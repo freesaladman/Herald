@@ -270,8 +270,6 @@ Limits: 16 authenticated clients, 64 KiB per message, 3 s to complete the handsh
 | `herald auth set\|test\|clear [--connection ID]` | manage a connection's secret (see First run) |
 | `herald config path` | print the config file path |
 
-Claude Code Monitor: run `herald tail --json --type "pr.*" --match actor.kind=human` as a background Monitor command. Each event becomes one JSON line (one notification), and the Monitor ends when the app stops (exit 1), so re-arm it after a restart.
-
 ## Adding a provider
 
 All provider-specific code lives outside `herald-core`.

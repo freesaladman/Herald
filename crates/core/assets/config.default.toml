@@ -5,6 +5,12 @@ fast_secs = 60          # pipelines, releases, approvals
 pr_secs = 120           # pull requests
 slow_secs = 600         # branches, discovery scan, identity and group refresh, local clone index
 max_lookback_days = 14  # how far back the first sync and catch-up look
+# Per-source intervals in seconds (15 to 86400); a source not listed uses its tier above.
+# Source names are listed in the README.
+# [polling.sources]
+# pipelines = 30
+# pr_threads = 60
+# branches = 1800
 
 [alerts]
 # Event type globs that never raise a toast or sound, e.g. ["pr.iteration.*"].

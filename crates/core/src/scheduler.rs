@@ -425,6 +425,10 @@ impl Cycle {
         added
     }
 
+    fn is_pending(&self, state: &ConnState, source: &str) -> bool {
+        self.pending.contains(&Self::key(state, source))
+    }
+
     fn key(state: &ConnState, source: &str) -> (String, String, u64) {
         (state.id().to_string(), source.to_string(), state.generation)
     }
@@ -587,6 +591,14 @@ fn tier_period(config: &Config, tier: Tier) -> Duration {
         Tier::Slow => config.polling.slow_secs,
     };
     Duration::from_secs(secs.max(1))
+}
+
+/// A source's own override, else its tier's interval.
+fn source_period(config: &Config, name: &str, tier: Tier) -> Duration {
+    match config.polling.sources.get(name) {
+        Some(secs) => Duration::from_secs((*secs).max(1)),
+        None => tier_period(config, tier),
+    }
 }
 
 struct Shared {
@@ -756,7 +768,7 @@ impl Shared {
                                 conn.last_attempt(name),
                                 w.last_success_utc,
                                 t0,
-                                tier_period(&cfg, *tier),
+                                source_period(&cfg, name, *tier),
                             ) =>
                         {
                             let added = self.cycle().join(conn, name, Some(w.last_success_utc));
@@ -982,57 +994,104 @@ impl Shared {
         connection: Arc<dyn Connection>,
         tier: Tier,
         mut slots: Vec<SourceSlot>,
-        period: Duration,
     ) {
         let cref = conn.connection_ref();
-        let mut interval = tokio::time::interval(period);
-        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut config = self.config.clone();
+        // When each source (and the slow tier's identity refresh) last started a period;
+        // None polls at once. Due time is this plus the interval in the current config,
+        // so a reload retimes the next poll without restarting the task.
+        let mut started: Vec<Option<Instant>> = vec![None; slots.len()];
+        let mut refresh_started: Option<Instant> = None;
         let mut seen = 0;
+        let mut config_open = true;
         loop {
             // Enabled before the generation check so a wake in between is not missed.
             let notified = conn.wake.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if conn.wake_gen(tier) == seen {
-                let ticked = tokio::select! {
-                    _ = interval.tick() => true,
-                    _ = &mut notified => false,
-                };
-                // A wake aimed at another tier also lands here.
-                if !ticked && conn.wake_gen(tier) == seen {
-                    continue;
+            let cfg = config.borrow_and_update().clone();
+            let gen_now = conn.wake_gen(tier);
+            let woke = gen_now != seen;
+            let now = Instant::now();
+            let slot_due: Vec<Option<Instant>> = slots
+                .iter()
+                .zip(&started)
+                .map(|(s, b)| b.map(|b| b + source_period(&cfg, s.source.name(), tier)))
+                .collect();
+            let refresh_due =
+                (tier == Tier::Slow).then(|| refresh_started.map(|b| b + tier_period(&cfg, tier)));
+            // A source another pass joined to the open catch-up cycle must poll now, or
+            // the cycle waits on it until the deadline.
+            let pending: Vec<bool> = {
+                let cycle = self.cycle();
+                slots
+                    .iter()
+                    .map(|s| cycle.is_pending(&conn, s.source.name()))
+                    .collect()
+            };
+            let is_due = |d: Option<Instant>| woke || d.is_none_or(|d| d <= now);
+            let slot_is_due: Vec<bool> = slot_due
+                .iter()
+                .zip(&pending)
+                .map(|(d, p)| *p || is_due(*d))
+                .collect();
+            let any_due = slot_is_due.iter().any(|d| *d) || refresh_due.is_some_and(is_due);
+            if !any_due {
+                let next = slot_due
+                    .iter()
+                    .flatten()
+                    .chain(refresh_due.iter().flatten())
+                    .min()
+                    .copied();
+                // A wake aimed at another tier or a config change also lands here.
+                tokio::select! {
+                    _ = async {
+                        match next {
+                            Some(t) => tokio::time::sleep_until(t).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {}
+                    _ = &mut notified => {}
+                    changed = config.changed(), if config_open => {
+                        config_open = changed.is_ok();
+                    }
                 }
+                continue;
             }
-            let woke = conn.wake_gen(tier) != seen;
-            seen = conn.wake_gen(tier);
+            seen = gen_now;
+            let due = slot_is_due;
+            let refresh = refresh_due.is_some_and(is_due);
             let ready = guarded(&cref.id, "identify", self.ready(&conn, &connection))
                 .await
                 .flatten();
-            let Some((me, identified)) = ready else {
-                for slot in &slots {
+            if let Some((me, identified)) = ready {
+                for (slot, _) in slots.iter_mut().zip(&due).filter(|(_, d)| **d) {
+                    let name = slot.source.name();
+                    if conn.gate_open() && !conn.is_disabled(name) {
+                        let period = source_period(&cfg, name, tier);
+                        conn.begin_poll(name);
+                        let poll = self.poll_source(&conn, &connection, slot, &me, period);
+                        guarded(&cref.id, name, poll).await;
+                        conn.end_poll(name);
+                    }
+                    self.finish_source(&conn, name);
+                }
+                if refresh && !identified && conn.gate_open() {
+                    guarded(&cref.id, "identify", self.identify(&conn, &connection)).await;
+                }
+            } else {
+                for (slot, _) in slots.iter().zip(&due).filter(|(_, d)| **d) {
                     self.finish_source(&conn, slot.source.name());
                 }
-                if woke {
-                    interval.reset();
-                }
-                continue;
-            };
-            for slot in &mut slots {
-                let name = slot.source.name();
-                if conn.gate_open() && !conn.is_disabled(name) {
-                    conn.begin_poll(name);
-                    let poll = self.poll_source(&conn, &connection, slot, &me, period);
-                    guarded(&cref.id, name, poll).await;
-                    conn.end_poll(name);
-                }
-                self.finish_source(&conn, name);
             }
-            if tier == Tier::Slow && !identified && conn.gate_open() {
-                guarded(&cref.id, "identify", self.identify(&conn, &connection)).await;
+            // A wake-driven pass restarts every period from its end, so the tick that
+            // would have followed the wake does not poll again at once.
+            let base = if woke { Instant::now() } else { now };
+            for (b, _) in started.iter_mut().zip(&due).filter(|(_, d)| **d) {
+                *b = Some(base);
             }
-            // The tick queued while this wake-driven pass ran would poll again at once.
-            if woke {
-                interval.reset();
+            if refresh {
+                refresh_started = Some(base);
             }
         }
     }
@@ -1115,12 +1174,22 @@ impl Shared {
         }
     }
 
-    async fn run_housekeeping(self: Arc<Self>, period: Duration) {
-        let mut interval = tokio::time::interval_at(Instant::now() + period, period);
-        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    async fn run_housekeeping(self: Arc<Self>) {
+        let mut watch = self.config.clone();
+        let mut watch_open = true;
+        let mut last = Instant::now();
         let mut last_prune: Option<Instant> = None;
         loop {
-            interval.tick().await;
+            // Re-read each turn so a changed slow_secs retimes the next rebuild.
+            let period = tier_period(&watch.borrow_and_update(), Tier::Slow);
+            tokio::select! {
+                _ = tokio::time::sleep_until(last + period) => {}
+                changed = watch.changed(), if watch_open => {
+                    watch_open = changed.is_ok();
+                    continue;
+                }
+            }
+            last = Instant::now();
             let config = self.config();
             let local = config.local.clone();
             let connections = config.connections.clone();
@@ -1211,11 +1280,7 @@ impl Scheduler {
             scheduler.launch(p);
         }
         shared.publish_statuses();
-        let housekeeping = tokio::spawn(
-            shared
-                .clone()
-                .run_housekeeping(tier_period(&cfg, Tier::Slow)),
-        );
+        let housekeeping = tokio::spawn(shared.clone().run_housekeeping());
         let watchdog = tokio::spawn(shared.run_cycle_watchdog());
         scheduler.add_tasks(HOUSEKEEPING, vec![housekeeping]);
         scheduler.add_tasks(WATCHDOG, vec![watchdog]);
@@ -1254,7 +1319,6 @@ impl Scheduler {
         if !slots.iter().any(|(t, _)| *t == Tier::Slow) {
             slots.push((Tier::Slow, Vec::new()));
         }
-        let cfg = self.shared.config();
         let handles = slots
             .into_iter()
             .map(|(tier, tier_slots)| {
@@ -1263,7 +1327,6 @@ impl Scheduler {
                     connection.clone(),
                     tier,
                     tier_slots,
-                    tier_period(&cfg, tier),
                 ))
             })
             .collect();
@@ -1810,6 +1873,9 @@ mod tests {
         fn parse_remote(&self, url: &str) -> Option<crate::provider::RemoteRepo> {
             self.inner.parse_remote(url)
         }
+        fn sources(&self) -> Vec<crate::provider::SourceInfo> {
+            self.inner.sources()
+        }
     }
 
     fn chaos_harness(fake: &FakeProvider, store: Option<Arc<Store>>) -> (Harness, Arc<Chaos>) {
@@ -1986,6 +2052,132 @@ mod tests {
         assert!(Arc::ptr_eq(&h.sched.connection("c1").unwrap(), &live));
         pass(1).await;
         assert_eq!(fake.poll_count("s"), 1);
+    }
+
+    fn with_source_secs(mut cfg: Config, sources: &[(&str, u64)]) -> Config {
+        for (name, secs) in sources {
+            cfg.polling.sources.insert((*name).into(), *secs);
+        }
+        cfg
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overridden_source_polls_at_its_own_interval_beside_its_tier_siblings() {
+        let fake = fake_with(&[("quick", Tier::Fast), ("plain", Tier::Fast)]);
+        let cfg = with_source_secs(config(), &[("quick", 4)]);
+        let _h = Harness::build(
+            vec![Arc::new(FakeProviderFactory::new(fake.clone()))],
+            None,
+            cfg,
+        );
+        // Fast tier is 10s: plain polls at 0, 10, 20; quick at 0, 4, ..., 20.
+        pass(21).await;
+        assert_eq!(fake.poll_count("quick"), 6);
+        assert_eq!(fake.poll_count("plain"), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn catch_up_gap_follows_the_sources_own_interval() {
+        let fake = fake_with(&[("quick", Tier::Fast), ("plain", Tier::Fast)]);
+        let cfg = with_source_secs(config(), &[("quick", 4)]);
+        let _h = Harness::build(
+            vec![Arc::new(FakeProviderFactory::new(fake.clone()))],
+            None,
+            cfg,
+        );
+        pass(1).await;
+        // 20s is over three of quick's 4s periods but under three of the tier's 10s.
+        fake.set_server_time(t0() + secs(20));
+        pass(16).await;
+
+        let quick = fake.poll_calls("quick");
+        assert!(quick[1].catch_up);
+        assert!(!quick[2].catch_up);
+        let plain = fake.poll_calls("plain");
+        assert_eq!(plain.len(), 2);
+        assert!(!plain[1].catch_up);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_long_override_sibling_joins_the_cycle_and_polls_with_it() {
+        let fake = fake_with(&[("a", Tier::Fast), ("b", Tier::Fast)]);
+        for source in ["a", "b"] {
+            fake.push_poll(source, ok(vec![]));
+            fake.push_poll(
+                source,
+                ok(vec![ev(
+                    &format!("c1:{source}:wake"),
+                    "run.completed",
+                    true,
+                )]),
+            );
+        }
+        let cfg = with_source_secs(config(), &[("b", 1800)]);
+        let mut h = Harness::build(
+            vec![Arc::new(FakeProviderFactory::new(fake.clone()))],
+            None,
+            cfg,
+        );
+        pass(1).await;
+        fake.set_server_time_error(Some(ProviderError::Transient("down".into())));
+        pass(25).await;
+        fake.set_server_time_error(None);
+        fake.set_server_time(t0() + secs(10_000));
+        pass(15).await;
+
+        // b is not due for 1800s, but joined a's cycle, so it polls with a.
+        assert_eq!(fake.poll_count("b"), 2);
+        let events = h.drain();
+        let summaries = of_type(&events, "catchup.summary");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].data["total"], 2);
+        assert!(h.sched.shared.cycle().pending.is_empty());
+
+        // The watchdog has nothing left to summarise.
+        pass(300).await;
+        assert!(of_type(&h.drain(), "catchup.summary").is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reload_retimes_a_running_source_without_extra_polls() {
+        let fake = fake_with(&[("s", Tier::Fast)]);
+        let h = Harness::start(&fake);
+        pass(12).await;
+        assert_eq!(fake.poll_count("s"), 2);
+
+        // Last poll started at 10s, so the next is due at 13s, then every 3s.
+        h._config_tx
+            .send_replace(Arc::new(with_source_secs(config(), &[("s", 3)])));
+        pass(5).await;
+        assert_eq!(fake.poll_count("s"), 4);
+
+        // Dropping the override goes back to the tier's 10s from the poll at 16s.
+        h._config_tx.send_replace(Arc::new(config()));
+        pass(8).await;
+        assert_eq!(fake.poll_count("s"), 4);
+        pass(2).await;
+        assert_eq!(fake.poll_count("s"), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_now_polls_slow_overridden_and_default_sources_once() {
+        let fake = fake_with(&[
+            ("rare", Tier::Fast),
+            ("plain", Tier::Fast),
+            ("slow", Tier::Slow),
+        ]);
+        let cfg = with_source_secs(config(), &[("rare", 5000)]);
+        let h = Harness::build(
+            vec![Arc::new(FakeProviderFactory::new(fake.clone()))],
+            None,
+            cfg,
+        );
+        pass(1).await;
+        h.sched.poll_now();
+        pass(1).await;
+        for name in ["rare", "plain", "slow"] {
+            assert_eq!(fake.poll_count(name), 2, "{name}");
+        }
     }
 
     #[tokio::test(start_paused = true)]

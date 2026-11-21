@@ -1,5 +1,6 @@
 //! Provider-neutral traits and types. Concrete providers live in their own crates.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -163,11 +164,22 @@ pub trait ProviderFactory: Send + Sync {
         secrets: Arc<dyn SecretStore>,
     ) -> Result<Arc<dyn Connection>, ProviderError>;
     fn parse_remote(&self, git_remote_url: &str) -> Option<RemoteRepo>;
+    /// Every source a connection of this provider polls. `[polling.sources]` keys are
+    /// validated against these names.
+    fn sources(&self) -> Vec<SourceInfo>;
     /// The `RemoteRepo::host_key` clones of this connection's repos carry, or `None`
     /// when it can't be derived (remotes are then matched without a host check).
     fn host_key(&self, _cfg: &ConnectionConfig) -> Option<String> {
         None
     }
+}
+
+/// What a factory declares about one of its sources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceInfo {
+    pub name: &'static str,
+    pub tier: Tier,
+    pub event_types: Vec<&'static str>,
 }
 
 const BOTS_HELP: &str =
@@ -267,6 +279,23 @@ impl Config {
     /// Provider-specific validation: unknown providers and each factory's own checks.
     pub fn validate_providers(&self, registry: &ProviderRegistry) -> Vec<ConfigError> {
         let mut errors = Vec::new();
+        let known: BTreeSet<&'static str> = registry
+            .all()
+            .iter()
+            .flat_map(|f| f.sources())
+            .map(|s| s.name)
+            .collect();
+        for name in self.polling.sources.keys() {
+            if !known.contains(name.as_str()) {
+                errors.push(ConfigError::new(
+                    format!("polling.sources.{name}"),
+                    format!(
+                        "unknown source; known: {}",
+                        known.iter().copied().collect::<Vec<_>>().join(", ")
+                    ),
+                ));
+            }
+        }
         for (i, conn) in self.connections.iter().enumerate() {
             if conn.provider.trim().is_empty() {
                 continue;
@@ -368,6 +397,24 @@ mod tests {
                 ConfigError::new("connections[0].settings.x", "bad x"),
                 ConfigError::new("connections[1].provider", "unknown provider 'nope'"),
             ]
+        );
+    }
+
+    #[test]
+    fn validate_providers_flags_unknown_polling_sources_with_the_known_list() {
+        let provider = FakeProvider::new();
+        provider.add_source("b_src", Tier::Fast);
+        provider.add_source("a_src", Tier::Slow);
+        let registry = ProviderRegistry::new(vec![Arc::new(FakeProviderFactory::new(provider))]);
+        let mut config = Config::default();
+        config.polling.sources.insert("a_src".into(), 30);
+        config.polling.sources.insert("nope".into(), 30);
+        assert_eq!(
+            config.validate_providers(&registry),
+            vec![ConfigError::new(
+                "polling.sources.nope",
+                "unknown source; known: a_src, b_src"
+            )]
         );
     }
 

@@ -148,7 +148,35 @@ All keys are snake_case TOML. Every section is optional; the defaults are below 
 | `local.scan_depth` | 2 | how deep below each root to look |
 | `stream.port` | 0 | stream port; 0 picks a free one (see Stream) |
 
-Changing `stream.port` applies on reload: the stream restarts on the new port with a new token, so clients must re-read `stream.json`. Changed `[polling]` intervals apply to connections when they restart (a config reload restarts them). Other keys apply on reload.
+Changing `stream.port` applies on reload: the stream restarts on the new port with a new token, so clients must re-read `stream.json`. All keys apply on reload, including `[polling]` intervals, which take effect on running connections without a restart (and, for `slow_secs`, the local clone index rebuild).
+
+### Per-source polling
+
+Each source polls on its tier's interval unless `[polling.sources]` overrides it. Values are seconds, from 15 to 86400. The same bounds now apply to `fast_secs`, `pr_secs` and `slow_secs`, so an older config with, say, `fast_secs = 10` fails to load until it is raised. An unknown source name is a config error.
+
+A source counts a poll as catch-up when its last success is more than three of its own intervals old, so a short override makes catch-up (events go to the summary instead of individual toasts) more likely after a short gap, and a long one less likely.
+
+```toml
+[polling.sources]
+pipelines = 30
+pr_threads = 60
+branches = 1800
+```
+
+Azure DevOps sources:
+
+| Source | Default tier (interval) | Event types |
+| --- | --- | --- |
+| `pr_lifecycle` | pr (120 s) | `pr.created`, `pr.completed`, `pr.abandoned`, `pr.reactivated`, `pr.conflicts.detected`, `pr.conflicts.cleared`, `pr.mentioned` |
+| `pr_discovery` | slow (600 s) | `pr.mentioned` |
+| `pr_threads` | pr (120 s) | `pr.comment.added`, `pr.comment.replied`, `pr.thread.status.changed`, `pr.mentioned` |
+| `pr_reviews` | pr (120 s) | `pr.published`, `pr.vote.changed`, `pr.votes.reset`, `pr.reviewer.added`, `pr.reviewer.removed`, `pr.autocomplete.set`, `pr.autocomplete.cancelled`, `pr.iteration.pushed`, `pr.rereview.needed` |
+| `pr_policies` | pr (120 s) | `pr.policy.changed` |
+| `branches` | slow (600 s) | `branch.created`, `branch.pushed`, `branch.forcepushed`, `branch.deleted` |
+| `pipelines` | fast (60 s) | `run.completed`, `run.stage.failed`, `approval.pending`, `approval.completed` |
+| `releases` | fast (60 s) | `release.created`, `deploy.started`, `deploy.succeeded`, `deploy.failed`, `deploy.canceled`, `approval.pending`, `approval.completed` |
+
+A `poll now` still polls every source once. The PR sources share a short-lived thread cache (20 s), so setting `pr_threads` and `pr_reviews` at or near the 15 s minimum may reuse one fetch for both.
 
 `local.scan_roots` lets Herald map an event to your checkout: it reads each repo's git remotes (and worktrees) and fills `local.repoPath` (main clone) and `local.worktreePath` (a worktree on the PR source branch or the branch). The index rebuilds every `slow_secs`.
 

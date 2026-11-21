@@ -6,9 +6,10 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
 use herald_core::config::{ConfigError, ConnectionConfig};
+use herald_core::event::event_types as ev;
 use herald_core::provider::{
     AuthMethodSpec, Connection, FieldKind, FieldSpec, Identity, ProviderError, ProviderFactory,
-    RemoteRepo, ScopeOption, SecretSpec, Source,
+    RemoteRepo, ScopeOption, SecretSpec, Source, SourceInfo, Tier,
 };
 use herald_core::secrets::SecretStore;
 use percent_encoding::percent_decode_str;
@@ -174,6 +175,89 @@ impl ProviderFactory for AdoProviderFactory {
             auth_method,
             AdoShared::new(client, organization, projects),
         )))
+    }
+
+    fn sources(&self) -> Vec<SourceInfo> {
+        let info = |name, tier, event_types: &[&'static str]| SourceInfo {
+            name,
+            tier,
+            event_types: event_types.to_vec(),
+        };
+        vec![
+            info(
+                "pr_lifecycle",
+                Tier::Pr,
+                &[
+                    ev::PR_CREATED,
+                    ev::PR_COMPLETED,
+                    ev::PR_ABANDONED,
+                    ev::PR_REACTIVATED,
+                    ev::PR_CONFLICTS_DETECTED,
+                    ev::PR_CONFLICTS_CLEARED,
+                    ev::PR_MENTIONED,
+                ],
+            ),
+            info("pr_discovery", Tier::Slow, &[ev::PR_MENTIONED]),
+            info(
+                "pr_threads",
+                Tier::Pr,
+                &[
+                    ev::PR_COMMENT_ADDED,
+                    ev::PR_COMMENT_REPLIED,
+                    ev::PR_THREAD_STATUS_CHANGED,
+                    ev::PR_MENTIONED,
+                ],
+            ),
+            info(
+                "pr_reviews",
+                Tier::Pr,
+                &[
+                    ev::PR_PUBLISHED,
+                    ev::PR_VOTE_CHANGED,
+                    ev::PR_VOTES_RESET,
+                    ev::PR_REVIEWER_ADDED,
+                    ev::PR_REVIEWER_REMOVED,
+                    ev::PR_AUTOCOMPLETE_SET,
+                    ev::PR_AUTOCOMPLETE_CANCELLED,
+                    ev::PR_ITERATION_PUSHED,
+                    ev::PR_REREVIEW_NEEDED,
+                ],
+            ),
+            info("pr_policies", Tier::Pr, &[ev::PR_POLICY_CHANGED]),
+            info(
+                "branches",
+                Tier::Slow,
+                &[
+                    ev::BRANCH_CREATED,
+                    ev::BRANCH_PUSHED,
+                    ev::BRANCH_FORCEPUSHED,
+                    ev::BRANCH_DELETED,
+                ],
+            ),
+            info(
+                "pipelines",
+                Tier::Fast,
+                &[
+                    ev::RUN_COMPLETED,
+                    ev::RUN_STAGE_FAILED,
+                    ev::APPROVAL_PENDING,
+                    ev::APPROVAL_COMPLETED,
+                ],
+            ),
+            info(
+                "releases",
+                Tier::Fast,
+                &[
+                    ev::RELEASE_CREATED,
+                    ev::DEPLOY_STARTED,
+                    ev::DEPLOY_SUCCEEDED,
+                    ev::DEPLOY_FAILED,
+                    ev::DEPLOY_CANCELED,
+                    ev::APPROVAL_PENDING,
+                    ev::APPROVAL_COMPLETED,
+                ],
+            ),
+        ]
     }
 
     fn parse_remote(&self, git_remote_url: &str) -> Option<RemoteRepo> {
@@ -592,6 +676,28 @@ organization = \"{org}\"
             "pat".into(),
             AdoShared::new(Arc::new(client), "org".into(), Vec::new()),
         )
+    }
+
+    #[tokio::test]
+    async fn declared_sources_match_the_connection_sources() {
+        let server = wiremock::MockServer::start().await;
+        let actual: Vec<_> = mock_connection(&server)
+            .sources()
+            .iter()
+            .map(|s| (s.name(), s.tier()))
+            .collect();
+        let declared: Vec<_> = AdoProviderFactory
+            .sources()
+            .iter()
+            .map(|s| (s.name, s.tier))
+            .collect();
+        assert_eq!(declared, actual);
+        assert!(
+            AdoProviderFactory
+                .sources()
+                .iter()
+                .all(|s| !s.event_types.is_empty())
+        );
     }
 
     #[tokio::test]

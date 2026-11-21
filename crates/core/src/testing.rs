@@ -10,8 +10,8 @@ use crate::config::{Config, ConfigError, ConnectionConfig};
 use crate::event::ConnectionRef;
 use crate::provider::{
     AuthMethodSpec, Connection, FieldKind, FieldSpec, Identity, PollOutcome, ProviderError,
-    ProviderFactory, RemoteRepo, ScopeOption, ScopedSnapshots, SecretSpec, Source, SyncContext,
-    Tier,
+    ProviderFactory, RemoteRepo, ScopeOption, ScopedSnapshots, SecretSpec, Source, SourceInfo,
+    SyncContext, Tier,
 };
 use crate::secrets::SecretStore;
 use crate::store::Store;
@@ -296,6 +296,19 @@ impl ProviderFactory for FakeProviderFactory {
     /// The connection's `host` setting.
     fn host_key(&self, cfg: &ConnectionConfig) -> Option<String> {
         cfg.settings.get("host")?.as_str().map(str::to_string)
+    }
+
+    fn sources(&self) -> Vec<SourceInfo> {
+        self.provider
+            .lock()
+            .sources
+            .iter()
+            .map(|s| SourceInfo {
+                name: s.name,
+                tier: s.tier,
+                event_types: Vec::new(),
+            })
+            .collect()
     }
 
     /// Parses `fake://{host}/{namespace}/{repo}`.

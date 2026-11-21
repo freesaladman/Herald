@@ -107,6 +107,11 @@ pub struct Config {
     pub hooks: Vec<HookConfig>,
 }
 
+/// Shortest allowed polling interval, in seconds.
+pub const MIN_POLL_SECS: u64 = 15;
+/// Longest allowed polling interval, in seconds.
+pub const MAX_POLL_SECS: u64 = 86_400;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PollingConfig {
@@ -114,6 +119,8 @@ pub struct PollingConfig {
     pub pr_secs: u64,
     pub slow_secs: u64,
     pub max_lookback_days: i64,
+    /// Per-source interval in seconds, keyed by source name; unlisted sources use their tier.
+    pub sources: BTreeMap<String, u64>,
 }
 
 impl Default for PollingConfig {
@@ -123,6 +130,7 @@ impl Default for PollingConfig {
             pr_secs: 120,
             slow_secs: 600,
             max_lookback_days: 14,
+            sources: BTreeMap::new(),
         }
     }
 }
@@ -377,6 +385,24 @@ impl Config {
         if !(0.0..=1.0).contains(&self.sound.volume) {
             errs.push(ConfigError::new("sound.volume", "must be between 0 and 1"));
         }
+        let tiers = [
+            ("polling.fast_secs".to_string(), self.polling.fast_secs),
+            ("polling.pr_secs".to_string(), self.polling.pr_secs),
+            ("polling.slow_secs".to_string(), self.polling.slow_secs),
+        ];
+        let sources = self
+            .polling
+            .sources
+            .iter()
+            .map(|(name, secs)| (format!("polling.sources.{name}"), *secs));
+        for (path, secs) in tiers.into_iter().chain(sources) {
+            if !(MIN_POLL_SECS..=MAX_POLL_SECS).contains(&secs) {
+                errs.push(ConfigError::new(
+                    path,
+                    format!("must be between {MIN_POLL_SECS} and {MAX_POLL_SECS} seconds"),
+                ));
+            }
+        }
         check_globs(&mut errs, "alerts.mute_types", &self.alerts.mute_types);
         check_globs(
             &mut errs,
@@ -522,6 +548,51 @@ mod tests {
             .into_iter()
             .map(|e| e.path)
             .collect()
+    }
+
+    #[test]
+    fn polling_sources_accept_the_bounds_and_empty() {
+        let cfg = Config::from_toml_str(
+            "[polling.sources]
+pipelines = 15
+branches = 86400
+",
+        )
+        .expect("bounds are inclusive");
+        assert_eq!(cfg.polling.sources.get("pipelines"), Some(&15));
+        assert_eq!(cfg.polling.sources.get("branches"), Some(&86_400));
+        assert!(
+            Config::from_toml_str(
+                "[polling.sources]
+"
+            )
+            .unwrap()
+            .polling
+            .sources
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn polling_intervals_outside_the_bounds_are_rejected_at_their_path() {
+        assert_eq!(
+            err_paths(
+                "[polling]
+fast_secs = 14
+pr_secs = 86401
+[polling.sources]
+pipelines = 5
+branches = 90000
+releases = 15
+"
+            ),
+            [
+                "polling.fast_secs",
+                "polling.pr_secs",
+                "polling.sources.branches",
+                "polling.sources.pipelines"
+            ]
+        );
     }
 
     #[test]

@@ -309,8 +309,8 @@ impl Engine {
     /// diffed by id in the background (removed stop, added start, changed restart).
     /// A restart rebuilds the connection, which re-enables its disabled sources.
     /// A changed `stream.port` restarts the stream server with a new token; clients
-    /// re-read `stream.json`. Changed `[polling]` intervals only apply to connections that restart; running
-    /// connections keep the intervals they launched with.
+    /// re-read `stream.json`. Changed `[polling]` intervals apply to running connections
+    /// from their next poll, without a restart.
     pub fn reload(&self, config: Config) {
         let config = Arc::new(config);
         self.config.send_replace(config.clone());
@@ -935,6 +935,9 @@ mod tests {
         }
         fn parse_remote(&self, url: &str) -> Option<crate::provider::RemoteRepo> {
             self.inner.parse_remote(url)
+        }
+        fn sources(&self) -> Vec<crate::provider::SourceInfo> {
+            self.inner.sources()
         }
     }
 

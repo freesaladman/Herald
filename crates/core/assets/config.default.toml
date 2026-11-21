@@ -64,6 +64,7 @@ port = 0  # 0 = pick a free port; the port and token are written to stream.json
 #   debounce_secs  ignore repeats for the same hook and subject within this window (default 0)
 # {dotted.path} placeholders in argv, cwd and env expand from the event JSON; a missing one
 # stops the run. Hooks also get HERALD_* environment variables and the event JSON on stdin.
+# Placeholders are restricted around shells and wrappers: see "Hook safety" in the README.
 
 [[hooks]]
 name = "open-link"

@@ -236,13 +236,18 @@ impl ProviderFactory for FakeProviderFactory {
         }))
     }
 
+    /// The connection's `host` setting.
+    fn host_key(&self, cfg: &ConnectionConfig) -> Option<String> {
+        cfg.settings.get("host")?.as_str().map(str::to_string)
+    }
+
     /// Parses `fake://{host}/{namespace}/{repo}`.
     fn parse_remote(&self, git_remote_url: &str) -> Option<RemoteRepo> {
         let rest = git_remote_url.strip_prefix("fake://")?;
         let parts: Vec<&str> = rest.split('/').collect();
         match parts.as_slice() {
             [host, namespace, repo] => Some(RemoteRepo {
-                provider: "fake".into(),
+                provider: self.kind.into(),
                 host_key: (*host).into(),
                 namespace: Some((*namespace).into()),
                 repo_name: (*repo).into(),

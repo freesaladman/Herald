@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::Context;
-use herald_core::config::{Config, ConfigError, Paths};
+use herald_core::config::{Config, ConfigError, DB_FILE, Paths};
 use herald_core::engine::Engine;
 use herald_core::provider::ProviderRegistry;
 use herald_core::secrets::{KeyringSecretStore, SecretStore};
@@ -25,7 +25,6 @@ mod tray;
 mod windows;
 
 const CONFIG_FILE: &str = "config.toml";
-const DB_FILE: &str = "herald.db";
 const CONFIG_DEBOUNCE: Duration = Duration::from_millis(500);
 const LOG_FILES_KEPT: usize = 7;
 const DEFAULT_LOG_FILTER: &str =

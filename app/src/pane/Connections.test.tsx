@@ -72,6 +72,25 @@ describe("Connections", () => {
     expect(sessionStorage.length).toBe(0);
   });
 
+  it("keeps text typed while the save is in flight", async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    setup(async (cmd) => {
+      if (cmd === "set_secret") await gate;
+      return null;
+    });
+    const input = screen.getByLabelText("Personal access token");
+    await userEvent.type(input, "old");
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await userEvent.type(input, "new");
+    release();
+
+    expect(await screen.findByText("Saved")).toBeTruthy();
+    expect((input as HTMLInputElement).value).toBe("oldnew");
+  });
+
   it("shows the identity on a successful test", async () => {
     setup((cmd) =>
       cmd === "test_connection"

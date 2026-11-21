@@ -6,7 +6,12 @@ use std::path::{Path, PathBuf};
 use globset::{Glob, GlobBuilder};
 use serde::{Deserialize, Serialize};
 
+use crate::hooks::placeholder_paths;
+
 const DEFAULT_TOML: &str = include_str!("../assets/config.default.toml");
+
+/// SQLite store file name under `Paths::home`.
+pub const DB_FILE: &str = "herald.db";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
@@ -334,13 +339,19 @@ impl Config {
 
     /// Writes the template if the file does not exist. Returns whether it wrote.
     pub fn ensure_file(path: &Path) -> std::io::Result<bool> {
-        if path.exists() {
-            return Ok(false);
-        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, DEFAULT_TOML)?;
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        std::io::Write::write_all(&mut file, DEFAULT_TOML.as_bytes())?;
         Ok(true)
     }
 
@@ -435,10 +446,26 @@ impl Config {
                                 format!("{at}.run.{k}"),
                                 "argv must start with a program",
                             ));
+                        } else if argv
+                            .first()
+                            .is_some_and(|a| !placeholder_paths(a).is_empty())
+                        {
+                            errs.push(ConfigError::new(
+                                format!("{at}.run.{k}"),
+                                "the program (first argv element) must be a literal, not a placeholder",
+                            ));
                         }
                     }
                 }
                 (Some(_), None) => {}
+            }
+            for (name, value) in &h.env {
+                if shell_executed_env(name) && !placeholder_paths(value).is_empty() {
+                    errs.push(ConfigError::new(
+                        format!("{at}.env.{name}"),
+                        "a placeholder is not allowed in a variable that shells execute",
+                    ));
+                }
             }
             for (key, value) in &h.r#match {
                 check_globs(&mut errs, &format!("{at}.match.{key}"), value.patterns());
@@ -446,6 +473,21 @@ impl Config {
         }
         errs
     }
+}
+
+/// Env names whose value a shell runs as code or startup commands.
+fn shell_executed_env(name: &str) -> bool {
+    let upper = name.to_uppercase();
+    upper.starts_with("BASH_FUNC_")
+        || [
+            "BASH_ENV",
+            "ENV",
+            "PS4",
+            "PROMPT_COMMAND",
+            "SHELLOPTS",
+            "BASHOPTS",
+        ]
+        .contains(&upper.as_str())
 }
 
 fn check_globs(errs: &mut Vec<ConfigError>, path: &str, patterns: &[String]) {
@@ -532,7 +574,7 @@ mod tests {
             r#"
 [[connections]]
 id = "conn-a"
-provider = "ado"
+provider = "fake"
 auth = { method = "pat" }
 bots = ["Build\\*"]
 organization = "contoso"
@@ -565,11 +607,11 @@ id = "Bad_Id"
 provider = ""
 bots = ["[oops"]
 [[connections]]
-id = "dup"
-provider = "ado"
+id = "conn-dup"
+provider = "fake"
 [[connections]]
-id = "dup"
-provider = "ado"
+id = "conn-dup"
+provider = "fake"
 "#,
         );
         assert_eq!(
@@ -620,6 +662,33 @@ match = { "pr.title" = ["ok", "[bad"] }
     }
 
     #[test]
+    fn rejects_placeholders_in_the_program_and_in_shell_executed_env() {
+        let p = err_paths(
+            r#"
+[[hooks]]
+name = "a"
+on = []
+run = { default = ["{pr.id}", "x"], windows = ["{{lit}}", "x"], linux = ["{ a }"] }
+[[hooks]]
+name = "b"
+on = []
+run = { default = ["echo"] }
+env = { bash_env = "{pr.title}", PS4 = "{x}", BASH_FUNC_f = "{x}", ENV = "ok", SAFE = "{x}", PROMPT_COMMAND = "{{x}}" }
+"#,
+        );
+        assert_eq!(
+            p,
+            vec![
+                "hooks[0].run.default",
+                "hooks[0].run.linux",
+                "hooks[1].env.BASH_FUNC_f",
+                "hooks[1].env.PS4",
+                "hooks[1].env.bash_env",
+            ]
+        );
+    }
+
+    #[test]
     fn rejects_bad_globs_and_volume() {
         let p = err_paths(
             "[alerts]\nmute_types = [\"[\"]\n[roles.group_reviewer]\nalert_types = [\"[\"]\n[sound]\nvolume = 1.5\n",
@@ -648,6 +717,23 @@ match = { "pr.title" = ["ok", "[bad"] }
         assert!(Config::ensure_file(&path).unwrap());
         assert!(!Config::ensure_file(&path).unwrap());
         assert!(Config::load(&path).is_ok());
+    }
+
+    #[test]
+    fn ensure_file_keeps_existing_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path, "# mine
+",
+        )
+        .unwrap();
+        assert!(!Config::ensure_file(&path).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# mine
+"
+        );
     }
 
     #[test]

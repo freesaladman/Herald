@@ -2,8 +2,13 @@
 //!
 //! The PR lists are org-level; everything else is project-scoped.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
 use chrono::{DateTime, SecondsFormat, Utc};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use tokio::time::Instant;
 
 use crate::client::{AdoClient, AdoError, Host};
 use crate::dto_git::{
@@ -13,6 +18,48 @@ use crate::dto_git::{
 
 const PAGE_SIZE: usize = 100;
 const POLICY_API_VERSION: &str = "7.1-preview.1";
+
+/// Assumes polling.pr_secs is well above this (default 120 s) so each tick fetches fresh data.
+/// With pr_secs at or below 20 s a tick may reuse the previous tick's threads.
+pub(crate) const THREADS_CACHE_TTL: Duration = Duration::from_secs(20);
+
+type ThreadsKey = (String, String, i64);
+type ThreadsSlot =
+    Arc<tokio::sync::Mutex<Option<(Instant, Arc<Vec<GitPullRequestCommentThread>>)>>>;
+
+/// Short-lived per-PR cache of thread lists. A slot's async mutex is held across the fetch, so
+/// concurrent callers for one PR share a single request. Failed fetches leave the slot empty.
+pub(crate) struct ThreadsCache {
+    ttl: Duration,
+    now: Box<dyn Fn() -> Instant + Send + Sync>,
+    slots: Mutex<HashMap<ThreadsKey, ThreadsSlot>>,
+}
+
+impl ThreadsCache {
+    pub(crate) fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            now: Box::new(Instant::now),
+            slots: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn fresh(&self, at: Instant) -> bool {
+        (self.now)().saturating_duration_since(at) < self.ttl
+    }
+
+    fn slot(&self, key: ThreadsKey) -> ThreadsSlot {
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        // Drop idle slots whose entry has expired (or never filled) to bound memory.
+        slots.retain(|_, s| {
+            Arc::strong_count(s) > 1
+                || s.try_lock()
+                    .map(|g| g.as_ref().is_some_and(|(at, _)| self.fresh(*at)))
+                    .unwrap_or(true)
+        });
+        slots.entry(key).or_default().clone()
+    }
+}
 
 fn enc(s: &str) -> String {
     utf8_percent_encode(s, NON_ALPHANUMERIC).to_string()
@@ -84,6 +131,28 @@ impl AdoClient {
     }
 
     pub async fn pr_threads(
+        &self,
+        project: &str,
+        repo_id: &str,
+        pr_id: i64,
+    ) -> Result<Vec<GitPullRequestCommentThread>, AdoError> {
+        let cache = &self.threads_cache;
+        if cache.ttl.is_zero() {
+            return self.fetch_pr_threads(project, repo_id, pr_id).await;
+        }
+        let slot = cache.slot((project.to_string(), repo_id.to_string(), pr_id));
+        let mut entry = slot.lock().await;
+        if let Some((at, threads)) = entry.as_ref()
+            && cache.fresh(*at)
+        {
+            return Ok(threads.as_ref().clone());
+        }
+        let threads = Arc::new(self.fetch_pr_threads(project, repo_id, pr_id).await?);
+        *entry = Some(((cache.now)(), threads.clone()));
+        Ok(threads.as_ref().clone())
+    }
+
+    async fn fetch_pr_threads(
         &self,
         project: &str,
         repo_id: &str,
@@ -202,6 +271,7 @@ mod tests {
     use herald_core::secrets::{MemorySecretStore, SecretStore};
     use serde_json::json;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use wiremock::matchers::{method, path, query_param, query_param_is_missing};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -374,5 +444,61 @@ mod tests {
         assert!(c.refs_heads("P", "r1").await.unwrap().is_empty());
         let d = c.commit_diff_counts("P", "r1", "aaa", "bbb").await.unwrap();
         assert_eq!((d.ahead_count, d.behind_count), (2, 5));
+    }
+
+    fn cached_client(server: &MockServer) -> AdoClient {
+        let mut c = client(server);
+        c.threads_cache = ThreadsCache::new(THREADS_CACHE_TTL);
+        c
+    }
+
+    async fn mount_threads(server: &MockServer, resp: ResponseTemplate, times: u64) {
+        Mock::given(method("GET"))
+            .and(path("/P/_apis/git/repositories/r1/pullRequests/7/threads"))
+            .respond_with(resp)
+            .expect(times)
+            .mount(server)
+            .await;
+    }
+
+    fn threads_body() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({ "value": [{ "id": 3 }] }))
+    }
+
+    #[tokio::test]
+    async fn concurrent_pr_threads_calls_share_one_request() {
+        let server = MockServer::start().await;
+        mount_threads(&server, threads_body(), 1).await;
+        let c = cached_client(&server);
+        let (a, b) = tokio::join!(c.pr_threads("P", "r1", 7), c.pr_threads("P", "r1", 7));
+        assert_eq!(a.unwrap()[0].id, 3);
+        assert_eq!(b.unwrap()[0].id, 3);
+    }
+
+    #[tokio::test]
+    async fn pr_threads_refetches_after_ttl() {
+        let server = MockServer::start().await;
+        mount_threads(&server, threads_body(), 2).await;
+        let base = Instant::now();
+        let offset = Arc::new(AtomicU64::new(0));
+        let mut c = client(&server);
+        c.threads_cache = ThreadsCache::new(THREADS_CACHE_TTL);
+        let o = offset.clone();
+        c.threads_cache.now =
+            Box::new(move || base + Duration::from_secs(o.load(Ordering::SeqCst)));
+        c.pr_threads("P", "r1", 7).await.unwrap();
+        offset.store(THREADS_CACHE_TTL.as_secs() - 1, Ordering::SeqCst);
+        c.pr_threads("P", "r1", 7).await.unwrap();
+        offset.store(THREADS_CACHE_TTL.as_secs() + 1, Ordering::SeqCst);
+        c.pr_threads("P", "r1", 7).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_threads_errors_are_not_cached() {
+        let server = MockServer::start().await;
+        mount_threads(&server, ResponseTemplate::new(400), 2).await;
+        let c = cached_client(&server);
+        assert!(c.pr_threads("P", "r1", 7).await.is_err());
+        assert!(c.pr_threads("P", "r1", 7).await.is_err());
     }
 }

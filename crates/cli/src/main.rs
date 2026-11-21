@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Local, NaiveDate, TimeDelta, TimeZone, Utc};
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, Stream, StreamExt};
-use herald_core::config::{Config, ConfigError, ConnectionConfig, Paths};
+use herald_core::config::{Config, ConfigError, ConnectionConfig, DB_FILE, Paths};
 use herald_core::provider::ProviderRegistry;
 use herald_core::secrets::{KeyringSecretStore, SecretStore};
 use herald_core::store::Store;
@@ -20,7 +20,6 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-const DB_FILE: &str = "herald.db";
 const CONFIG_FILE: &str = "config.toml";
 const STREAM_FILE: &str = "stream.json";
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);

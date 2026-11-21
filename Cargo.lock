@@ -2243,6 +2243,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "windows",
 ]
 
 [[package]]

@@ -122,6 +122,11 @@ impl ProviderFactory for AdoProviderFactory {
     fn parse_remote(&self, git_remote_url: &str) -> Option<RemoteRepo> {
         parse_remote(git_remote_url)
     }
+
+    fn host_key(&self, cfg: &ConnectionConfig) -> Option<String> {
+        let org = cfg.settings.get("organization")?.as_str()?.trim();
+        (!org.is_empty()).then(|| org.to_lowercase())
+    }
 }
 
 fn decode(s: &str) -> String {
@@ -391,6 +396,35 @@ mod tests {
             f.parse_remote("https://dev.azure.com/contoso/My%20Proj/_git/my%20repo.git"),
             want("My Proj", "my repo")
         );
+    }
+
+    #[test]
+    fn host_key_is_lowercased_organization_matching_parse_remote() {
+        let f = AdoProviderFactory;
+        let cfg = |org: &str| {
+            Config::from_toml_str(&format!(
+                "[[connections]]
+id = \"c1\"
+provider = \"ado\"
+auth = {{ method = \"pat\" }}
+organization = \"{org}\"
+"
+            ))
+            .unwrap()
+            .connections
+            .remove(0)
+        };
+        let key = f.host_key(&cfg("  Contoso "));
+        assert_eq!(key.as_deref(), Some("contoso"));
+        for url in [
+            "https://dev.azure.com/Contoso/Proj/_git/repo",
+            "https://contoso.visualstudio.com/Proj/_git/repo",
+        ] {
+            assert_eq!(f.parse_remote(url).map(|r| r.host_key), key, "{url}");
+        }
+        let mut no_org = cfg("x");
+        no_org.settings.remove("organization");
+        assert_eq!(f.host_key(&no_org), None);
     }
 
     #[test]

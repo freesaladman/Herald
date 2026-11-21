@@ -7,6 +7,7 @@ pub mod engine;
 pub mod event;
 pub mod hooks;
 pub mod local_repos;
+pub mod process;
 pub mod provider;
 pub mod scheduler;
 pub mod secrets;

@@ -1121,9 +1121,15 @@ impl Shared {
         let mut last_prune: Option<Instant> = None;
         loop {
             interval.tick().await;
-            let local = self.config().local.clone();
+            let config = self.config();
+            let local = config.local.clone();
+            let connections = config.connections.clone();
             let registry = self.registry.clone();
-            match tokio::task::spawn_blocking(move || LocalIndex::build(&local, &registry)).await {
+            match tokio::task::spawn_blocking(move || {
+                LocalIndex::build(&local, &connections, &registry)
+            })
+            .await
+            {
                 Ok(index) => self.bus.set_local_index(index),
                 Err(e) => tracing::error!(error = %e, "local index rebuild failed"),
             }

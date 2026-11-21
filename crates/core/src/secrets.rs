@@ -58,7 +58,7 @@ impl fmt::Debug for KeyringSecretStore {
 fn map_error(e: keyring::Error) -> SecretError {
     match e {
         keyring::Error::NoDefaultStore => SecretError::NoNativeStore,
-        // The payload holds the raw secret bytes.
+        // Drop the payload: it is the raw stored bytes.
         keyring::Error::BadEncoding(_) => {
             SecretError::Backend("stored value is not valid UTF-8".into())
         }
@@ -169,6 +169,15 @@ mod tests {
         assert!(!format!("{s:?}").contains("hunter2"));
     }
 
+    /// Deletes the throwaway entry on drop, so a panicking test leaves nothing behind.
+    struct EntryGuard<'a>(&'a KeyringSecretStore, &'a str);
+
+    impl Drop for EntryGuard<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.delete(self.1);
+        }
+    }
+
     #[test]
     fn keyring_round_trip_uses_throwaway_service() {
         let s = KeyringSecretStore::with_service(&format!("herald-test-{}", uuid::Uuid::new_v4()));
@@ -176,11 +185,31 @@ mod tests {
             return;
         }
         let key = "round-trip";
+        let _guard = EntryGuard(&s, key);
         assert_eq!(s.get(key).unwrap(), None);
         s.set(key, "secret-value").unwrap();
         assert_eq!(s.get(key).unwrap().as_deref(), Some("secret-value"));
         s.delete(key).unwrap();
         assert_eq!(s.get(key).unwrap(), None);
         s.delete(key).unwrap();
+    }
+
+    #[test]
+    fn map_error_maps_each_variant() {
+        assert!(matches!(
+            map_error(keyring::Error::NoDefaultStore),
+            SecretError::NoNativeStore
+        ));
+        let bad = map_error(keyring::Error::BadEncoding(b"hunter2".to_vec())).to_string();
+        assert!(bad.contains("not valid UTF-8"));
+        assert!(!bad.contains("hunter2"));
+        assert!(matches!(
+            map_error(keyring::Error::NoEntry),
+            SecretError::Backend(_)
+        ));
+        assert!(matches!(
+            map_error(keyring::Error::Invalid("a".into(), "b".into())),
+            SecretError::Backend(_)
+        ));
     }
 }

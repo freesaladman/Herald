@@ -12,6 +12,8 @@ use crate::event::Event;
 
 const SCHEMA_VERSION: i64 = 1;
 
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS events (
     id TEXT PRIMARY KEY,
@@ -62,6 +64,10 @@ pub enum StoreError {
     Timestamp(#[from] chrono::ParseError),
     #[error("store lock poisoned")]
     Poisoned,
+    #[error(
+        "database schema version {found} is newer than this build supports ({supported}); upgrade Herald"
+    )]
+    SchemaTooNew { found: i64, supported: i64 },
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -95,12 +101,40 @@ fn parse_ts(s: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(s)?.with_timezone(&Utc))
 }
 
+/// Refuses a database written by a newer build; a missing meta table or version is fine.
+fn check_schema_version(conn: &Connection) -> Result<()> {
+    let has_meta: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_meta {
+        return Ok(());
+    }
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match value.and_then(|v| v.trim().parse::<i64>().ok()) {
+        Some(found) if found > SCHEMA_VERSION => Err(StoreError::SchemaTooNew {
+            found,
+            supported: SCHEMA_VERSION,
+        }),
+        _ => Ok(()),
+    }
+}
+
 impl Store {
     /// Opens (creating if needed) a read-write database and migrates its schema.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        // Before the WAL pragma, so a newer database is refused without being modified.
+        check_schema_version(&conn)?;
         conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Self::init(conn)
     }
 
@@ -114,13 +148,16 @@ impl Store {
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        check_schema_version(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
     fn init(conn: Connection) -> Result<Self> {
+        // Check first so a newer database is refused before the DDL touches it.
+        check_schema_version(&conn)?;
         conn.execute_batch(SCHEMA)?;
         conn.execute(
             "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?1)",
@@ -483,12 +520,14 @@ mod tests {
         assert!(s.get_watermark("w").unwrap().is_some());
         assert_eq!(s.get_snapshot::<u32>("snap").unwrap(), Some(1));
         assert_eq!(s.get_ui_state("k").unwrap().as_deref(), Some("v"));
-        let runs: i64 = s
-            .lock()
+        let conn = s.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT hook FROM hook_runs").unwrap();
+        let runs: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
             .unwrap()
-            .query_row("SELECT COUNT(*) FROM hook_runs", [], |r| r.get(0))
+            .collect::<std::result::Result<_, _>>()
             .unwrap();
-        assert_eq!(runs, 1);
+        assert_eq!(runs, ["new-run"]);
     }
 
     #[test]
@@ -514,5 +553,74 @@ mod tests {
         assert!(ro.get_event("a").unwrap().is_some());
         assert!(ro.set_ui_state("k", "v").is_err());
         assert!(ro.insert_event_if_new(&event("b", at(1), true)).is_err());
+    }
+
+    #[test]
+    fn reader_reads_while_writer_inserts_in_wal_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herald.db");
+        let writer = Store::open(&path).unwrap();
+        let reader = Store::open_read_only(&path).unwrap();
+
+        let mode: String = reader
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for i in 0..200 {
+                    let id = format!("e{i}");
+                    assert!(
+                        writer
+                            .insert_event_if_new(&event(&id, at(i), true))
+                            .unwrap()
+                    );
+                }
+            });
+            scope.spawn(|| {
+                for _ in 0..200 {
+                    reader.unviewed_count().unwrap();
+                }
+            });
+        });
+        assert_eq!(reader.unviewed_count().unwrap(), 200);
+    }
+
+    #[test]
+    fn open_refuses_a_newer_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herald.db");
+        let newer = (SCHEMA_VERSION + 1).to_string();
+        {
+            let s = Store::open(&path).unwrap();
+            let conn = s.lock().unwrap();
+            conn.execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                params![newer],
+            )
+            .unwrap();
+            conn.execute_batch("DROP TABLE ui_state").unwrap();
+        }
+        for result in [Store::open(&path), Store::open_read_only(&path)] {
+            match result {
+                Err(StoreError::SchemaTooNew { found, supported }) => {
+                    assert_eq!(found, SCHEMA_VERSION + 1);
+                    assert_eq!(supported, SCHEMA_VERSION);
+                }
+                other => panic!("expected SchemaTooNew, got {:?}", other.err()),
+            }
+        }
+        let conn = Connection::open(&path).unwrap();
+        let has_ui_state: bool = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'ui_state')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!has_ui_state, "refused open must not run the schema DDL");
     }
 }

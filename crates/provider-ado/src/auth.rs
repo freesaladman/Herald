@@ -18,6 +18,8 @@ const ADO_RESOURCE: &str = "499b84ac-1321-427f-aa17-267ca6975798";
 const EXPIRY_MARGIN_MINUTES: i64 = 5;
 const STDERR_EXCERPT_CHARS: usize = 200;
 const AZ_TIMEOUT: Duration = Duration::from_secs(30);
+// Backstop for runners that do not enforce AZ_TIMEOUT themselves; leaves room for the tree kill.
+const AZ_BACKSTOP: Duration = Duration::from_secs(40);
 
 /// Failure of the `az` invocation: it could not start or exited non-zero.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +33,106 @@ pub(crate) trait AzRunner: Send + Sync {
 }
 
 struct CliAzRunner;
+
+/// Stands in for stderr when the run is cut off at the deadline.
+const AZ_TIMED_OUT: &str = "az timed out";
+
+/// Kills the process tree when dropped while armed, so a caller that drops the run future
+/// (cancellation) still takes az's python child down. Runs on a plain thread: the runtime
+/// may already be shutting down, where `spawn_blocking` would panic. The guard owns the
+/// Child so its OS handle (and with it the PID) outlives the tree kill; a recycled PID
+/// could otherwise be killed instead.
+struct TreeKill {
+    child: Option<tokio::process::Child>,
+    armed: bool,
+    kill: fn(u32),
+}
+
+impl Drop for TreeKill {
+    fn drop(&mut self) {
+        let child = self.child.take();
+        if !self.armed {
+            return;
+        }
+        if let Some(pid) = child.as_ref().and_then(|c| c.id()) {
+            let kill = self.kill;
+            std::thread::spawn(move || {
+                kill(pid);
+                drop(child);
+            });
+        }
+    }
+}
+
+async fn read_all<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    if let Some(mut pipe) = pipe {
+        let _ = pipe.read_to_end(&mut buf).await;
+    }
+    buf
+}
+
+/// Runs `cmd` to completion or `timeout`. On timeout the tree is killed while the root
+/// process still exists (taskkill /T needs it to find the descendants), then the child.
+/// The child has no kill_on_drop: dropping it first would kill only the root.
+async fn run_command(
+    mut cmd: tokio::process::Command,
+    timeout: Duration,
+    kill: fn(u32),
+) -> Result<String, AzFailure> {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let child = cmd.spawn().map_err(|e| AzFailure {
+        stderr: format!("could not run az: {e}"),
+    })?;
+    // Covers az's python child if Herald itself dies.
+    herald_core::process::assign_to_kill_on_exit_job(&child);
+    let mut guard = TreeKill {
+        child: Some(child),
+        armed: true,
+        kill,
+    };
+    let Some(child) = guard.child.as_mut() else {
+        return Err(AzFailure {
+            stderr: "could not run az".to_string(),
+        });
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    // Pipes are drained concurrently with the wait so a full pipe cannot stall az.
+    let io = async { tokio::join!(read_all(stdout), read_all(stderr), child.wait()) };
+    let result = tokio::time::timeout(timeout, io).await;
+    guard.armed = false;
+    match result {
+        Ok((out, err, status)) => match status {
+            Ok(s) if s.success() => Ok(String::from_utf8_lossy(&out).into_owned()),
+            Ok(_) => Err(AzFailure {
+                stderr: String::from_utf8_lossy(&err).into_owned(),
+            }),
+            Err(e) => Err(AzFailure {
+                stderr: format!("could not run az: {e}"),
+            }),
+        },
+        Err(_) => {
+            if let Some(child) = guard.child.as_mut() {
+                if let Some(pid) = child.id() {
+                    let _ = tokio::task::spawn_blocking(move || kill(pid)).await;
+                }
+                let _ = child.kill().await;
+            }
+            Err(AzFailure {
+                stderr: AZ_TIMED_OUT.to_string(),
+            })
+        }
+    }
+}
 
 impl AzRunner for CliAzRunner {
     fn run(&self) -> BoxFuture<'_, Result<String, AzFailure>> {
@@ -59,20 +161,7 @@ impl AzRunner for CliAzRunner {
                 "-o",
                 "json",
             ]);
-            cmd.stdin(std::process::Stdio::null()).kill_on_drop(true);
-            #[cfg(windows)]
-            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-
-            let out = cmd.output().await.map_err(|e| AzFailure {
-                stderr: format!("could not run az: {e}"),
-            })?;
-            if out.status.success() {
-                Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-            } else {
-                Err(AzFailure {
-                    stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-                })
-            }
+            run_command(cmd, AZ_TIMEOUT, herald_core::process::kill_tree).await
         })
     }
 }
@@ -189,9 +278,9 @@ impl AdoAuth {
         {
             return Ok(c.header.clone());
         }
-        let stdout = tokio::time::timeout(AZ_TIMEOUT, self.runner.run())
+        let stdout = tokio::time::timeout(AZ_BACKSTOP, self.runner.run())
             .await
-            .map_err(|_| ProviderError::Other("az timed out".to_string()))?
+            .map_err(|_| ProviderError::Other(AZ_TIMED_OUT.to_string()))?
             .map_err(classify_failure)?;
         let (token, expires) = parse_token(&stdout)?;
         let header = format!("Bearer {token}");
@@ -205,6 +294,9 @@ impl AdoAuth {
 }
 
 fn classify_failure(f: AzFailure) -> ProviderError {
+    if f.stderr == AZ_TIMED_OUT {
+        return ProviderError::Other(AZ_TIMED_OUT.to_string());
+    }
     let lower = f.stderr.to_lowercase();
     if lower.contains("az login") || lower.contains("not logged in") {
         return ProviderError::MissingCredentials;
@@ -474,6 +566,93 @@ mod tests {
             ProviderError::Other("az timed out".into())
         );
         assert_eq!(auth.authorization().await.unwrap(), "Bearer tok-after");
+    }
+
+    static KILLED_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    fn record_and_kill(pid: u32) {
+        KILLED_PID.store(pid, Ordering::SeqCst);
+        herald_core::process::kill_tree(pid);
+    }
+
+    fn sleeper() -> tokio::process::Command {
+        #[cfg(windows)]
+        {
+            let mut c = tokio::process::Command::new("cmd");
+            c.args(["/D", "/C", "ping -n 30 127.0.0.1 >NUL"]);
+            c
+        }
+        #[cfg(not(windows))]
+        {
+            let mut c = tokio::process::Command::new("sleep");
+            c.arg("30");
+            c
+        }
+    }
+
+    #[tokio::test]
+    async fn run_command_timeout_kills_the_tree_and_reports_a_timeout() {
+        let started = std::time::Instant::now();
+        let err = run_command(sleeper(), Duration::from_millis(300), record_and_kill)
+            .await
+            .unwrap_err();
+        assert_eq!(err.stderr, AZ_TIMED_OUT);
+        assert_ne!(
+            KILLED_PID.load(Ordering::SeqCst),
+            0,
+            "tree kill not invoked"
+        );
+        assert!(started.elapsed() < Duration::from_secs(15));
+        assert_eq!(
+            classify_failure(err),
+            ProviderError::Other("az timed out".into())
+        );
+    }
+
+    static CANCELLED_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    fn record_cancel_and_kill(pid: u32) {
+        CANCELLED_PID.store(pid, Ordering::SeqCst);
+        herald_core::process::kill_tree(pid);
+    }
+
+    #[tokio::test]
+    async fn run_command_dropped_future_kills_the_tree() {
+        let outer = tokio::time::timeout(
+            Duration::from_millis(300),
+            run_command(sleeper(), Duration::from_secs(30), record_cancel_and_kill),
+        )
+        .await;
+        assert!(outer.is_err(), "run_command finished before the cancel");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while CANCELLED_PID.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_ne!(
+            CANCELLED_PID.load(Ordering::SeqCst),
+            0,
+            "tree kill not invoked after the future was dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_returns_stdout_on_success() {
+        #[cfg(windows)]
+        let cmd = {
+            let mut c = tokio::process::Command::new("cmd");
+            c.args(["/D", "/C", "echo hi"]);
+            c
+        };
+        #[cfg(not(windows))]
+        let cmd = {
+            let mut c = tokio::process::Command::new("echo");
+            c.arg("hi");
+            c
+        };
+        let out = run_command(cmd, Duration::from_secs(10), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(out.trim(), "hi");
     }
 
     #[tokio::test]

@@ -18,6 +18,11 @@ pub struct Bus {
     tx: broadcast::Sender<Arc<Event>>,
 }
 
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Bus>();
+};
+
 impl Bus {
     pub fn new(store: Arc<Store>, classifier: Classifier, local_index: LocalIndex) -> Bus {
         let (tx, _) = broadcast::channel(CAPACITY);
@@ -29,7 +34,7 @@ impl Bus {
         }
     }
 
-    /// Persists and broadcasts a new event. `None` for a duplicate id, an empty id or a store error.
+    /// Persists and broadcasts a new event; `Some` means the event was new. `None` for a duplicate id, an empty id or a store error.
     pub fn publish(&self, e: Event) -> Option<Arc<Event>> {
         self.try_publish(e).ok().flatten()
     }
@@ -188,6 +193,7 @@ mod tests {
                 scan_roots: vec![tmp.path().display().to_string()],
                 scan_depth: 2,
             },
+            &[],
             &registry,
         );
         let bus = bus(classifier(&[]), idx);

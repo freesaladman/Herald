@@ -561,6 +561,187 @@ mod tests {
     }
 
     #[test]
+    fn every_id_builder_produces_its_documented_format() {
+        let at = t();
+        let ms = at.timestamp_millis();
+        let iso = "2026-11-20T17:52:29.007Z";
+        let cases: Vec<(&str, String, String)> = vec![
+            (
+                "pr_created",
+                ids::pr_created("c", "r", 5),
+                "c:pr:r:5:created".into(),
+            ),
+            (
+                "pr_completed",
+                ids::pr_completed("c", "r", 5),
+                "c:pr:r:5:completed".into(),
+            ),
+            (
+                "pr_abandoned",
+                ids::pr_abandoned("c", "r", 5),
+                "c:pr:r:5:abandoned".into(),
+            ),
+            (
+                "pr_reactivated",
+                ids::pr_reactivated("c", "r", 5, at),
+                format!("c:pr:r:5:reactivated:{iso}"),
+            ),
+            (
+                "pr_comment",
+                ids::pr_comment("c", "r", 5, "t1", "k2"),
+                "c:pr:r:5:thread:t1:comment:k2".into(),
+            ),
+            (
+                "pr_mention",
+                ids::pr_mention("c", "r", 5, "t1", "k2"),
+                "c:pr:r:5:thread:t1:mention:k2".into(),
+            ),
+            (
+                "pr_description_mention",
+                ids::pr_description_mention("c", "r", 5),
+                "c:pr:r:5:description-mention".into(),
+            ),
+            (
+                "pr_thread_status",
+                ids::pr_thread_status("c", "r", 5, "t1", "fixed", at),
+                format!("c:pr:r:5:thread:t1:status:fixed:{iso}"),
+            ),
+            (
+                "pr_system",
+                ids::pr_system("c", "r", 5, "t1"),
+                "c:pr:r:5:system:t1".into(),
+            ),
+            (
+                "pr_iteration",
+                ids::pr_iteration("c", "r", 5, "3"),
+                "c:pr:r:5:iteration:3".into(),
+            ),
+            (
+                "pr_rereview",
+                ids::pr_rereview("c", "r", 5, "3"),
+                "c:pr:r:5:rereview:3".into(),
+            ),
+            (
+                "pr_rereview_reset",
+                ids::pr_rereview_reset("c", "r", 5, "t1"),
+                "c:pr:r:5:rereview:reset:t1".into(),
+            ),
+            (
+                "pr_policy",
+                ids::pr_policy("c", "r", 5, "e1", "rejected"),
+                "c:pr:r:5:policy:e1:rejected".into(),
+            ),
+            (
+                "pr_merge",
+                ids::pr_merge("c", "r", 5, "conflicts", at),
+                format!("c:pr:r:5:merge:conflicts:{ms}"),
+            ),
+            (
+                "branch",
+                ids::branch("c", "r", "p9", "refs/heads/a"),
+                "c:branch:r:p9:refs/heads/a".into(),
+            ),
+            (
+                "run_completed",
+                ids::run_completed("c", "77"),
+                "c:run:77:completed".into(),
+            ),
+            (
+                "run_stage_failed",
+                ids::run_stage_failed("c", "77", "rec"),
+                "c:run:77:stage:rec:failed".into(),
+            ),
+            (
+                "release_created",
+                ids::release_created("c", "9"),
+                "c:release:9:created".into(),
+            ),
+            (
+                "deploy",
+                ids::deploy("c", "1", "2", "3", "failed"),
+                "c:release:1:env:2:deploy:3:failed".into(),
+            ),
+            (
+                "approval",
+                ids::approval("c", "ado-yaml", "a1", "pending"),
+                "c:approval:ado-yaml:a1:pending".into(),
+            ),
+            (
+                "auth_failed",
+                ids::auth_failed("c", at),
+                format!("c:auth:failed:{ms}"),
+            ),
+            (
+                "source_disabled",
+                ids::source_disabled("c", "prs", at),
+                format!("c:source-disabled:prs:{ms}"),
+            ),
+            ("catchup", ids::catchup(at), "catchup:1795197149007".into()),
+            (
+                "ui_activated",
+                ids::ui_activated("orig", at),
+                format!("ui:activated:orig:{ms}"),
+            ),
+            ("test", ids::test("u-1"), "test:u-1".into()),
+        ];
+        for (name, got, want) in cases {
+            assert_eq!(got, want, "{name}");
+        }
+    }
+
+    #[test]
+    fn every_system_family_resolves_as_system() {
+        use event_types::*;
+        let system = [
+            RUN_COMPLETED,
+            RUN_STAGE_FAILED,
+            RELEASE_CREATED,
+            DEPLOY_STARTED,
+            DEPLOY_SUCCEEDED,
+            DEPLOY_FAILED,
+            DEPLOY_CANCELED,
+            APPROVAL_PENDING,
+            APPROVAL_COMPLETED,
+            PR_POLICY_CHANGED,
+            PR_CONFLICTS_DETECTED,
+            PR_CONFLICTS_CLEARED,
+            PR_REREVIEW_NEEDED,
+            CATCHUP_SUMMARY,
+            AUTH_FAILED,
+            SOURCE_DISABLED,
+        ];
+        for s in system {
+            assert!(is_system_type(s), "{s}");
+        }
+        let not_system = [
+            PR_CREATED,
+            PR_PUBLISHED,
+            PR_COMPLETED,
+            PR_ABANDONED,
+            PR_REACTIVATED,
+            PR_ITERATION_PUSHED,
+            PR_REVIEWER_ADDED,
+            PR_REVIEWER_REMOVED,
+            PR_VOTE_CHANGED,
+            PR_VOTES_RESET,
+            PR_COMMENT_ADDED,
+            PR_COMMENT_REPLIED,
+            PR_THREAD_STATUS_CHANGED,
+            PR_MENTIONED,
+            PR_AUTOCOMPLETE_SET,
+            PR_AUTOCOMPLETE_CANCELLED,
+            BRANCH_CREATED,
+            BRANCH_PUSHED,
+            BRANCH_FORCEPUSHED,
+            BRANCH_DELETED,
+            RECORD_ACTIVATED,
+        ];
+        for s in not_system {
+            assert!(!is_system_type(s), "{s}");
+        }
+    }
+
+    #[test]
     fn system_type_matching() {
         for s in [
             "run.completed",

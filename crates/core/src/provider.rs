@@ -149,6 +149,11 @@ pub trait ProviderFactory: Send + Sync {
         secrets: Arc<dyn SecretStore>,
     ) -> Result<Arc<dyn Connection>, ProviderError>;
     fn parse_remote(&self, git_remote_url: &str) -> Option<RemoteRepo>;
+    /// The `RemoteRepo::host_key` clones of this connection's repos carry, or `None`
+    /// when it can't be derived (remotes are then matched without a host check).
+    fn host_key(&self, _cfg: &ConnectionConfig) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Clone)]
@@ -307,6 +312,7 @@ mod tests {
         let mut poll = source.poll(&ctx);
         let held = tokio::time::timeout(Duration::from_millis(50), &mut poll).await;
         assert!(held.is_err());
+        assert_eq!(provider.poll_count("alpha"), 1);
 
         provider.release_polls("alpha");
         let result = tokio::time::timeout(Duration::from_secs(5), poll)

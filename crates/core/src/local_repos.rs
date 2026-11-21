@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use crate::config::LocalConfig;
+use crate::config::{ConnectionConfig, LocalConfig};
 use crate::event::{Event, LocalPaths, RepoRef};
 use crate::provider::{ProviderRegistry, RemoteRepo};
 
@@ -27,6 +27,8 @@ struct LocalRepo {
 #[derive(Debug, Clone, Default)]
 pub struct LocalIndex {
     repos: Vec<LocalRepo>,
+    /// Connection id -> host key of its provider; absent means match without a host check.
+    host_keys: BTreeMap<String, String>,
 }
 
 impl LocalIndex {
@@ -34,7 +36,20 @@ impl LocalIndex {
         Self::default()
     }
 
-    pub fn build(cfg: &LocalConfig, registry: &ProviderRegistry) -> Self {
+    pub fn build(
+        cfg: &LocalConfig,
+        connections: &[ConnectionConfig],
+        registry: &ProviderRegistry,
+    ) -> Self {
+        // A connection added by a reload has no entry until the next housekeeping rebuild and
+        // matches by repo name alone until then.
+        let host_keys = connections
+            .iter()
+            .filter_map(|c| {
+                let key = registry.get(&c.provider)?.host_key(c)?;
+                Some((c.id.clone(), key))
+            })
+            .collect();
         // Keyed by the common git dir so a main clone and its worktrees group together.
         let mut found: BTreeMap<PathBuf, Vec<Checkout>> = BTreeMap::new();
         for root in &cfg.scan_roots {
@@ -67,15 +82,16 @@ impl LocalIndex {
                 worktrees,
             });
         }
-        Self { repos }
+        Self { repos, host_keys }
     }
 
     pub fn enrich(&self, e: &mut Event) {
         let Some(repo_ref) = &e.repo else { return };
+        let host_key = self.host_keys.get(&e.connection.id).map(String::as_str);
         let Some(repo) = self.repos.iter().find(|r| {
             r.remotes
                 .iter()
-                .any(|rm| remote_matches(rm, &e.connection.provider, repo_ref))
+                .any(|rm| remote_matches(rm, &e.connection.provider, host_key, repo_ref))
         }) else {
             return;
         };
@@ -99,8 +115,9 @@ impl LocalIndex {
     }
 }
 
-fn remote_matches(rm: &RemoteRepo, provider: &str, repo: &RepoRef) -> bool {
+fn remote_matches(rm: &RemoteRepo, provider: &str, host_key: Option<&str>, repo: &RepoRef) -> bool {
     rm.provider == provider
+        && host_key.is_none_or(|h| rm.host_key.eq_ignore_ascii_case(h))
         && rm.repo_name.eq_ignore_ascii_case(&repo.name)
         && match (&rm.namespace, &repo.namespace) {
             (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
@@ -302,7 +319,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let clone = tmp.path().join("widgets");
         make_clone(&clone, URL, "ref: refs/heads/main\n");
-        let idx = LocalIndex::build(&cfg(tmp.path(), 2), &registry());
+        let idx = LocalIndex::build(&cfg(tmp.path(), 2), &[], &registry());
 
         let mut e = event("WIDGETS", Some("refs/heads/feature"));
         idx.enrich(&mut e);
@@ -318,7 +335,7 @@ mod tests {
         make_clone(&main, URL, "ref: refs/heads/main\n");
         let wt = tmp.path().join("widgets-feat");
         make_worktree(&wt, &main, "feat", "ref: refs/heads/feature/x\n");
-        let idx = LocalIndex::build(&cfg(tmp.path(), 2), &registry());
+        let idx = LocalIndex::build(&cfg(tmp.path(), 2), &[], &registry());
 
         let mut e = event("Widgets", Some("refs/heads/feature/x"));
         idx.enrich(&mut e);
@@ -350,7 +367,7 @@ mod tests {
             "wt",
             "0123456789abcdef0123456789abcdef01234567\n",
         );
-        let idx = LocalIndex::build(&cfg(tmp.path(), 2), &registry());
+        let idx = LocalIndex::build(&cfg(tmp.path(), 2), &[], &registry());
 
         let mut e = event("widgets", Some("refs/heads/feature"));
         idx.enrich(&mut e);
@@ -367,10 +384,75 @@ mod tests {
         );
 
         let mut e = event("widgets", None);
-        LocalIndex::build(&cfg(tmp.path(), 2), &registry()).enrich(&mut e);
+        LocalIndex::build(&cfg(tmp.path(), 2), &[], &registry()).enrich(&mut e);
         assert!(e.local.is_none());
 
-        LocalIndex::build(&cfg(tmp.path(), 3), &registry()).enrich(&mut e);
+        LocalIndex::build(&cfg(tmp.path(), 3), &[], &registry()).enrich(&mut e);
+        assert!(e.local.is_some());
+    }
+
+    fn conn(id: &str, host: Option<&str>) -> ConnectionConfig {
+        let host_line = host
+            .map(|h| {
+                format!(
+                    "host = \"{h}\"
+"
+                )
+            })
+            .unwrap_or_default();
+        crate::config::Config::from_toml_str(&format!(
+            "[[connections]]
+id = \"{id}\"
+provider = \"fake\"
+auth = {{ method = \"pat\" }}
+{host_line}"
+        ))
+        .unwrap()
+        .connections
+        .remove(0)
+    }
+
+    #[test]
+    fn enrich_requires_the_connection_host_key_to_match_the_clone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clone = tmp.path().join("widgets");
+        make_clone(
+            &clone,
+            "fake://HostB/proj/Widgets",
+            "ref: refs/heads/main
+",
+        );
+        let connections = [conn("a", Some("hosta")), conn("b", Some("hostb"))];
+        let idx = LocalIndex::build(&cfg(tmp.path(), 2), &connections, &registry());
+
+        let mut from_a = event("widgets", None);
+        from_a.connection.id = "a".into();
+        idx.enrich(&mut from_a);
+        assert!(from_a.local.is_none());
+
+        let mut from_b = event("widgets", None);
+        from_b.connection.id = "b".into();
+        idx.enrich(&mut from_b);
+        assert_eq!(
+            from_b.local.unwrap().repo_path,
+            Some(clone.display().to_string())
+        );
+    }
+
+    #[test]
+    fn enrich_without_a_known_host_key_matches_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_clone(
+            &tmp.path().join("widgets"),
+            URL,
+            "ref: refs/heads/main
+",
+        );
+        let connections = [conn("c", None)];
+        let idx = LocalIndex::build(&cfg(tmp.path(), 2), &connections, &registry());
+
+        let mut e = event("widgets", None);
+        idx.enrich(&mut e);
         assert!(e.local.is_some());
     }
 
@@ -383,7 +465,7 @@ mod tests {
             "fake://host/proj/Hidden",
             "ref: refs/heads/main\n",
         );
-        let idx = LocalIndex::build(&cfg(tmp.path(), 3), &registry());
+        let idx = LocalIndex::build(&cfg(tmp.path(), 3), &[], &registry());
 
         let mut other = event("gadgets", None);
         idx.enrich(&mut other);

@@ -148,7 +148,7 @@ All keys are snake_case TOML. Every section is optional; the defaults are below 
 | `local.scan_depth` | 2 | how deep below each root to look |
 | `stream.port` | 0 | stream port; 0 picks a free one (see Stream) |
 
-Changing `stream.port` needs an app restart. Changed `[polling]` intervals apply to connections when they restart (a config reload restarts them). Other keys apply on reload.
+Changing `stream.port` applies on reload: the stream restarts on the new port with a new token, so clients must re-read `stream.json`. Changed `[polling]` intervals apply to connections when they restart (a config reload restarts them). Other keys apply on reload.
 
 `local.scan_roots` lets Herald map an event to your checkout: it reads each repo's git remotes (and worktrees) and fills `local.repoPath` (main clone) and `local.worktreePath` (a worktree on the PR source branch or the branch). The index rebuilds every `slow_secs`.
 
@@ -181,7 +181,7 @@ debounce_secs = 10
 [[hooks]]
 name = "log-pr-created"
 on = ["pr.created"]
-run = { windows = ["cmd", "/C", "echo", "{pr.id}", ">>", "C:\\temp\\prs.txt"], default = ["logger", "{pr.id}"] }
+run = { windows = ["cmd", "/C", "echo %HERALD_PR_ID% >> C:\\temp\\prs.txt"], default = ["logger", "{pr.id}"] }
 ```
 
 | Field | Default | Meaning |
@@ -202,7 +202,7 @@ run = { windows = ["cmd", "/C", "echo", "{pr.id}", ">>", "C:\\temp\\prs.txt"], d
 
 Gates, in order: type and `match`; catch-up; test; snooze; debounce and re-entrancy (keyed by hook name and subject, so a hook cannot pile up on one PR; detached hooks skip the re-entrancy check). At most 4 non-detached hooks run at once. Hooks fire on catch-up events only with `catch_up = true`.
 
-Each run records start, exit code, error and the last 4 KB of stderr in `herald.db` (`hook_runs`). On timeout, or when Herald shuts down, the whole process tree is killed (taskkill /T on Windows, the process group elsewhere). A normal exit does not kill grandchildren, so a launcher that spawns a long-lived process leaves it running. Detached hooks are never killed by Herald. Herald does not use a Windows Job Object, so if Herald itself crashes, running hook children can outlive it.
+Each run records start, exit code, error and the last 4 KB of stderr in `herald.db` (`hook_runs`). On timeout, or when Herald shuts down, the whole process tree is killed (taskkill /T on Windows, the process group elsewhere). A normal exit does not kill grandchildren, so a launcher that spawns a long-lived process leaves it running until Herald exits on Windows; use `detached = true` for anything that should outlive Herald. Detached hooks are never killed by Herald. On Windows, non-detached hook children also run in a kill-on-close Job Object, so they die with Herald even if it crashes.
 
 ### Payload
 
@@ -218,33 +218,22 @@ Event shape (abridged): `id`, `type`, `connection {id, provider}`, `occurredUtc`
 Event text comes from other people (PR titles, branch names, comments). Treat every placeholder value as hostile input.
 
 - Argv-only (no shell) is the safe default: Herald passes each argv element to the program as is, with no re-parsing.
-- A run is in a shell context when any argv element is a known shell (this covers wrappers too: `env sh -c ...`, `sudo bash ...`). The shell list: `cmd`, `sh`, `bash`, `zsh`, `dash`, `ksh`, `mksh`, `ash`, `fish`, `busybox`, `pwsh`, `powershell`, `wsl`, `csh`, `tcsh`, `nu`, `ssh`, `su`, `runuser`. Every placeholder value after the first shell must match a strict allowlist, otherwise the hook is refused and an error is recorded. The sh family (and `wsl`, `ssh`, `su`, ...) allows letters, digits and `. _ / @ : + -`; `cmd`, `pwsh` and `powershell` also allow backslash. Spaces are not allowed under any shell, so a title with spaces or quotes is refused in a shell string by design.
-- Pass rich values as environment variables instead: `"$HERALD_BRANCH"` (quoted) in sh, `$env:HERALD_BRANCH` in PowerShell, or read `HERALD_EVENT_FILE` / stdin. Hook `env` entries work the same way.
-- Never use a placeholder as the program itself (the first argv element); the program must be a literal.
-- Pass values that fail the allowlist (anything with spaces, such as titles or comments) through `HERALD_*` environment variables or by reading the JSON at `HERALD_EVENT_FILE`. There is no `$env:HERALD_PR_TITLE`-style variable: the variables that exist are `HERALD_EVENT_TYPE`, `HERALD_EVENT_ID`, `HERALD_EVENT_FILE`, `HERALD_SUBJECT`, `HERALD_CONNECTION`, `HERALD_PROVIDER`, and when present `HERALD_URL`, `HERALD_PR_ID`, `HERALD_REPO`, `HERALD_BRANCH`, `HERALD_LOCAL_PATH`.
-- A placeholder at a shell's command position is refused even when its value is safe, because the value would then be what runs: `cmd /c {x}`, `pwsh -Command {x}`, `pwsh {x}`, `sh -c {x}`. Only the start of the shell's command string is checked: a placeholder later in it (after `;` or `&&`, after a leading space or quote, or inside a nested shell string) is still held to the allowlist but not refused outright, so keep placeholders out of command strings.
+- A run is in a shell context when any argv element is a known shell (this covers wrappers too: `env sh -c ...`, `sudo bash ...`). The shell list: `cmd`, `sh`, `bash`, `zsh`, `dash`, `ksh`, `mksh`, `ash`, `fish`, `busybox`, `pwsh`, `powershell`, `wsl`, `csh`, `tcsh`, `nu`, `ssh`, `su`, `runuser`. From the first shell on, a placeholder is allowed only as a positional parameter of an sh-family shell (`sh`, `bash`, `zsh`, `dash`, `ksh`, `mksh`, `ash`) run with `-c`: the `-c` flag (optionally clustered with value-less flags, like `-ce`) must be the element directly after the shell, and the next element, the command string, must not start with `-` or `+` (the shell would read it as an option). The elements after the command string become `$0`, `$1`, ... and are data, e.g. `["sh", "-c", "echo \"$1\"", "_", "{pr.id}"]`. The command string and everything before it may not contain a placeholder. Any other shape has no positionals, so every placeholder after the shell is refused and an error recorded: options before `-c` (`bash -e -c ...`), `-c` after a script name, all of `cmd` (any `/c`, `/k`, `/r`, glued `/c...`, and everything after it), all of `pwsh` and `powershell` (any flag, including `-File`, `-Command`, `-EncodedCommand`), `wsl`, `ssh`, `su`, `runuser`, `csh`, `tcsh`, `fish`, `nu`, `busybox`, and sh-family shells without `-c`.
+- Command wrappers run their arguments as a command, and Herald does not parse their options, so no placeholder is allowed in any argument from the first wrapper up to the first shell (or to the end of the argv when there is no shell): `env`, `sudo`, `doas`, `timeout`, `nice`, `nohup`, `setsid`, `stdbuf`, `xargs`, `watch`, `flock`, `script`, `chroot`, `runas`, `start`, `time`, `exec`, `command`. The check is by name, so it also refuses harmless uses such as `sudo git checkout -- {branch.shortName}`. `["env", "FOO=1", "sh", "-c", "true", "_", "{pr.id}"]` is fine: the placeholder is after the shell, in a positional slot.
+- A positional placeholder must still match a strict allowlist: letters, digits and `. _ / @ : + -`. Spaces and backslashes are not allowed, so a title with spaces or quotes is refused by design (use `{pr.id}` or `{branch.shortName}`).
+- Pass everything else (titles, comments, anything with spaces) through environment variables, the event file or stdin: `"$HERALD_BRANCH"` (quoted) in sh, `$env:HERALD_BRANCH` in PowerShell, or read `HERALD_EVENT_FILE` / stdin. Hook `env` entries work the same way.
+- The program (the first argv element of every `run` list) must be a literal: a placeholder there is a config error.
+- Hook `env` entries named `BASH_ENV`, `ENV`, `PS4`, `PROMPT_COMMAND`, `SHELLOPTS`, `BASHOPTS` or starting with `BASH_FUNC_` (case-insensitive) are executed by shells, so a placeholder in their value is a config error.
+- Values that fail the allowlist (anything with spaces, such as titles or comments) can only reach a shell through `HERALD_*` environment variables or the JSON at `HERALD_EVENT_FILE`. There is no `$env:HERALD_PR_TITLE`-style variable: the variables that exist are `HERALD_EVENT_TYPE`, `HERALD_EVENT_ID`, `HERALD_EVENT_FILE`, `HERALD_SUBJECT`, `HERALD_CONNECTION`, `HERALD_PROVIDER`, and when present `HERALD_URL`, `HERALD_PR_ID`, `HERALD_REPO`, `HERALD_BRANCH`, `HERALD_LOCAL_PATH`.
 - cmd also expands `%NAME%` (and `!NAME!`) after parsing. If a cmd command line references a hook `env` entry or a `HERALD_*` variable by name, Herald checks that variable's value against the allowlist too, and refuses the run if it is not allowed. `.bat` and `.cmd` scripts must use `setlocal EnableDelayedExpansion` and `!VAR!`, and avoid `for /f` over untrusted values (it re-parses them).
 - Never put placeholders inside interpreter code strings: `python -c`, `node -e`, `perl -e`, `ruby -e`, `osascript -e`, `mshta`, `rundll32`. These are code, not data; pass values as separate args or env vars and read them in the script.
 - In plain argv (no shell), a value can still start with `-` and be read as an option (option injection), e.g. `git checkout {pr.sourceBranch}`. Put `--` before values: `["git", "checkout", "--", "{pr.sourceBranch}"]`, or use a program that takes explicit flags.
 - `cwd` should come only from `local.*` placeholders (`{local.worktreePath}`, `{local.repoPath}`), which are paths from your own disk scan, not event text.
-- Nested shells are checked as a whole: `pwsh -c "cmd /c ..."` is held to the strictest allowlist of the shells present (the sh family beats cmd and PowerShell).
-- Not enforced, so a documented risk: wrappers that take a command in a different way (`wsl {x}`, `ssh host {x}`, `pwsh -File {x}`, `-EncodedCommand`), interpreter code strings (`python -c`, `node -e`, ...), and option injection in plain argv (use `--`).
+- Nested shells: the first shell decides where placeholders may go, and the allowlist of the strictest shell present applies (the sh family beats cmd and PowerShell).
+- Not enforced, so a documented risk: interpreter code strings (`python -c`, `node -e`, ...), option injection in plain argv (use `--`), and other programs that take a command as an argument and are not in the wrapper list (e.g. `find -exec`, `wt`, `schtasks`).
 - Console programs started with `detached = true` open their own console window. Launch GUI programs or a terminal emulator, or run non-detached with a timeout.
 - Use the `open-url` action to open links; it parses the event url and opens only `http` and `https` (never `file:`, UNC or custom schemes). Events without a url are skipped quietly.
 - Loop safety: debounce plus the per-subject re-entrancy guard stop a hook that triggers events from re-firing forever; keep `on` and `match` narrow anyway.
-
-### Example idea (not shipped)
-
-Open a WezTerm window with Claude in the PR's worktree when you create a PR. This is only an example; Herald does not ship it and there is no `pr-champion` skill in this repo. `local.worktreePath` is only set when `local.scan_roots` finds a worktree on the PR's source branch; otherwise the placeholder is missing and the hook does not run.
-
-```toml
-# [[hooks]]
-# name = "pr-champion"
-# on = ["pr.created"]
-# match = { "actor.kind" = "me" }
-# detached = true
-# run.windows = ["wezterm", "start", "--cwd", "{local.worktreePath}", "--", "claude", "/pr-champion", "{pr.id}"]
-```
 
 ## Stream
 
@@ -328,7 +317,7 @@ Known limitations:
 - macOS and Linux are untested (code-complete behind `cfg` gates; no do-not-disturb detection there).
 - The PAT scope for YAML pipeline approvals is unconfirmed (see First run).
 - The exact property names ADO uses for a removed reviewer (`CodeReviewReviewersUpdatedRemovedIdentity`) and for reset-all-votes system threads are unconfirmed; those events may be missing or partial.
-- Windows Job Object not used: a hard crash of Herald can leave non-detached hook children running (a normal quit and timeouts kill the tree).
+- Windows Job Object assignment happens just after a child starts, so a grandchild spawned in that instant can escape it.
 - No updater; no history viewer.
 
 ## License

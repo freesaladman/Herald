@@ -34,18 +34,66 @@ pub struct Engine {
     reloads: mpsc::UnboundedSender<Arc<Config>>,
     reload_task: JoinHandle<()>,
     hooks: HookRunner,
-    stream: Option<StreamServer>,
-    stream_control_task: Option<JoinHandle<()>>,
+    stream: Arc<tokio::sync::Mutex<StreamSlot>>,
+    stream_control_task: JoinHandle<()>,
+}
+
+/// The running stream server and the `stream.port` it was started for.
+struct StreamSlot {
+    server: Option<StreamServer>,
+    port: u16,
+}
+
+/// What the reload worker needs to restart the stream.
+struct StreamRestarter {
+    slot: Arc<tokio::sync::Mutex<StreamSlot>>,
+    bus: Arc<Bus>,
+    paths: Paths,
+    control: mpsc::UnboundedSender<String>,
+}
+
+impl StreamRestarter {
+    /// Rebinds when `stream.port` changed, or retries when the stream is down. The old
+    /// server stops first so an explicit port can be reused; if the new bind fails the
+    /// engine keeps running with the stream stopped.
+    async fn apply(&self, port: u16) {
+        let mut slot = self.slot.lock().await;
+        if slot.server.is_some() && slot.port == port {
+            return;
+        }
+        if let Some(old) = slot.server.take() {
+            old.shutdown().await;
+        }
+        slot.port = port;
+        let started = StreamServer::start(
+            self.bus.clone(),
+            self.paths.clone(),
+            port,
+            self.control.clone(),
+        )
+        .await;
+        match started {
+            Ok(server) => {
+                tracing::info!(port = server.port(), "stream server restarted");
+                slot.server = Some(server);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, port, "stream server failed to restart; stream is stopped");
+            }
+        }
+    }
 }
 
 /// Applies reloads one at a time, in the order they were requested.
 async fn run_reloads(
     scheduler: Arc<Scheduler>,
+    stream: StreamRestarter,
     mut applied: Arc<Config>,
     mut rx: mpsc::UnboundedReceiver<Arc<Config>>,
 ) {
     while let Some(next) = rx.recv().await {
         apply_reload(&scheduler, &applied, &next).await;
+        stream.apply(next.stream.port).await;
         applied = next;
     }
 }
@@ -112,15 +160,17 @@ impl Engine {
         paths: Paths,
     ) -> Result<Engine, EngineError> {
         let local = config.local.clone();
+        let connections = config.connections.clone();
         let index_registry = registry.clone();
         // Replaced with one carrying the identities as each connection identifies.
         let classifier = Classifier::new(&config, &BTreeMap::new());
         let bus = Arc::new(Bus::new(store.clone(), classifier, LocalIndex::empty()));
         let index_bus = bus.clone();
         let index_task = tokio::spawn(async move {
-            let built =
-                tokio::task::spawn_blocking(move || LocalIndex::build(&local, &index_registry))
-                    .await;
+            let built = tokio::task::spawn_blocking(move || {
+                LocalIndex::build(&local, &connections, &index_registry)
+            })
+            .await;
             match built {
                 Ok(index) => index_bus.set_local_index(index),
                 Err(e) => tracing::error!(error = %e, "local index build failed"),
@@ -137,29 +187,39 @@ impl Engine {
             secrets.clone(),
             config_rx,
         ));
-        let (reloads, reload_rx) = mpsc::unbounded_channel();
-        let reload_task = tokio::spawn(run_reloads(scheduler.clone(), initial, reload_rx));
         let (control_tx, control_rx) = mpsc::unbounded_channel();
-        let (stream, stream_control_task) = match StreamServer::start(
+        let server = match StreamServer::start(
             bus.clone(),
             paths.clone(),
             initial_port,
-            control_tx,
+            control_tx.clone(),
         )
         .await
         {
-            Ok(server) => (
-                Some(server),
-                Some(tokio::spawn(run_stream_control(
-                    scheduler.clone(),
-                    control_rx,
-                ))),
-            ),
+            Ok(server) => Some(server),
             Err(e) => {
                 tracing::error!(error = %e, "stream server failed to start; running without it");
-                (None, None)
+                None
             }
         };
+        let stream = Arc::new(tokio::sync::Mutex::new(StreamSlot {
+            server,
+            port: initial_port,
+        }));
+        let stream_control_task = tokio::spawn(run_stream_control(scheduler.clone(), control_rx));
+        let restarter = StreamRestarter {
+            slot: stream.clone(),
+            bus: bus.clone(),
+            paths: paths.clone(),
+            control: control_tx,
+        };
+        let (reloads, reload_rx) = mpsc::unbounded_channel();
+        let reload_task = tokio::spawn(run_reloads(
+            scheduler.clone(),
+            restarter,
+            initial,
+            reload_rx,
+        ));
         Ok(Engine {
             bus,
             store,
@@ -203,7 +263,8 @@ impl Engine {
     /// Swaps in a new config: the classifier is rebuilt now, and connections are
     /// diffed by id in the background (removed stop, added start, changed restart).
     /// A restart rebuilds the connection, which re-enables its disabled sources.
-    /// Changed `[polling]` intervals only apply to connections that restart; running
+    /// A changed `stream.port` restarts the stream server with a new token; clients
+    /// re-read `stream.json`. Changed `[polling]` intervals only apply to connections that restart; running
     /// connections keep the intervals they launched with.
     pub fn reload(&self, config: Config) {
         let config = Arc::new(config);
@@ -250,13 +311,6 @@ impl Engine {
     /// Stops every task and waits for them to end.
     pub async fn shutdown(mut self) {
         self.hooks.shutdown().await;
-        if let Some(stream) = self.stream.take() {
-            stream.shutdown().await;
-        }
-        if let Some(task) = self.stream_control_task.take() {
-            task.abort();
-            let _ = task.await;
-        }
         self.index_task.abort();
         let _ = (&mut self.index_task).await;
         // Closing the channel lets the worker finish a reload in progress, so no
@@ -268,6 +322,13 @@ impl Engine {
             self.reload_task.abort();
             let _ = (&mut self.reload_task).await;
         }
+        // After the reload worker, so a reload cannot start a stream behind this.
+        let server = self.stream.lock().await.server.take();
+        if let Some(server) = server {
+            server.shutdown().await;
+        }
+        self.stream_control_task.abort();
+        let _ = (&mut self.stream_control_task).await;
         match Arc::try_unwrap(self.scheduler) {
             Ok(scheduler) => scheduler.shutdown().await,
             Err(_) => tracing::warn!("scheduler still shared at shutdown; tasks abort on drop"),
@@ -422,6 +483,81 @@ mod tests {
 
         eventually(|| fake.poll_count("s") >= 1).await;
         assert!(!paths.runtime.join("stream.json").exists());
+        engine.shutdown().await;
+    }
+
+    async fn can_connect(port: u64, token: &str) -> bool {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = format!("ws://127.0.0.1:{port}/events")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        tokio_tungstenite::connect_async(req).await.is_ok()
+    }
+
+    #[tokio::test]
+    async fn reload_with_changed_port_moves_the_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, paths) =
+            start_with_stream(config_of(&[("c1", "fake", "1")]), &fake(), &dir).await;
+        let old = stream_info(&paths);
+        let old_token = old["token"].as_str().unwrap().to_string();
+
+        let free = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let new_port = u64::from(free.local_addr().unwrap().port());
+        drop(free);
+        let mut config = engine.config().as_ref().clone();
+        config.stream.port = new_port as u16;
+        engine.reload(config);
+
+        eventually(|| {
+            std::fs::read_to_string(paths.runtime.join("stream.json"))
+                .ok()
+                .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
+                .is_some_and(|v| v["port"].as_u64() == Some(new_port))
+        })
+        .await;
+        let new = stream_info(&paths);
+        let new_token = new["token"].as_str().unwrap();
+        assert_ne!(new_token, old_token);
+        assert!(!can_connect(old["port"].as_u64().unwrap(), &old_token).await);
+        assert!(can_connect(new_port, new_token).await);
+        assert!(!can_connect(new_port, &old_token).await);
+        engine.shutdown().await;
+        assert!(!paths.runtime.join("stream.json").exists());
+    }
+
+    #[tokio::test]
+    async fn reload_with_unchanged_stream_keeps_the_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = fake();
+        let (engine, paths) =
+            start_with_stream(config_of(&[("c1", "fake", "1")]), &fake, &dir).await;
+        eventually(|| fake.identify_calls() >= 1).await;
+        let before = stream_info(&paths);
+
+        // The connection change is applied before the stream check in the same worker pass.
+        engine.reload(config_of(&[("c1", "fake", "2")]));
+        eventually(|| fake.identify_calls() >= 2).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(stream_info(&paths), before);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reload_with_failed_bind_leaves_the_engine_running_without_a_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = fake();
+        let (engine, paths) =
+            start_with_stream(config_of(&[("c1", "fake", "1")]), &fake, &dir).await;
+        let blocker = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut config = engine.config().as_ref().clone();
+        config.stream.port = blocker.local_addr().unwrap().port();
+        engine.reload(config);
+
+        eventually(|| !paths.runtime.join("stream.json").exists()).await;
+        assert!(engine.stream.lock().await.server.is_none());
         engine.shutdown().await;
     }
 

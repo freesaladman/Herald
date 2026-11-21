@@ -28,6 +28,9 @@ uuid = { workspace = true }
 open = { workspace = true }
 url = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }

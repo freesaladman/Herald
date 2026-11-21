@@ -48,10 +48,7 @@ const ORG_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'.').remove(b'-').remov
 const MAX_PAGES: usize = 1000;
 
 fn too_many_pages() -> AdoError {
-    AdoError::Http {
-        status: 200,
-        body_excerpt: format!("paging stopped after {MAX_PAGES} pages"),
-    }
+    AdoError::TooManyPages { pages: MAX_PAGES }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -68,6 +65,10 @@ pub enum AdoError {
     Transport(String),
     #[error("http {status}: {body_excerpt}")]
     Http { status: u16, body_excerpt: String },
+    #[error("paging stopped after {pages} pages")]
+    TooManyPages { pages: usize },
+    #[error("server repeated a continuation token")]
+    PagingCycle,
     #[error("could not decode response from {0}")]
     Decode(String),
     #[error(transparent)]
@@ -85,7 +86,10 @@ impl From<AdoError> for ProviderError {
             AdoError::Http { status, .. } if status >= 500 => {
                 ProviderError::Transient(format!("http {status}"))
             }
-            AdoError::Http { .. } | AdoError::Decode(_) => ProviderError::Other(e.to_string()),
+            AdoError::Http { .. }
+            | AdoError::TooManyPages { .. }
+            | AdoError::PagingCycle
+            | AdoError::Decode(_) => ProviderError::Other(e.to_string()),
             AdoError::Auth(p) => p,
         }
     }
@@ -115,18 +119,22 @@ pub struct AdoClient {
     vssps: String,
     membership_warned: AtomicBool,
     descriptor_warned: AtomicBool,
+    pub(crate) threads_cache: crate::git::ThreadsCache,
 }
 
 impl AdoClient {
+    /// Production constructor: PR threads are cached briefly so the Pr-tier sources share one fetch.
     pub fn new(organization: &str, auth: AdoAuth) -> AdoClient {
         let org = utf8_percent_encode(organization, ORG_SEGMENT);
-        Self::with_base_urls(
+        let mut client = Self::with_base_urls(
             organization,
             auth,
             &format!("https://dev.azure.com/{org}"),
             &format!("https://vsrm.dev.azure.com/{org}"),
             &format!("https://vssps.dev.azure.com/{org}"),
-        )
+        );
+        client.threads_cache = crate::git::ThreadsCache::new(crate::git::THREADS_CACHE_TTL);
+        client
     }
 
     pub fn with_base_urls(
@@ -156,6 +164,8 @@ impl AdoClient {
             vssps: trim(vssps),
             membership_warned: AtomicBool::new(false),
             descriptor_warned: AtomicBool::new(false),
+            // Off here so tests that rewrite mocks between polls see fresh data.
+            threads_cache: crate::git::ThreadsCache::new(Duration::ZERO),
         }
     }
 
@@ -207,10 +217,7 @@ impl AdoClient {
             match &token {
                 None => return Ok(all),
                 Some(t) if !seen.insert(t.clone()) => {
-                    return Err(AdoError::Http {
-                        status: 200,
-                        body_excerpt: "server repeated a continuation token".to_string(),
-                    });
+                    return Err(AdoError::PagingCycle);
                 }
                 Some(_) => {}
             }
@@ -736,7 +743,12 @@ mod tests {
             .respond_with(list(json!([])).insert_header(CONTINUATION_HEADER, "same"))
             .mount(&server)
             .await;
-        assert!(client(&server).projects().await.is_err());
+        let e = client(&server)
+            .projects()
+            .await
+            .expect_err("cycle must error");
+        assert!(matches!(e, AdoError::PagingCycle));
+        assert!(matches!(ProviderError::from(e), ProviderError::Other(_)));
     }
 
     #[tokio::test]
@@ -748,7 +760,7 @@ mod tests {
             .mount(&server)
             .await;
         let r: Result<Vec<i32>, _> = client(&server).get_top_skip(Host::Dev, "_apis/z", 2).await;
-        assert!(matches!(r, Err(AdoError::Http { .. })));
+        assert_too_many_pages(r);
     }
 
     #[tokio::test]
@@ -763,7 +775,15 @@ mod tests {
             .mount(&server)
             .await;
         let r: Result<Vec<i32>, _> = client(&server).get_paged(Host::Dev, "_apis/projects").await;
-        assert!(matches!(r, Err(AdoError::Http { .. })), "{r:?}");
+        assert_too_many_pages(r);
+    }
+
+    fn assert_too_many_pages(r: Result<Vec<i32>, AdoError>) {
+        let e = r.expect_err("paging cap must error");
+        assert!(matches!(e, AdoError::TooManyPages { pages } if pages == MAX_PAGES));
+        assert!(
+            matches!(ProviderError::from(e), ProviderError::Other(m) if m.contains("paging stopped"))
+        );
     }
 
     #[test]

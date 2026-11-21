@@ -19,6 +19,7 @@ use crate::bus::Bus;
 use crate::config::{Config, HookAction, HookConfig, Paths};
 use crate::event::Event;
 use crate::hooks::{CompiledHookFilter, expand, lookup};
+use crate::process::kill_tree;
 use crate::store::{HookRun, Store};
 
 const MAX_CONCURRENT: usize = 4;
@@ -29,7 +30,6 @@ const EVENT_FILE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 const SNOOZE_KEY: &str = "snoozed_until_utc";
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(8);
-const KILLER_TIMEOUT: Duration = Duration::from_secs(3);
 const DEBOUNCE_PRUNE_AT: usize = 1024;
 type Recorder = Arc<dyn Fn(HookRun) + Send + Sync>;
 type RunKey = (String, String);
@@ -204,52 +204,6 @@ impl Drop for KillGuard {
         let _ = std::fs::remove_file(&self.event_file);
     }
 }
-
-fn run_killer(cmd: &mut std::process::Command) {
-    let spawned = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    let mut child = match spawned {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not start the process tree killer");
-            return;
-        }
-    };
-    let deadline = std::time::Instant::now() + KILLER_TIMEOUT;
-    while matches!(child.try_wait(), Ok(None)) {
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-#[cfg(windows)]
-fn kill_tree(pid: u32) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let root =
-        std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
-    run_killer(
-        std::process::Command::new(root.join("System32").join("taskkill.exe"))
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .creation_flags(CREATE_NO_WINDOW),
-    );
-}
-
-/// Children are spawned as their own process group leader, so the pid is the group id.
-#[cfg(unix)]
-fn kill_tree(pid: u32) {
-    run_killer(std::process::Command::new("/bin/kill").args(["-KILL", &format!("-{pid}")]));
-}
-
-#[cfg(not(any(windows, unix)))]
-fn kill_tree(_pid: u32) {}
 
 struct Job {
     hook: HookConfig,
@@ -466,6 +420,9 @@ impl Shared {
         };
         let body = job.json.to_string().into_bytes();
         let stdin = child.stdin.take();
+        if !detached {
+            crate::process::assign_to_kill_on_exit_job(&child);
+        }
         if detached {
             tracing::info!(hook = %job.hook.name, pid = ?child.id(), "detached hook started");
             self.finish(job, started, Outcome::started());
@@ -616,7 +573,7 @@ fn build_spec(hook: &HookConfig, json: &Value, event: &Event) -> Result<CommandS
 }
 
 /// Placeholder paths in a template, in order; `{{` and `}}` are literal braces.
-fn placeholder_paths(template: &str) -> Vec<String> {
+pub(crate) fn placeholder_paths(template: &str) -> Vec<String> {
     let mut paths = Vec::new();
     let mut chars = template.chars().peekable();
     while let Some(c) = chars.next() {
@@ -695,25 +652,36 @@ fn value_allowed(value: &str, family: ShellFamily) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || "._/@:+-".contains(c) || extra.contains(&c))
 }
 
-/// The argument a shell runs as its command string, if the argv names one: after `-c`
-/// style flags for the sh family, `/c`/`/k`/`/r` for cmd, `-Command` (or a prefix) for
-/// PowerShell, which also takes the first plain argument as the command.
-fn shell_command_arg(family: ShellFamily, after: &[String]) -> Option<&String> {
-    let is_flag = |a: &str| match family {
-        ShellFamily::Cmd => ["/c", "/k", "/r"].contains(&a.to_lowercase().as_str()),
-        ShellFamily::Windows => a
-            .to_lowercase()
-            .strip_prefix(['-', '/'])
-            .is_some_and(|r| !r.is_empty() && "command".starts_with(r)),
-        ShellFamily::Sh => a.starts_with('-') && !a.starts_with("--") && a.contains('c'),
-    };
-    match after.iter().position(|a| is_flag(a)) {
-        Some(i) => after[i + 1..]
-            .iter()
-            .find(|a| family == ShellFamily::Cmd || !a.starts_with('-')),
-        None if family == ShellFamily::Windows => after.iter().find(|a| !a.starts_with(['-', '/'])),
-        None => None,
+/// Shells whose positional parameters (`$0`, `$1`, ...) after a `-c` command string are
+/// plain data, not code.
+const POSITIONAL_SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "mksh", "ash"];
+
+/// Programs that run their arguments as a command. Their options are not parsed, so
+/// `check_shell_safety` refuses any placeholder from the first one up to the first shell.
+const WRAPPERS: &[&str] = &[
+    "env", "sudo", "doas", "timeout", "nice", "nohup", "setsid", "stdbuf", "xargs", "watch",
+    "flock", "script", "chroot", "runas", "start", "time", "exec", "command",
+];
+
+/// `-c`, optionally clustered with flags that take no value (`-ce`, `-ec`, `-cex`).
+fn is_c_cluster(arg: &str) -> bool {
+    arg.strip_prefix('-')
+        .is_some_and(|f| f.contains('c') && f.chars().all(|c| "ceuxvf".contains(c)))
+}
+
+/// Index in `after` (the elements following an sh-family shell) of the first positional
+/// parameter. Positionals exist only when the element directly after the shell is a `-c`
+/// cluster and the command string after it does not start with `-` or `+` (the shell would
+/// read that as an option, e.g. `bash -c +o posix ...`). Any other shape is ambiguous, so
+/// nothing counts as positional.
+fn sh_positional_start(after: &[String]) -> Option<usize> {
+    if !is_c_cluster(after.first()?) {
+        return None;
     }
+    if after.get(1)?.starts_with(['-', '+']) {
+        return None;
+    }
+    Some(2)
 }
 
 /// Whether cmd would expand variable `name` in `text` (already lower-cased): `%NAME%`,
@@ -733,16 +701,19 @@ fn mentions_cmd(arg: &str) -> bool {
 
 /// A shell re-parses its arguments, and std does not escape for it, so a run is in a
 /// shell context when any argument is a shell (this also covers wrappers such as `env`
-/// or `sudo`). Every placeholder in the arguments after the first shell must then hold only
-/// allowlisted characters, whatever flags the shell takes. Shells nest (`pwsh -c "cmd /c
-/// ..."`, `cmd /c bash -c ...`), so the strictest allowlist among every shell in the argv
+/// or `sudo`). The first shell decides: from there on a placeholder is allowed only as a
+/// positional parameter of an sh-family shell given a `-c` command string
+/// (`sh -c 'echo "$1"' _ {x}`). Everything else is refused, because it is command text
+/// the shell would parse: the command string and options of an sh-family shell, any
+/// argument after cmd, PowerShell, wsl, ssh, su, csh, fish, nu or busybox, and scripts
+/// run by an sh-family shell without `-c`. Values reach those through HERALD_* env vars
+/// or the event file.
+///
+/// An allowed positional placeholder must still hold only allowlisted characters. Shells
+/// nest (`cmd /c bash -c ...`), so the strictest allowlist among every shell in the argv
 /// applies: the sh family (no backslash, no space) beats cmd and PowerShell. Non-shell
 /// programs get argv directly and are not restricted. The check is on template
 /// placeholders, not the final args: the template itself may legitimately contain `&&`.
-///
-/// A placeholder must never be the command itself: the command string of a shell may not
-/// start with one, since its value would then be what runs. A value containing spaces
-/// is refused under cmd and PowerShell; pass it through a hook env var instead.
 ///
 /// cmd also expands `%NAME%` (and `!NAME!` under delayed expansion) after parsing, so
 /// when any shell is cmd, including a `cmd` word inside a single string argument, every
@@ -750,21 +721,44 @@ fn mentions_cmd(arg: &str) -> bool {
 /// must hold an allowlisted value (HERALD_EVENT_FILE is not known yet and is
 /// app-generated). The check is name-driven: no `%` pairing is parsed, and env names are
 /// case-insensitive on Windows, so each entry is checked on its own. sh and PowerShell
-/// read env values as variables, not as code.
+/// read env values as variables, not as code, except for names the shell itself executes
+/// (`BASH_ENV`, `ENV`, `PS4`, `PROMPT_COMMAND`, ...); config validation refuses a
+/// placeholder in those.
+///
+/// Command wrappers (`env`, `sudo`, `timeout`, ...) run their arguments as a command and
+/// their options are not parsed, so no placeholder is allowed from the first wrapper up to
+/// the first shell (or the end of the argv when there is none).
 fn check_shell_safety(
     template: &[String],
     json: &Value,
     hook_env: &[(String, String)],
     event: &Event,
 ) -> Result<(), String> {
-    let Some(shell_at) = template
+    let shell_at = template
         .iter()
-        .position(|a| SHELLS.contains(&program_stem(a).as_str()))
-    else {
+        .position(|a| SHELLS.contains(&program_stem(a).as_str()));
+    if let Some(wrapper_at) = template
+        .iter()
+        .position(|a| WRAPPERS.contains(&program_stem(a).as_str()))
+    {
+        let end = shell_at.unwrap_or(template.len());
+        let covered = template.get(wrapper_at..end).unwrap_or_default();
+        if let Some(path) = covered
+            .iter()
+            .find_map(|a| placeholder_paths(a).into_iter().next())
+        {
+            return Err(format!(
+                "placeholder not allowed after a command wrapper ({}): {path}",
+                program_stem(&template[wrapper_at])
+            ));
+        }
+    }
+    let Some(shell_at) = shell_at else {
         return Ok(());
     };
     let args = &template[shell_at + 1..];
-    let mut stem = program_stem(&template[shell_at]);
+    let first = program_stem(&template[shell_at]);
+    let mut stem = first.clone();
     let mut family = shell_family(&stem);
     let mut has_cmd = family == ShellFamily::Cmd;
     for arg in args {
@@ -780,24 +774,22 @@ fn check_shell_safety(
             has_cmd |= mentions_cmd(arg);
         }
     }
-    let refuse = |what: &str| Err(format!("unsafe value for {stem}: {what}"));
-    for path in args.iter().flat_map(|a| placeholder_paths(a)) {
-        if lookup(&path, json).is_some_and(|v| !value_allowed(&v, family)) {
-            return refuse(&path);
-        }
-    }
-    for (i, shell) in template.iter().enumerate() {
-        let shell_stem = program_stem(shell);
-        if !SHELLS.contains(&shell_stem.as_str()) {
-            continue;
-        }
-        let cmd_arg = shell_command_arg(shell_family(&shell_stem), &template[i + 1..]);
-        if let Some(arg) = cmd_arg.filter(|a| a.starts_with('{') && !a.starts_with("{{")) {
-            let path = placeholder_paths(arg)
-                .into_iter()
-                .next()
-                .unwrap_or_default();
-            return Err(format!("placeholder cannot be the shell command: {path}"));
+    let positional_from = if POSITIONAL_SHELLS.contains(&first.as_str()) {
+        sh_positional_start(args)
+    } else {
+        None
+    };
+    for (i, arg) in args.iter().enumerate() {
+        let is_positional = positional_from.is_some_and(|from| i >= from);
+        for path in placeholder_paths(arg) {
+            if !is_positional {
+                return Err(format!(
+                    "placeholder not allowed in a shell command: {path}; pass it via HERALD_* env vars, the event file, or as an sh positional argument"
+                ));
+            }
+            if lookup(&path, json).is_some_and(|v| !value_allowed(&v, family)) {
+                return Err(format!("unsafe value for {stem}: {path}"));
+            }
         }
     }
     if has_cmd {
@@ -807,7 +799,7 @@ fn check_shell_safety(
         let base = base.iter().map(|(k, v)| (*k, v.as_str()));
         for (name, value) in hook_env.chain(base) {
             if cmd_references(&text, name) && !value_allowed(value, family) {
-                return refuse(&format!("%{name}%"));
+                return Err(format!("unsafe value for {stem}: %{name}%"));
             }
         }
     }
@@ -1146,7 +1138,7 @@ mod tests {
     #[tokio::test]
     async fn placeholders_expand_into_argv_and_exit_code_is_recorded() {
         let fx = fixture();
-        let h = shell_hook("exit", &["exit", "{pr.id}"], "exit {pr.id}");
+        let h = shell_hook("exit", &["exit", "%HERALD_PR_ID%"], "exit $HERALD_PR_ID");
         let run = fx.run_one(h).await;
         assert_eq!(run.exit_code, Some(7));
         assert_eq!(run.error, None);
@@ -1378,13 +1370,7 @@ mod tests {
     }
 
     #[test]
-    fn cmd_refuses_unsafe_placeholders_and_env_references() {
-        let err = spec_for(&["cmd", "/C", "echo", "{branch.shortName}"])
-            .err()
-            .unwrap();
-        assert_eq!(err, "unsafe value for cmd: branch.shortName");
-        assert!(spec_for(&["CMD.EXE", "/C", "echo", "{pr.title}", "&", "echo", "done"]).is_err());
-
+    fn cmd_refuses_unsafe_env_references() {
         let e = event_with("a&calc", "t");
         let err = spec_with(&["cmd", "/C", "echo", "%HERALD_BRANCH%"], &[], e)
             .err()
@@ -1475,126 +1461,182 @@ mod tests {
         .err()
         .unwrap();
         assert_eq!(err, "unsafe value for pwsh: %X%");
-
-        let spaced = || event_with("a b", "t");
-        let err = spec_with(
-            &["cmd", "/c", "bash", "-c", "{branch.shortName}"],
-            &[],
-            spaced(),
-        )
-        .err()
-        .unwrap();
-        assert_eq!(err, "unsafe value for bash: branch.shortName");
-        let err = spec_with(&["cmd", "/c", "echo", "{branch.shortName}"], &[], spaced())
-            .err()
-            .unwrap();
-        assert_eq!(err, "unsafe value for cmd: branch.shortName");
     }
 
-    #[test]
-    fn a_placeholder_cannot_be_the_shell_command() {
-        let e = || event_with("b", "calc");
-        for argv in [
-            &["pwsh", "-Command", "{pr.title}"][..],
-            &["pwsh", "-NoProfile", "-c", "{pr.title}"],
-            &["pwsh", "{pr.title}"],
-            &["cmd", "/c", "{pr.title}"],
-            &["cmd", "/C", "{pr.title} /?"],
-            &["sh", "-c", "{pr.title}"],
-        ] {
-            let err = spec_with(argv, &[], e())
-                .err()
-                .unwrap_or_else(|| panic!("{argv:?}"));
-            assert_eq!(err, "placeholder cannot be the shell command: pr.title");
-        }
-        assert!(spec_with(&["cmd", "/c", "echo", "{pr.id}"], &[], e()).is_ok());
-        assert!(spec_with(&["pwsh", "-Command", "echo {pr.title}"], &[], e()).is_ok());
-    }
+    const NOT_ALLOWED: &str = "placeholder not allowed in a shell command: ";
 
     #[test]
-    fn ssh_and_other_remote_shells_get_the_sh_allowlist() {
-        let err = spec_with(
-            &["ssh", "host", "deploy", "{branch.shortName}"],
-            &[],
-            event_with("x;reboot", "t"),
-        )
-        .err()
-        .unwrap();
-        assert_eq!(err, "unsafe value for ssh: branch.shortName");
-        for shell in ["csh", "tcsh", "nu", "su", "runuser"] {
-            assert!(spec_for(&[shell, "-c", "{pr.title}"]).is_err(), "{shell}");
-        }
-    }
-
-    #[test]
-    fn cmd_allows_safe_values_by_every_route() {
-        let e = || event_with("feature/abc-1", "t");
-        assert!(spec_with(&["cmd", "/C", "echo", "{branch.shortName}"], &[], e()).is_ok());
-        assert!(spec_with(&["cmd", "/C", "echo", "%HERALD_BRANCH%"], &[], e()).is_ok());
-        let e = event_with(r"C:\Users\me\repo", "t");
-        assert!(
-            spec_with(
-                &["cmd", "/C", "cd", "{branch.shortName}", "&&", "dir"],
-                &[],
-                e
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn sh_family_refuses_unsafe_values_whatever_the_flags() {
-        for argv in [
-            &["bash", "-ce", "echo {pr.title}"][..],
+    fn placeholders_in_a_shell_context_are_refused_unless_an_sh_positional() {
+        let e = || event_with("feature/abc-1", "ok");
+        let refused: &[&[&str]] = &[
+            // Command strings and options of an sh-family shell.
+            &["sh", "-c", "echo {pr.title}"],
+            &["bash", "-c", "{pr.title}"],
+            &["sh", "-c", "'{pr.title}'"],
+            &["sh", "-c", "true; {pr.title}"],
+            &["sh", "-c", "echo $({pr.title})"],
+            &["sh", "-c", "env FOO=bar {pr.title}"],
+            &["sh", "-c", "FOO={pr.title} echo hi"],
+            &["bash", "-ce", "echo {pr.title}"],
             &["bash", "-c", "-e", "echo {pr.title}"],
             &["bash", "-c", "--", "echo {pr.title}"],
             &["bash", "-c", "-o", "pipefail", "echo {pr.title}"],
+            &["bash", "-O", "{pr.title}", "-c", "true", "_", "{pr.id}"],
+            &["bash", "-c", "-o", "pipefail", "true", "{pr.id}"],
+            &["bash", "-co", "pipefail", "true", "_", "{pr.id}"],
+            &["bash", "-c", "-e", "true", "_", "{pr.id}"],
+            &["bash", "-c", "+o", "posix", "{pr.id}"],
+            &["sh", "-c", "+O", "extglob", "{pr.id}"],
+            &["dash", "-c", "+o", "errexit", "{pr.id}"],
+            &["bash", "s.sh", "-c", "true", "{pr.id}"],
+            &["bash", "--init-file", "-c", "true", "{pr.id}"],
+            &["mksh", "-cT", "x", "{pr.id}"],
+            &["bash", "-e", "-c", "true", "_", "{pr.id}"],
             &["env", "bash", "-c", "echo {pr.title}"],
             &["/usr/bin/sh", "-c", "echo {pr.title}"],
+            &["env", "FOO=1", "sh", "-c", "echo {pr.title}"],
+            &["env", "FOO=1", "sh", "-c", "{pr.title}"],
+            &["sh", "-c", "sh -c {pr.title}"],
+            &["timeout", "5", "sh", "-c", "{pr.title}"],
+            // sh family without a command string, and shells that are not sh.
+            &["sh", "{pr.title}"],
+            &["sh", "script.sh", "{pr.id}"],
+            &["bash", "-x", "script.sh", "{pr.id}"],
+            &["busybox", "sh", "-c", "true", "_", "{pr.id}"],
+            &["csh", "-c", "{pr.title}"],
+            &["tcsh", "-c", "{pr.title}"],
+            &["fish", "-c", "{pr.title}"],
+            &["nu", "-c", "{pr.title}"],
+            &["su", "-c", "{pr.title}"],
+            &["runuser", "-c", "{pr.title}"],
+            &["wsl", "{pr.id}"],
             &["wsl", "echo", "{pr.title}"],
-        ] {
-            let err = spec_for(argv).err().unwrap_or_else(|| panic!("{argv:?}"));
-            assert!(err.starts_with("unsafe value for "), "{err}");
-            assert!(err.ends_with(": pr.title"), "{err}");
+            &["ssh", "host", "{pr.id}"],
+            &["ssh", "host", "deploy", "{pr.title}"],
+            // cmd: all of it is command text.
+            &["cmd", "/c", "echo", "{pr.id}"],
+            &["cmd", "/C", "echo {pr.id}"],
+            &["cmd", "/c{pr.id}"],
+            &["cmd", "/c", "{pr.title}"],
+            &["cmd", "/c", "echo", "x", "&", "{pr.id}"],
+            &["cmd", "/c", "echo x & {pr.id}"],
+            &["cmd", "/c", "^{pr.id}"],
+            &["cmd", "/c", ",{pr.id}"],
+            &["cmd", "/c", "={pr.id}"],
+            &["cmd", "/c", "call", "{pr.id}"],
+            &["cmd", "/c", "start", "{pr.id}"],
+            &["cmd", "/c", "bash", "-c", "{pr.id}"],
+            &["cmd", "/c", "bash", "-c", "true", "_", "{pr.id}"],
+            &["CMD.EXE", "/C", "echo", "{pr.title}", "&", "echo", "done"],
+            // PowerShell: any flag, all of it.
+            &["pwsh", "-File", "s.ps1", "{pr.id}"],
+            &["pwsh", "-Command", "{pr.id}"],
+            &["pwsh", "-Command", "echo x; {pr.id}"],
+            &["pwsh", "-Command", "{{ {pr.id}; }}"],
+            &["pwsh", "-EncodedCommand", "{pr.id}"],
+            &["pwsh", "-NoProfile", "-c", "{pr.title}"],
+            &["pwsh", "{pr.title}"],
+            &["pwsh", "-Command", "iex {pr.id}"],
+            &["powershell.exe", "echo", "{pr.id}"],
+            // Wrappers, redirections and other shapes.
+            &["env", "-i", "sh", "-c", "{pr.id}"],
+            &["sudo", "-E", "bash", "-c", "{pr.id}"],
+            &["sh", "-c", ">/dev/null {pr.id}"],
+            &["sh", "-c", "2>&1 {pr.id}"],
+            &["sh", "-c", "$'{pr.id}'"],
+            &["sh", "-c", "{{ {pr.id}; }}"],
+            &["sh", "-c", "eval {pr.id}"],
+            &["sh", "-c", "source {pr.id}"],
+            &["sh", "-c", ". {pr.id}"],
+        ];
+        for argv in refused {
+            let err = spec_with(argv, &[], e())
+                .err()
+                .unwrap_or_else(|| panic!("{argv:?}"));
+            assert!(err.starts_with(NOT_ALLOWED), "{argv:?}: {err}");
+            assert!(err.ends_with("or as an sh positional argument"), "{err}");
         }
-    }
-
-    #[test]
-    fn sh_allows_env_variables_and_safe_values() {
-        assert!(spec_for(&["sh", "-c", r#"git checkout "$HERALD_BRANCH""#]).is_ok());
-        let e = event_with("feature/abc-1", "t");
-        assert!(
-            spec_with(
-                &["sh", "-c", "echo {branch.shortName} && echo done"],
-                &[],
-                e
-            )
-            .is_ok()
+        let err = spec_with(&["wsl", "{pr.title}"], &[], e()).err().unwrap();
+        assert_eq!(
+            err,
+            "placeholder not allowed in a shell command: pr.title; pass it via HERALD_* env vars, the event file, or as an sh positional argument"
         );
+
+        let allowed: &[&[&str]] = &[
+            &["sh", "-c", r#"echo "$1""#, "_", "{pr.title}"],
+            &[
+                "env",
+                "FOO=1",
+                "sh",
+                "-c",
+                r#"echo "$1""#,
+                "_",
+                "{pr.title}",
+            ],
+            &["bash", "-ce", "true", "_", "{branch.shortName}", "{pr.id}"],
+            &["dash", "-c", "true", "_", "{pr.id}"],
+            &["timeout", "5", "sh", "-c", "true", "_", "{pr.id}"],
+            &["sh", "-c", "true", "{pr.id}"],
+            &["sh", "-c", "echo {{literal}}; {{x}}"],
+            &["sh", "-c", r#"git checkout "$HERALD_BRANCH""#],
+            &["pwsh", "-Command", "echo {{x}}"],
+            &["git", "checkout", "--", "{branch.shortName}"],
+        ];
+        for argv in allowed {
+            assert!(spec_with(argv, &[], e()).is_ok(), "{argv:?}");
+        }
     }
 
     #[test]
-    fn powershell_refuses_unsafe_values_whatever_the_flags() {
-        for flags in [
-            &["-C"][..],
-            &["/c"],
-            &["-Com"],
-            &[],
-            &["-NoProfile", "-Command"],
-        ] {
-            let mut argv = vec!["pwsh"];
-            argv.extend(flags);
-            argv.push("echo {pr.title}");
-            let err = spec_for(&argv).err().unwrap_or_else(|| panic!("{argv:?}"));
-            assert_eq!(err, "unsafe value for pwsh: pr.title");
+    fn placeholders_after_a_command_wrapper_are_refused() {
+        let e = || event_with("feature/abc-1", "ok");
+        let refused: &[(&[&str], &str)] = &[
+            (&["env", "{pr.id}"], "env"),
+            (&["env", "-S", "{pr.id}"], "env"),
+            (&["sudo", "{pr.id}"], "sudo"),
+            (&["timeout", "5", "{pr.id}"], "timeout"),
+            (&["xargs", "{pr.id}"], "xargs"),
+            (&["/usr/bin/nice", "-n", "5", "echo", "{pr.id}"], "nice"),
+            (&["start", "{pr.id}"], "start"),
+            (&["sudo", "git", "checkout", "--", "{pr.id}"], "sudo"),
+        ];
+        for (argv, wrapper) in refused {
+            let err = spec_with(argv, &[], e())
+                .err()
+                .unwrap_or_else(|| panic!("{argv:?}"));
+            assert_eq!(
+                err,
+                format!("placeholder not allowed after a command wrapper ({wrapper}): pr.id"),
+                "{argv:?}"
+            );
         }
-        let e = event_with("it\u{2019}s", "t");
-        let err = spec_with(&["powershell.exe", "echo", "{branch.shortName}"], &[], e)
-            .err()
-            .unwrap();
-        assert_eq!(err, "unsafe value for powershell: branch.shortName");
-        let e = event_with(r"C:\Users\me\repo", "t");
-        assert!(spec_with(&["pwsh", "-Command", "cd {branch.shortName}"], &[], e).is_ok());
+
+        let allowed: &[&[&str]] = &[
+            &["env", "FOO=1", "sh", "-c", "true", "_", "{pr.id}"],
+            &["env", "FOO={{x}}", "sh", "-c", "true"],
+            &["git", "checkout", "--", "{branch.shortName}"],
+        ];
+        for argv in allowed {
+            assert!(spec_with(argv, &[], e()).is_ok(), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn sh_positional_placeholders_still_follow_the_allowlist() {
+        let argv = ["sh", "-c", "true", "_", "{pr.title}"];
+        for title in ["has space", "a;b", "$(x)", "a\\b"] {
+            let err = spec_with(&argv, &[], event_with("b", title))
+                .err()
+                .unwrap_or_else(|| panic!("{title}"));
+            assert_eq!(err, "unsafe value for sh: pr.title");
+        }
+        assert!(spec_with(&argv, &[], event_with("b", "feature/a-1@x:y+z")).is_ok());
+    }
+
+    #[test]
+    fn cmd_allows_env_references_with_safe_values() {
+        let e = event_with("feature/abc-1", "t");
+        assert!(spec_with(&["cmd", "/C", "echo", "%HERALD_BRANCH%"], &[], e).is_ok());
     }
 
     #[test]
@@ -1619,7 +1661,13 @@ mod tests {
         });
         fx.run_all(&compiled(vec![h]), e).await;
         let runs = fx.runs();
-        assert!(runs[0].error.as_deref().unwrap().contains("unsafe value"));
+        assert!(
+            runs[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("placeholder not allowed")
+        );
         assert!(!marker.exists());
     }
 

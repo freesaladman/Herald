@@ -19,6 +19,10 @@ use crate::dto_git::GitPullRequest;
 
 const SNAPSHOT_LIFECYCLE: &str = "prs:lifecycle";
 const CLOSED_KEEP: Duration = Duration::days(14);
+/// A tracked PR whose single GET has been forbidden this long is dropped. Fixed rather than
+/// tied to the lookback (default 14 days) so a revoked permission stops costing a request
+/// every tick within a day, while a short permission blip still recovers.
+const FORBIDDEN_GIVE_UP: Duration = Duration::hours(24);
 /// The org-level list cuts `description` at about this many characters.
 const LIST_DESCRIPTION_LIMIT: usize = 400;
 
@@ -27,6 +31,8 @@ enum Fetched {
     Pr(Box<GitPullRequest>),
     /// The PR no longer exists.
     NotFound,
+    /// Access denied; the caller keeps its previous state until it has lasted too long.
+    Forbidden,
     /// Failed for a non-fatal reason; the caller keeps its previous state.
     Skipped,
 }
@@ -38,6 +44,8 @@ struct Lifecycle {
     closed: Vec<ClosedPr>,
     /// Last-seen description state per PR; entries outlive a PR's absence from the list.
     descriptions: BTreeMap<String, DescriptionState>,
+    /// When a tracked PR's single GET first came back forbidden, until a GET succeeds.
+    forbidden_since: BTreeMap<String, DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -97,6 +105,10 @@ impl PrLifecycleSource {
         {
             Ok(p) => Ok(Fetched::Pr(Box::new(p))),
             Err(ProviderError::NotFound(_)) => Ok(Fetched::NotFound),
+            Err(e @ ProviderError::Forbidden(_)) => {
+                tracing::warn!("skipping PR {pr_id} in {repo_id}: {e}");
+                Ok(Fetched::Forbidden)
+            }
             Err(e @ ProviderError::Transient(_)) if tolerate_transient => {
                 tracing::warn!("skipping PR {pr_id} in {repo_id}: {e}");
                 Ok(Fetched::Skipped)
@@ -325,6 +337,7 @@ impl PrLifecycleSource {
             .iter()
             .map(|(t, _, _)| pr_key(&t.repo_id, t.pr_id))
             .collect();
+        let mut forbidden_since: BTreeMap<String, DateTime<Utc>> = BTreeMap::new();
         for o in &old.prs {
             if active_keys.contains(&pr_key(&o.repo_id, o.pr_id)) {
                 continue;
@@ -342,7 +355,26 @@ impl PrLifecycleSource {
                 Fetched::NotFound => continue,
                 // Unknown state: keep tracking so it is not later seen as newly tracked.
                 Fetched::Skipped => {
+                    let k = pr_key(&o.repo_id, o.pr_id);
+                    if let Some(since) = state.forbidden_since.get(&k) {
+                        forbidden_since.insert(k, *since);
+                    }
                     tracked.push(o.clone());
+                    continue;
+                }
+                Fetched::Forbidden => {
+                    let k = pr_key(&o.repo_id, o.pr_id);
+                    let since = state.forbidden_since.get(&k).copied().unwrap_or(now);
+                    if now - since >= FORBIDDEN_GIVE_UP {
+                        tracing::info!(
+                            "no longer tracking PR {} in {}: forbidden since {since}",
+                            o.pr_id,
+                            o.repo_id
+                        );
+                    } else {
+                        forbidden_since.insert(k, since);
+                        tracked.push(o.clone());
+                    }
                     continue;
                 }
             };
@@ -386,6 +418,7 @@ impl PrLifecycleSource {
         state.closed.retain(|x| x.closed_utc >= now - CLOSED_KEEP);
         descriptions.retain(|_, d| d.seen_utc >= now - CLOSED_KEEP);
         state.descriptions = descriptions;
+        state.forbidden_since = forbidden_since;
 
         ctx.snapshots
             .put(SNAPSHOT_TRACKED_PRS, &TrackedPrs { prs: tracked })?;
@@ -950,6 +983,95 @@ mod tests {
                 .await
                 .is_empty()
         );
+    }
+
+    /// Seeds one tracked reviewer PR (id 2) that then drops out of the active list.
+    async fn tracked_pr_missing_from_list(server: &MockServer) -> (PrLifecycleSource, SyncContext) {
+        let mut review = pr(2, "other", at(1, 0));
+        review["reviewers"] = json!([{ "id": ME, "isContainer": false }]);
+        serve_active(server, vec![review]).await;
+        let (ctx, _store) = sync_context(cfg(), me(), at(10, 0), None, false);
+        let mut src = source(server);
+        run(&mut src, &ctx, None, at(10, 0), false).await;
+        serve_active(server, vec![]).await;
+        (src, ctx)
+    }
+
+    fn tracked_ids(ctx: &SyncContext) -> Vec<i64> {
+        let snap: TrackedPrs = ctx.snapshots.get(SNAPSHOT_TRACKED_PRS).unwrap().unwrap();
+        snap.prs.iter().map(|p| p.pr_id).collect()
+    }
+
+    fn forbidden_count(ctx: &SyncContext) -> usize {
+        let state: Lifecycle = ctx.snapshots.get(SNAPSHOT_LIFECYCLE).unwrap().unwrap();
+        state.forbidden_since.len()
+    }
+
+    #[tokio::test]
+    async fn forbidden_get_keeps_tracking_until_threshold_then_drops_quietly() {
+        let server = MockServer::start().await;
+        let (mut src, ctx) = tracked_pr_missing_from_list(&server).await;
+        serve_pr(&server, 2, ResponseTemplate::new(403)).await;
+
+        assert!(
+            run(&mut src, &ctx, Some(at(10, 1)), at(10, 2), false)
+                .await
+                .is_empty()
+        );
+        assert!(
+            run(&mut src, &ctx, Some(at(10, 3)), at(11, 1), false)
+                .await
+                .is_empty()
+        );
+        assert_eq!(tracked_ids(&ctx), [2]);
+        assert_eq!(forbidden_count(&ctx), 1);
+
+        assert!(
+            run(&mut src, &ctx, Some(at(11, 2)), at(11, 3), false)
+                .await
+                .is_empty()
+        );
+        assert!(tracked_ids(&ctx).is_empty());
+        assert_eq!(forbidden_count(&ctx), 0);
+    }
+
+    #[tokio::test]
+    async fn successful_get_clears_forbidden_marker() {
+        let server = MockServer::start().await;
+        let (mut src, ctx) = tracked_pr_missing_from_list(&server).await;
+        serve_pr(&server, 2, ResponseTemplate::new(403)).await;
+        run(&mut src, &ctx, Some(at(10, 1)), at(10, 2), false).await;
+        assert_eq!(forbidden_count(&ctx), 1);
+
+        let mut review = pr(2, "other", at(1, 0));
+        review["reviewers"] = json!([{ "id": ME, "isContainer": false }]);
+        serve_active(&server, vec![]).await;
+        serve_pr(&server, 2, ResponseTemplate::new(200).set_body_json(review)).await;
+        assert!(
+            run(&mut src, &ctx, Some(at(10, 3)), at(10, 4), false)
+                .await
+                .is_empty()
+        );
+        assert_eq!(forbidden_count(&ctx), 0);
+
+        serve_active(&server, vec![]).await;
+        serve_pr(&server, 2, ResponseTemplate::new(403)).await;
+        run(&mut src, &ctx, Some(at(11, 1)), at(11, 2), false).await;
+        assert_eq!(tracked_ids(&ctx), [2]);
+    }
+
+    #[tokio::test]
+    async fn long_transient_failure_never_drops_or_starts_the_clock() {
+        let server = MockServer::start().await;
+        let (mut src, ctx) = tracked_pr_missing_from_list(&server).await;
+        serve_pr(&server, 2, ResponseTemplate::new(500)).await;
+
+        let mut c = ctx.clone();
+        c.watermark = Some(at(10, 1));
+        c.server_now = at(14, 0);
+        assert!(src.poll(&c).await.is_err());
+        assert_eq!(tracked_ids(&ctx), [2]);
+        assert_eq!(forbidden_count(&ctx), 0);
     }
 
     #[tokio::test]

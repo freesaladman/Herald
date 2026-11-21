@@ -63,7 +63,7 @@ function ConnectionCard({
       await setSecret(c.id, value);
       return "Saved";
     }).then((ok) => {
-      if (ok) setSecretValue("");
+      if (ok) setSecretValue((cur) => (cur === value ? "" : cur));
     });
   };
 

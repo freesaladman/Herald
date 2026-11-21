@@ -1,0 +1,52 @@
+[workspace]
+resolver = "3"
+members = ["app/src-tauri", "crates/cli", "crates/core", "crates/provider-ado"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "time", "sync", "process", "net", "fs", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "1.2"
+chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+keyring = "4.2"
+base64 = "0.23"
+percent-encoding = "2.3"
+tokio-tungstenite = "0.30"
+futures-util = "0.3"
+globset = "0.4"
+dirs = "7.0"
+rand = "0.10"
+uuid = { version = "1.29", features = ["v4"] }
+open = "5.4"
+notify = "8.2"
+url = "2.5"
+clap = { version = "4.6", features = ["derive"] }
+rpassword = "7.5"
+tauri = { version = "2.12", features = ["tray-icon", "image-png", "macos-private-api"] }
+tauri-build = "2.7"
+tauri-plugin-single-instance = "2.5"
+tauri-plugin-autostart = "2.7"
+tauri-plugin-opener = "2.7"
+rodio = "0.23"
+image = "0.25"
+windows = { version = "0.62", features = ["Win32_UI_Shell", "Win32_Foundation"] }
+wiremock = "0.6"
+tempfile = "3.27"
+pretty_assertions = "1.4"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true

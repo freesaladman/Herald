@@ -1,0 +1,82 @@
+{
+  "count": 3,
+  "value": [
+    {
+      "id": 84157,
+      "approver": {
+        "displayName": "[TEAM FOUNDATION]\\Developers",
+        "id": "dde5a881-1aaf-4366-8999-f49576886726",
+        "uniqueName": "vstfs:///Framework/IdentityDomain/00000000-0000-0000-0000-000000000000\\Developers",
+        "isContainer": true
+      },
+      "approvalType": "preDeploy",
+      "createdOn": "2026-11-20T23:31:20.26Z",
+      "modifiedOn": "2026-11-20T23:31:20.26Z",
+      "status": "pending",
+      "comments": "",
+      "release": {
+        "id": 8679,
+        "name": "2026.11.20.6"
+      },
+      "releaseDefinition": {
+        "id": 11,
+        "name": "repo-alpha"
+      },
+      "releaseEnvironment": {
+        "id": 38180,
+        "name": "qa"
+      }
+    },
+    {
+      "id": 84156,
+      "approver": {
+        "displayName": "Person 4",
+        "id": "9c52e09c-f051-4649-aef1-8a6545b58f3a",
+        "uniqueName": "person4@example.com"
+      },
+      "approvalType": "preDeploy",
+      "createdOn": "2026-11-20T23:31:20.26Z",
+      "modifiedOn": "2026-11-20T23:31:20.26Z",
+      "status": "pending",
+      "comments": "",
+      "release": {
+        "id": 8679,
+        "name": "2026.11.20.6"
+      },
+      "releaseDefinition": {
+        "id": 11,
+        "name": "repo-alpha"
+      },
+      "releaseEnvironment": {
+        "id": 38180,
+        "name": "qa"
+      }
+    },
+    {
+      "id": 84148,
+      "approver": {
+        "displayName": "[TEAM FOUNDATION]\\Developers",
+        "id": "dde5a881-1aaf-4366-8999-f49576886726",
+        "uniqueName": "vstfs:///Framework/IdentityDomain/00000000-0000-0000-0000-000000000000\\Developers",
+        "isContainer": true
+      },
+      "approvalType": "preDeploy",
+      "createdOn": "2026-11-20T23:24:36.607Z",
+      "modifiedOn": "2026-11-20T23:24:36.607Z",
+      "status": "pending",
+      "comments": "",
+      "release": {
+        "id": 8676,
+        "name": "2026.11.20.4"
+      },
+      "releaseDefinition": {
+        "id": 26,
+        "name": "repo-gamma"
+      },
+      "releaseEnvironment": {
+        "id": 38168,
+        "name": "qa"
+      }
+    }
+  ]
+}

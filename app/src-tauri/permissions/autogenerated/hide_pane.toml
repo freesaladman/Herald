@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-hide-pane"
+description = "Enables the hide_pane command without any pre-configured scope."
+commands.allow = ["hide_pane"]
+
+[[permission]]
+identifier = "deny-hide-pane"
+description = "Denies the hide_pane command without any pre-configured scope."
+commands.deny = ["hide_pane"]

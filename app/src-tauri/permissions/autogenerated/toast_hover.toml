@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-toast-hover"
+description = "Enables the toast_hover command without any pre-configured scope."
+commands.allow = ["toast_hover"]
+
+[[permission]]
+identifier = "deny-toast-hover"
+description = "Denies the toast_hover command without any pre-configured scope."
+commands.deny = ["toast_hover"]

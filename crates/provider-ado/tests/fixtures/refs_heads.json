@@ -1,0 +1,23 @@
+{
+ "value": [
+  {
+   "name": "refs/heads/feature/branch-5",
+   "objectId": "8b21ea852a84882937c3de4c02228d485d0991e0",
+   "creator": {
+    "displayName": "Person 1",
+    "id": "54a5054c-da2e-4003-9e0e-14ca778e6176",
+    "uniqueName": "person2@example.com"
+   }
+  },
+  {
+   "name": "refs/heads/feature/branch-6",
+   "objectId": "807d2f893ece2523375277c66c5421f1805913ee",
+   "creator": {
+    "displayName": "Person 1",
+    "id": "54a5054c-da2e-4003-9e0e-14ca778e6176",
+    "uniqueName": "person2@example.com"
+   }
+  }
+ ],
+ "count": 2
+}

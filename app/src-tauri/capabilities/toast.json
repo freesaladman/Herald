@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "toast",
+  "description": "Herald toast window: listen to app events and call the toast commands",
+  "windows": ["toast"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-toast-clicked",
+    "allow-toast-hover",
+    "allow-toast-resize"
+  ]
+}

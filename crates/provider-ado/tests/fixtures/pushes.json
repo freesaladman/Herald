@@ -1,0 +1,107 @@
+{
+ "count": 3,
+ "value": [
+  {
+   "refUpdates": [
+    {
+     "repositoryId": "62f746b4-84e6-4ceb-95bd-447e7184d454",
+     "name": "refs/pull/7123/merge",
+     "oldObjectId": "0000000000000000000000000000000000000000",
+     "newObjectId": "0ded97bb7ec0c9226ed91f2e3af9f30c5a661477"
+    }
+   ],
+   "repository": {
+    "id": "62f746b4-84e6-4ceb-95bd-447e7184d454",
+    "name": "repo-alpha",
+    "project": {
+     "id": "b61e6ba5-3682-4dd6-b804-69b84b2d451c",
+     "name": "Project One",
+     "description": "[redacted]",
+     "state": "wellFormed",
+     "revision": 336,
+     "visibility": "private",
+     "lastUpdateTime": "2026-10-20T16:07:58.313Z"
+    },
+    "size": 12423802,
+    "webUrl": "https://dev.azure.com/contoso/Project%20One/_git/repo-alpha",
+    "isDisabled": false,
+    "isInMaintenance": false
+   },
+   "pushedBy": {
+    "displayName": "Person 1",
+    "id": "95814675-5260-4ba9-9362-3b53b93e295f",
+    "uniqueName": "person2@example.com"
+   },
+   "pushId": 75360,
+   "date": "2026-11-21T00:01:20.3431046Z"
+  },
+  {
+   "refUpdates": [
+    {
+     "repositoryId": "62f746b4-84e6-4ceb-95bd-447e7184d454",
+     "name": "refs/heads/feature/branch-4",
+     "oldObjectId": "0000000000000000000000000000000000000000",
+     "newObjectId": "5e5c41765df6f817b0992bcf60ec6db25097c040"
+    }
+   ],
+   "repository": {
+    "id": "62f746b4-84e6-4ceb-95bd-447e7184d454",
+    "name": "repo-alpha",
+    "project": {
+     "id": "b61e6ba5-3682-4dd6-b804-69b84b2d451c",
+     "name": "Project One",
+     "description": "[redacted]",
+     "state": "wellFormed",
+     "revision": 336,
+     "visibility": "private",
+     "lastUpdateTime": "2026-10-20T16:07:58.313Z"
+    },
+    "size": 12423802,
+    "webUrl": "https://dev.azure.com/contoso/Project%20One/_git/repo-alpha",
+    "isDisabled": false,
+    "isInMaintenance": false
+   },
+   "pushedBy": {
+    "displayName": "Person 3",
+    "id": "ec7ac8ad-1b2b-406b-aae1-2c972399d29d",
+    "uniqueName": "person4@example.com"
+   },
+   "pushId": 75359,
+   "date": "2026-11-21T00:00:48.0902329Z"
+  },
+  {
+   "refUpdates": [
+    {
+     "repositoryId": "62f746b4-84e6-4ceb-95bd-447e7184d454",
+     "name": "refs/pull/7053/merge",
+     "oldObjectId": "2b1522b8a15f09c858b8413f8ef5b163cef350e7",
+     "newObjectId": "f2ecb7d90a6fd69304a0a7d3d3f1b773a6e35f4b"
+    }
+   ],
+   "repository": {
+    "id": "62f746b4-84e6-4ceb-95bd-447e7184d454",
+    "name": "repo-alpha",
+    "project": {
+     "id": "b61e6ba5-3682-4dd6-b804-69b84b2d451c",
+     "name": "Project One",
+     "description": "[redacted]",
+     "state": "wellFormed",
+     "revision": 336,
+     "visibility": "private",
+     "lastUpdateTime": "2026-10-20T16:07:58.313Z"
+    },
+    "size": 12423802,
+    "webUrl": "https://dev.azure.com/contoso/Project%20One/_git/repo-alpha",
+    "isDisabled": false,
+    "isInMaintenance": false
+   },
+   "pushedBy": {
+    "displayName": "Person 1",
+    "id": "95814675-5260-4ba9-9362-3b53b93e295f",
+    "uniqueName": "person2@example.com"
+   },
+   "pushId": 75356,
+   "date": "2026-11-20T23:55:52.2579222Z"
+  }
+ ]
+}

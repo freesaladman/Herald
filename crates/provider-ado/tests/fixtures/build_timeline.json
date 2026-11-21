@@ -1,0 +1,61 @@
+{
+  "records": [
+    {
+      "id": "a9cc2ff7-4eaf-4d61-8434-d99c09ff7f0c",
+      "parentId": null,
+      "type": "Stage",
+      "name": "__default",
+      "startTime": "2026-11-01T00:46:03.6666667Z",
+      "finishTime": "2026-11-01T01:10:35.3166667Z",
+      "state": "completed",
+      "result": "failed",
+      "order": 1
+    },
+    {
+      "id": "944782d7-3418-42c5-9b24-10a6f0ae1284",
+      "parentId": "a9cc2ff7-4eaf-4d61-8434-d99c09ff7f0c",
+      "type": "Phase",
+      "name": "E2E Tests - Group 2: Search + Filters",
+      "startTime": "2026-11-01T00:46:03.6666667Z",
+      "finishTime": "2026-11-01T01:04:04.2566667Z",
+      "state": "completed",
+      "result": "failed",
+      "order": 2
+    },
+    {
+      "id": "101379c7-d2ab-4d67-8074-a6442ba33d67",
+      "parentId": "543bcfbb-c9f2-4a8a-9ecf-958027801375",
+      "type": "Job",
+      "name": "E2E Tests - Group 3: Checkout + Catalog",
+      "startTime": "2026-11-01T00:46:05.94Z",
+      "finishTime": "2026-11-01T01:10:32.5666667Z",
+      "state": "completed",
+      "result": "failed",
+      "queueId": 217,
+      "order": 1
+    },
+    {
+      "id": "6d84cc79-5636-4be9-b859-93a74865d3ee",
+      "parentId": "fe2fbd72-0bdc-45d3-860b-ed79214119cf",
+      "type": "Task",
+      "name": "Initialize job",
+      "startTime": "2026-11-01T00:46:04.7366667Z",
+      "finishTime": "2026-11-01T00:46:06.98Z",
+      "state": "completed",
+      "result": "succeeded",
+      "order": 1
+    },
+    {
+      "id": "04948682-4233-4b55-bff9-59b7c7fda173",
+      "parentId": "fe2fbd72-0bdc-45d3-860b-ed79214119cf",
+      "type": "Task",
+      "name": "npm ci",
+      "startTime": "2026-11-01T00:46:08.79Z",
+      "finishTime": "2026-11-01T00:46:29.09Z",
+      "state": "completed",
+      "result": "succeeded",
+      "order": 4
+    }
+  ],
+  "id": "2ccd5f71-12fc-4e59-b1e9-f4fd46b1f9d2"
+}

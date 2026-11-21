@@ -1,0 +1,27 @@
+{
+ "value": [
+  {
+   "id": 1,
+   "description": "[redacted]",
+   "author": {
+    "displayName": "Person 1",
+    "id": "ec7ac8ad-1b2b-406b-aae1-2c972399d29d",
+    "uniqueName": "person2@example.com"
+   },
+   "createdDate": "2026-11-21T00:01:19.1794065Z",
+   "updatedDate": "2026-11-21T00:01:19.1794065Z",
+   "sourceRefCommit": {
+    "commitId": "5e5c41765df6f817b0992bcf60ec6db25097c040"
+   },
+   "targetRefCommit": {
+    "commitId": "3da9d8c096d38ff58c3f846cc6a942d303f84c48"
+   },
+   "commonRefCommit": {
+    "commitId": "3da9d8c096d38ff58c3f846cc6a942d303f84c48"
+   },
+   "hasMoreCommits": false,
+   "reason": "push"
+  }
+ ],
+ "count": 1
+}

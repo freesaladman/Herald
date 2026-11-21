@@ -1,0 +1,144 @@
+{
+  "count": 2,
+  "value": [
+    {
+      "id": "d9fb18e8-eef6-4ac4-88b6-350eedd03c87",
+      "steps": [
+        {
+          "assignedApprover": {
+            "displayName": "[contoso]\\Group 1",
+            "id": "f7572dd8-8f18-4e53-a895-bc4380f485ea",
+            "uniqueName": "vstfs:///Framework/IdentityDomain/00000000-0000-0000-0000-000000000000\\Group 1",
+            "isContainer": true
+          },
+          "status": "pending",
+          "lastModifiedOn": "2026-11-15T11:45:59.3984696Z",
+          "order": 1,
+          "lastModifiedBy": {
+            "displayName": "Microsoft.VisualStudio.Services.TFS",
+            "id": "95814675-5260-4ba9-9362-3b53b93e295f",
+            "uniqueName": "95814675-5260-4ba9-9362-3b53b93e295f@4ca8c324-a8eb-42f1-a27d-239fdf8adf39"
+          },
+          "initiatedOn": "2026-10-16T11:45:59.2714666Z",
+          "history": []
+        },
+        {
+          "assignedApprover": {
+            "displayName": "[contoso]\\Group 2",
+            "id": "dde5a881-1aaf-4366-8999-f49576886726",
+            "uniqueName": "vstfs:///Framework/IdentityDomain/00000000-0000-0000-0000-000000000000\\Group 2",
+            "isContainer": true
+          },
+          "status": "pending",
+          "lastModifiedOn": "2026-11-15T11:45:59.3984696Z",
+          "order": 1,
+          "lastModifiedBy": {
+            "displayName": "Microsoft.VisualStudio.Services.TFS",
+            "id": "95814675-5260-4ba9-9362-3b53b93e295f",
+            "uniqueName": "95814675-5260-4ba9-9362-3b53b93e295f@4ca8c324-a8eb-42f1-a27d-239fdf8adf39"
+          },
+          "initiatedOn": "2026-10-16T11:45:59.2714666Z",
+          "history": []
+        }
+      ],
+      "status": "pending",
+      "createdOn": "2026-10-16T11:45:59.27Z",
+      "lastModifiedOn": "2026-11-15T11:45:59.3984696Z",
+      "executionOrder": "anyOrder",
+      "minRequiredApprovers": 1,
+      "blockedApprovers": [],
+      "_links": {
+        "self": {
+          "href": "https://dev.azure.com/contoso/b61e6ba5-3682-4dd6-b804-69b84b2d451c/_apis/pipelines/approvals/d9fb18e8-eef6-4ac4-88b6-350eedd03c87?%24expand=1"
+        }
+      },
+      "pipeline": {
+        "owner": {
+          "_links": {
+            "web": {
+              "href": "https://dev.azure.com/contoso/b61e6ba5-3682-4dd6-b804-69b84b2d451c/_build/results?buildId=47181"
+            },
+            "self": {
+              "href": "https://dev.azure.com/contoso/b61e6ba5-3682-4dd6-b804-69b84b2d451c/_apis/build/Builds/47181"
+            }
+          },
+          "id": 47181,
+          "name": "release-2026.10.16.1"
+        },
+        "id": "89",
+        "name": "web-release"
+      }
+    },
+    {
+      "id": "1007e910-f9a8-4ab8-99b3-43bb8a01f57a",
+      "steps": [
+        {
+          "assignedApprover": {
+            "displayName": "Person 1",
+            "id": "e4d3921a-724a-47f6-a518-182b5e200159",
+            "uniqueName": "person1@example.com"
+          },
+          "actualApprover": {
+            "displayName": "Person 1",
+            "id": "e4d3921a-724a-47f6-a518-182b5e200159",
+            "uniqueName": "person1@example.com"
+          },
+          "status": "approved",
+          "lastModifiedOn": "2026-11-10T19:05:16.8305524Z",
+          "order": 1,
+          "lastModifiedBy": {
+            "displayName": "Person 1",
+            "id": "e4d3921a-724a-47f6-a518-182b5e200159",
+            "uniqueName": "person1@example.com"
+          },
+          "initiatedOn": "2026-11-10T19:05:08.9907889Z",
+          "history": []
+        },
+        {
+          "assignedApprover": {
+            "displayName": "Person 2",
+            "id": "2936be1a-54e6-4454-a922-5a7d3e21b31d",
+            "uniqueName": "person2@example.com"
+          },
+          "status": "pending",
+          "lastModifiedOn": "2026-11-10T19:05:08.9907889Z",
+          "order": 1,
+          "lastModifiedBy": {
+            "displayName": "Microsoft.VisualStudio.Services.TFS",
+            "id": "95814675-5260-4ba9-9362-3b53b93e295f",
+            "uniqueName": "95814675-5260-4ba9-9362-3b53b93e295f@4ca8c324-a8eb-42f1-a27d-239fdf8adf39"
+          },
+          "initiatedOn": "2026-11-10T19:05:08.9907889Z",
+          "history": []
+        }
+      ],
+      "status": "approved",
+      "createdOn": "2026-11-10T19:05:08.99Z",
+      "lastModifiedOn": "2026-11-10T19:05:16.8305524Z",
+      "executionOrder": "anyOrder",
+      "minRequiredApprovers": 1,
+      "blockedApprovers": [],
+      "_links": {
+        "self": {
+          "href": "https://dev.azure.com/contoso/b61e6ba5-3682-4dd6-b804-69b84b2d451c/_apis/pipelines/approvals/1007e910-f9a8-4ab8-99b3-43bb8a01f57a?%24expand=1"
+        }
+      },
+      "pipeline": {
+        "owner": {
+          "_links": {
+            "web": {
+              "href": "https://dev.azure.com/contoso/b61e6ba5-3682-4dd6-b804-69b84b2d451c/_build/results?buildId=49443"
+            },
+            "self": {
+              "href": "https://dev.azure.com/contoso/b61e6ba5-3682-4dd6-b804-69b84b2d451c/_apis/build/Builds/49443"
+            }
+          },
+          "id": 49443,
+          "name": "20261110.2"
+        },
+        "id": "102",
+        "name": "repo-epsilon"
+      }
+    }
+  ]
+}

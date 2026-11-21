@@ -1,0 +1,363 @@
+//! Provider-neutral traits and types. Concrete providers live in their own crates.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use futures_util::future::BoxFuture;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+
+use crate::config::{Config, ConfigError, ConnectionConfig};
+use crate::event::{ConnectionRef, Event};
+use crate::secrets::SecretStore;
+use crate::store::{self, Store};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Identity {
+    pub id: String,
+    pub display_name: String,
+    pub unique_name: String,
+    pub group_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthState {
+    Unknown,
+    Ok,
+    Missing,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Tier {
+    Fast,
+    Pr,
+    Slow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ProviderError {
+    #[error("unauthorized")]
+    Unauthorized,
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("throttled, retry after {retry_after:?}")]
+    Throttled { retry_after: Duration },
+    #[error("missing credentials")]
+    MissingCredentials,
+    #[error("transient error: {0}")]
+    Transient(String),
+    #[error("configuration error: {0}")]
+    Config(String),
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<store::StoreError> for ProviderError {
+    fn from(e: store::StoreError) -> Self {
+        ProviderError::Other(e.to_string())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteRepo {
+    pub provider: String,
+    pub host_key: String,
+    pub namespace: Option<String>,
+    pub repo_name: String,
+}
+
+/// Snapshot access namespaced to one connection ("{connId}:{key}").
+#[derive(Clone)]
+pub struct ScopedSnapshots {
+    store: Arc<Store>,
+    prefix: String,
+}
+
+impl ScopedSnapshots {
+    pub fn new(store: Arc<Store>, connection_id: &str) -> Self {
+        Self {
+            store,
+            prefix: format!("{connection_id}:"),
+        }
+    }
+
+    pub fn get<T: DeserializeOwned>(&self, key: &str) -> store::Result<Option<T>> {
+        self.store.get_snapshot(&self.scoped(key))
+    }
+
+    pub fn put<T: Serialize>(&self, key: &str, value: &T) -> store::Result<()> {
+        self.store.put_snapshot(&self.scoped(key), value)
+    }
+
+    fn scoped(&self, key: &str) -> String {
+        format!("{}{key}", self.prefix)
+    }
+}
+
+#[derive(Clone)]
+pub struct SyncContext {
+    pub connection: ConnectionRef,
+    pub me: Identity,
+    pub config: Arc<Config>,
+    pub connection_config: ConnectionConfig,
+    pub snapshots: ScopedSnapshots,
+    pub server_now: DateTime<Utc>,
+    /// `None` means the source has never synced (seed).
+    pub watermark: Option<DateTime<Utc>>,
+    pub catch_up: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PollOutcome {
+    pub events: Vec<Event>,
+}
+
+pub trait Source: Send {
+    fn name(&self) -> &'static str;
+    fn tier(&self) -> Tier;
+    fn poll<'a>(
+        &'a mut self,
+        ctx: &'a SyncContext,
+    ) -> BoxFuture<'a, Result<PollOutcome, ProviderError>>;
+}
+
+pub trait Connection: Send + Sync {
+    fn id(&self) -> &str;
+    fn provider(&self) -> &'static str;
+    fn auth_method(&self) -> &str;
+    /// Includes group ids.
+    fn identify(&self) -> BoxFuture<'_, Result<Identity, ProviderError>>;
+    fn server_time(&self) -> BoxFuture<'_, Result<DateTime<Utc>, ProviderError>>;
+    fn sources(&self) -> Vec<Box<dyn Source>>;
+    fn credentials_changed(&self);
+}
+
+pub trait ProviderFactory: Send + Sync {
+    fn kind(&self) -> &'static str;
+    fn secret_label(&self) -> &'static str;
+    /// Error paths are relative to the connection (e.g. `organization`);
+    /// `Config::validate_providers` prefixes them with `connections[i].`.
+    fn validate(&self, cfg: &ConnectionConfig) -> Vec<ConfigError>;
+    fn connect(
+        &self,
+        cfg: &ConnectionConfig,
+        secrets: Arc<dyn SecretStore>,
+    ) -> Result<Arc<dyn Connection>, ProviderError>;
+    fn parse_remote(&self, git_remote_url: &str) -> Option<RemoteRepo>;
+}
+
+#[derive(Clone)]
+pub struct ProviderRegistry {
+    factories: Vec<Arc<dyn ProviderFactory>>,
+}
+
+impl ProviderRegistry {
+    pub fn new(factories: Vec<Arc<dyn ProviderFactory>>) -> Self {
+        Self { factories }
+    }
+
+    pub fn get(&self, kind: &str) -> Option<Arc<dyn ProviderFactory>> {
+        self.factories.iter().find(|f| f.kind() == kind).cloned()
+    }
+
+    pub fn all(&self) -> &[Arc<dyn ProviderFactory>] {
+        &self.factories
+    }
+}
+
+impl Config {
+    /// Provider-specific validation: unknown providers and each factory's own checks.
+    pub fn validate_providers(&self, registry: &ProviderRegistry) -> Vec<ConfigError> {
+        let mut errors = Vec::new();
+        for (i, conn) in self.connections.iter().enumerate() {
+            if conn.provider.trim().is_empty() {
+                continue;
+            }
+            match registry.get(&conn.provider) {
+                None => errors.push(ConfigError::new(
+                    format!("connections[{i}].provider"),
+                    format!("unknown provider '{}'", conn.provider),
+                )),
+                Some(factory) => {
+                    errors.extend(factory.validate(conn).into_iter().map(|e| {
+                        ConfigError::new(format!("connections[{i}].{}", e.path), e.message)
+                    }))
+                }
+            }
+        }
+        errors
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::{FakeProvider, FakeProviderFactory, sync_context};
+    use chrono::TimeZone;
+
+    fn identity() -> Identity {
+        Identity {
+            id: "me".into(),
+            display_name: "Me".into(),
+            unique_name: "me@example.test".into(),
+            group_ids: vec![],
+        }
+    }
+
+    fn conn_cfg(id: &str, provider: &str) -> ConnectionConfig {
+        ConnectionConfig {
+            id: id.into(),
+            provider: provider.into(),
+            enabled: true,
+            auth: Default::default(),
+            bots: vec![],
+            settings: toml::Table::new(),
+        }
+    }
+
+    #[test]
+    fn scoped_snapshots_prefix_keys_per_connection() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let a = ScopedSnapshots::new(store.clone(), "conn-a");
+        let b = ScopedSnapshots::new(store.clone(), "conn-b");
+        a.put("k", &1_i32).unwrap();
+        b.put("k", &2_i32).unwrap();
+        assert_eq!(a.get::<i32>("k").unwrap(), Some(1));
+        assert_eq!(b.get::<i32>("k").unwrap(), Some(2));
+        assert_eq!(store.get_snapshot::<i32>("conn-a:k").unwrap(), Some(1));
+        assert_eq!(a.get::<i32>("other").unwrap(), None);
+    }
+
+    #[test]
+    fn validate_providers_flags_unknown_and_surfaces_factory_errors() {
+        let provider = FakeProvider::new();
+        provider.set_validate_errors(vec![ConfigError::new("settings.x", "bad x")]);
+        let registry = ProviderRegistry::new(vec![Arc::new(FakeProviderFactory::new(provider))]);
+        let config = Config {
+            connections: vec![conn_cfg("conn-a", "fake"), conn_cfg("conn-b", "nope")],
+            ..Config::default()
+        };
+        let errors = config.validate_providers(&registry);
+        assert_eq!(
+            errors,
+            vec![
+                ConfigError::new("connections[0].settings.x", "bad x"),
+                ConfigError::new("connections[1].provider", "unknown provider 'nope'"),
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_providers_skips_blank_provider() {
+        let registry = ProviderRegistry::new(vec![Arc::new(FakeProviderFactory::new(
+            FakeProvider::new(),
+        ))]);
+        let config = Config {
+            connections: vec![conn_cfg("conn-a", "  ")],
+            ..Config::default()
+        };
+        assert!(config.validate_providers(&registry).is_empty());
+    }
+
+    #[test]
+    fn factories_with_different_kinds_have_independent_scripts() {
+        let (a, b) = (FakeProvider::new(), FakeProvider::new());
+        a.add_source("alpha", Tier::Fast);
+        b.add_source("beta", Tier::Slow);
+        let registry = ProviderRegistry::new(vec![
+            Arc::new(FakeProviderFactory::with_kind(a, "fake-a")),
+            Arc::new(FakeProviderFactory::with_kind(b, "fake-b")),
+        ]);
+        let secrets: Arc<dyn SecretStore> = Arc::new(crate::secrets::MemorySecretStore::default());
+        let conn_a = registry
+            .get("fake-a")
+            .unwrap()
+            .connect(&conn_cfg("ca", "fake-a"), secrets.clone())
+            .unwrap();
+        let conn_b = registry
+            .get("fake-b")
+            .unwrap()
+            .connect(&conn_cfg("cb", "fake-b"), secrets)
+            .unwrap();
+        assert_eq!(conn_a.provider(), "fake-a");
+        assert_eq!(conn_b.provider(), "fake-b");
+        assert_eq!(conn_a.sources()[0].name(), "alpha");
+        assert_eq!(conn_b.sources()[0].name(), "beta");
+        assert!(registry.get("fake").is_none());
+    }
+
+    #[tokio::test]
+    async fn held_poll_waits_for_release() {
+        let provider = FakeProvider::new();
+        provider.add_source("alpha", Tier::Fast);
+        provider.push_poll("alpha", Err(ProviderError::Unauthorized));
+        provider.hold_polls("alpha");
+        let cfg = conn_cfg("conn-a", "fake");
+        let conn = FakeProviderFactory::new(provider.clone())
+            .connect(&cfg, Arc::new(crate::secrets::MemorySecretStore::default()))
+            .unwrap();
+        let mut source = conn.sources().remove(0);
+        let (ctx, _store) = sync_context(cfg, identity(), chrono::Utc::now(), None, false);
+
+        let mut poll = source.poll(&ctx);
+        let held = tokio::time::timeout(Duration::from_millis(50), &mut poll).await;
+        assert!(held.is_err());
+
+        provider.release_polls("alpha");
+        let result = tokio::time::timeout(Duration::from_secs(5), poll)
+            .await
+            .unwrap();
+        assert_eq!(result.unwrap_err(), ProviderError::Unauthorized);
+    }
+
+    #[test]
+    fn registry_get_and_all() {
+        let registry = ProviderRegistry::new(vec![Arc::new(FakeProviderFactory::new(
+            FakeProvider::new(),
+        ))]);
+        assert_eq!(registry.all().len(), 1);
+        assert!(registry.get("fake").is_some());
+        assert!(registry.get("other").is_none());
+    }
+
+    #[tokio::test]
+    async fn fake_source_returns_queued_results_and_records_contexts() {
+        let provider = FakeProvider::new();
+        provider.add_source("alpha", Tier::Fast);
+        provider.push_poll("alpha", Err(ProviderError::Unauthorized));
+        provider.push_poll("alpha", Ok(PollOutcome::default()));
+
+        let factory = FakeProviderFactory::new(provider.clone());
+        let cfg = conn_cfg("conn-a", "fake");
+        let conn = factory
+            .connect(&cfg, Arc::new(crate::secrets::MemorySecretStore::default()))
+            .unwrap();
+        let mut sources = conn.sources();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name(), "alpha");
+
+        let now = chrono::Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        let (seed_ctx, _store) = sync_context(cfg.clone(), identity(), now, None, false);
+        let (catch_ctx, _store) = sync_context(cfg, identity(), now, Some(now), true);
+
+        assert_eq!(
+            sources[0].poll(&seed_ctx).await.unwrap_err(),
+            ProviderError::Unauthorized
+        );
+        assert!(sources[0].poll(&catch_ctx).await.is_ok());
+        // Queue drained: default is an empty success.
+        assert!(sources[0].poll(&catch_ctx).await.unwrap().events.is_empty());
+
+        let calls = provider.poll_calls("alpha");
+        assert_eq!(provider.poll_count("alpha"), 3);
+        assert_eq!(calls[0].watermark, None);
+        assert!(!calls[0].catch_up);
+        assert_eq!(calls[1].watermark, Some(now));
+        assert!(calls[1].catch_up);
+    }
+}

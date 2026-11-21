@@ -1,0 +1,184 @@
+{
+ "value": [
+  {
+   "repository": {
+    "id": "62f746b4-84e6-4ceb-95bd-447e7184d454",
+    "name": "repo-alpha",
+    "project": {
+     "id": "b61e6ba5-3682-4dd6-b804-69b84b2d451c",
+     "name": "Project One",
+     "state": "unchanged",
+     "visibility": "unchanged",
+     "lastUpdateTime": "0001-01-01T00:00:00"
+    }
+   },
+   "pullRequestId": 7123,
+   "codeReviewId": 7123,
+   "status": "active",
+   "createdBy": {
+    "displayName": "Person 1",
+    "id": "ec7ac8ad-1b2b-406b-aae1-2c972399d29d",
+    "uniqueName": "person2@example.com"
+   },
+   "creationDate": "2026-11-21T00:01:19.1653671Z",
+   "title": "[redacted]",
+   "description": "[redacted]",
+   "sourceRefName": "refs/heads/feature/branch-4",
+   "targetRefName": "refs/heads/main",
+   "mergeStatus": "succeeded",
+   "isDraft": false,
+   "mergeId": "dc36fc90-2248-4d70-aca4-a1a9f5b19f71",
+   "lastMergeSourceCommit": {
+    "commitId": "5e5c41765df6f817b0992bcf60ec6db25097c040"
+   },
+   "lastMergeTargetCommit": {
+    "commitId": "3da9d8c096d38ff58c3f846cc6a942d303f84c48"
+   },
+   "lastMergeCommit": {
+    "commitId": "0ded97bb7ec0c9226ed91f2e3af9f30c5a661477"
+   },
+   "reviewers": [
+    {
+     "reviewerUrl": "https://dev.azure.com/contoso/b61e6ba5-3682-4dd6-b804-69b84b2d451c/_apis/git/repositories/62f746b4-84e6-4ceb-95bd-447e7184d454/pullRequests/7123/reviewers/e500bddf-37b0-4307-8f0f-4c3c2052e52b",
+     "vote": 0,
+     "hasDeclined": false,
+     "isRequired": true,
+     "isFlagged": false,
+     "displayName": "Person 3",
+     "id": "e500bddf-37b0-4307-8f0f-4c3c2052e52b",
+     "uniqueName": "person4@example.com",
+     "isContainer": true
+    },
+    {
+     "reviewerUrl": "https://dev.azure.com/contoso/b61e6ba5-3682-4dd6-b804-69b84b2d451c/_apis/git/repositories/62f746b4-84e6-4ceb-95bd-447e7184d454/pullRequests/7123/reviewers/54a5054c-da2e-4003-9e0e-14ca778e6176",
+     "vote": 0,
+     "votedFor": [
+      {
+       "reviewerUrl": "https://dev.azure.com/contoso/b61e6ba5-3682-4dd6-b804-69b84b2d451c/_apis/git/repositories/62f746b4-84e6-4ceb-95bd-447e7184d454/pullRequests/7123/reviewers/e500bddf-37b0-4307-8f0f-4c3c2052e52b",
+       "vote": 0,
+       "displayName": "Person 3",
+       "id": "e500bddf-37b0-4307-8f0f-4c3c2052e52b",
+       "uniqueName": "person4@example.com",
+       "isContainer": true
+      }
+     ],
+     "hasDeclined": false,
+     "isFlagged": false,
+     "displayName": "Person 5",
+     "id": "54a5054c-da2e-4003-9e0e-14ca778e6176",
+     "uniqueName": "person6@example.com"
+    }
+   ],
+   "completionOptions": {
+    "deleteSourceBranch": true,
+    "mergeStrategy": "noFastForward"
+   },
+   "supportsIterations": true
+  },
+  {
+   "repository": {
+    "id": "62f746b4-84e6-4ceb-95bd-447e7184d454",
+    "name": "repo-alpha",
+    "project": {
+     "id": "b61e6ba5-3682-4dd6-b804-69b84b2d451c",
+     "name": "Project One",
+     "state": "unchanged",
+     "visibility": "unchanged",
+     "lastUpdateTime": "0001-01-01T00:00:00"
+    }
+   },
+   "pullRequestId": 7122,
+   "codeReviewId": 7122,
+   "status": "active",
+   "createdBy": {
+    "displayName": "Person 7",
+    "id": "8c0a70a7-a845-47f9-953a-5154281fa6f5",
+    "uniqueName": "person8@example.com"
+   },
+   "creationDate": "2026-11-20T23:26:08.3432476Z",
+   "title": "[redacted]",
+   "description": "[redacted]",
+   "sourceRefName": "refs/heads/feature/branch-3",
+   "targetRefName": "refs/heads/main",
+   "mergeStatus": "succeeded",
+   "isDraft": false,
+   "mergeId": "0db317d9-4c8e-4fa3-969a-73bf4c83cf3b",
+   "lastMergeSourceCommit": {
+    "commitId": "9ce4aa5f0b4702d25e05c9906be994f2baa2919c"
+   },
+   "lastMergeTargetCommit": {
+    "commitId": "3da9d8c096d38ff58c3f846cc6a942d303f84c48"
+   },
+   "lastMergeCommit": {
+    "commitId": "d438155150d00787862a73db851bec1ede27387c"
+   },
+   "reviewers": [
+    {
+     "reviewerUrl": "https://dev.azure.com/contoso/b61e6ba5-3682-4dd6-b804-69b84b2d451c/_apis/git/repositories/62f746b4-84e6-4ceb-95bd-447e7184d454/pullRequests/7122/reviewers/e500bddf-37b0-4307-8f0f-4c3c2052e52b",
+     "vote": 0,
+     "hasDeclined": false,
+     "isRequired": true,
+     "isFlagged": false,
+     "displayName": "Person 3",
+     "id": "e500bddf-37b0-4307-8f0f-4c3c2052e52b",
+     "uniqueName": "person4@example.com",
+     "isContainer": true
+    }
+   ],
+   "supportsIterations": true
+  },
+  {
+   "repository": {
+    "id": "939ae232-588e-4bce-b71e-d78a1dc02e27",
+    "name": "repo-iota",
+    "project": {
+     "id": "b61e6ba5-3682-4dd6-b804-69b84b2d451c",
+     "name": "Project One",
+     "state": "unchanged",
+     "visibility": "unchanged",
+     "lastUpdateTime": "0001-01-01T00:00:00"
+    }
+   },
+   "pullRequestId": 7121,
+   "codeReviewId": 7121,
+   "status": "active",
+   "createdBy": {
+    "displayName": "Person 5",
+    "id": "54a5054c-da2e-4003-9e0e-14ca778e6176",
+    "uniqueName": "person6@example.com"
+   },
+   "creationDate": "2026-11-20T23:23:30.0920676Z",
+   "title": "[redacted]",
+   "description": "[redacted]",
+   "sourceRefName": "refs/heads/feature/branch-2",
+   "targetRefName": "refs/heads/main",
+   "mergeStatus": "succeeded",
+   "isDraft": false,
+   "mergeId": "5e571eaa-66c1-44e7-8859-90d2e844c762",
+   "lastMergeSourceCommit": {
+    "commitId": "620602e0fc80fa6f7a8d9ccd7582329f7ac526d3"
+   },
+   "lastMergeTargetCommit": {
+    "commitId": "00e287d75eda7e46a386c4a7670c589145d28c06"
+   },
+   "lastMergeCommit": {
+    "commitId": "7592b89ff910d68abaeebb48936b7ac2bce1cb34"
+   },
+   "reviewers": [
+    {
+     "reviewerUrl": "https://dev.azure.com/contoso/b61e6ba5-3682-4dd6-b804-69b84b2d451c/_apis/git/repositories/939ae232-588e-4bce-b71e-d78a1dc02e27/pullRequests/7121/reviewers/e500bddf-37b0-4307-8f0f-4c3c2052e52b",
+     "vote": 0,
+     "hasDeclined": false,
+     "isRequired": true,
+     "isFlagged": false,
+     "displayName": "Person 3",
+     "id": "e500bddf-37b0-4307-8f0f-4c3c2052e52b",
+     "uniqueName": "person4@example.com",
+     "isContainer": true
+    }
+   ],
+   "supportsIterations": true
+  }
+ ],
+ "count": 3
+}

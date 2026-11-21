@@ -1,0 +1,165 @@
+{
+  "count": 2,
+  "value": [
+    {
+      "id": 8679,
+      "name": "2026.11.20.6",
+      "status": "active",
+      "createdOn": "2026-11-20T23:27:48.863Z",
+      "modifiedOn": "2026-11-20T23:27:48.863Z",
+      "createdBy": {
+        "displayName": "Person 2",
+        "id": "8c0a70a7-a845-47f9-953a-5154281fa6f5",
+        "uniqueName": "person2@example.com"
+      },
+      "artifacts": [
+        {
+          "sourceId": "b61e6ba5-3682-4dd6-b804-69b84b2d451c:43",
+          "type": "Build",
+          "alias": "repo-iota",
+          "definitionReference": {
+            "branches": {
+              "id": "main",
+              "name": "main"
+            },
+            "buildUri": {
+              "id": "vstfs:///Build/Build/51125",
+              "name": null
+            },
+            "definition": {
+              "id": "43",
+              "name": "repo-alpha"
+            },
+            "project": {
+              "id": "b61e6ba5-3682-4dd6-b804-69b84b2d451c",
+              "name": "repo-delta"
+            },
+            "repository.provider": {
+              "id": "TfsGit",
+              "name": null
+            },
+            "repository": {
+              "id": "62f746b4-84e6-4ceb-95bd-447e7184d454",
+              "name": "repo-alpha"
+            },
+            "requestedFor": {
+              "id": "Person 3",
+              "name": null
+            },
+            "sourceVersion": {
+              "id": "3da9d8c096d38ff58c3f846cc6a942d303f84c48",
+              "name": null
+            },
+            "version": {
+              "id": "51125",
+              "name": "2026.11.20.43"
+            }
+          },
+          "isPrimary": true,
+          "isRetained": true
+        }
+      ],
+      "releaseDefinition": {
+        "id": 11,
+        "name": "repo-alpha",
+        "path": "\\Api",
+        "_links": {
+          "web": {
+            "href": "https://dev.azure.com/contoso/b61e6ba5-3682-4dd6-b804-69b84b2d451c/_release?definitionId=11"
+          }
+        }
+      },
+      "releaseDefinitionRevision": 67,
+      "reason": "continuousIntegration",
+      "releaseNameFormat": "$(Date:yyyy.MM.dd).$(Rev:r)",
+      "keepForever": false,
+      "definitionSnapshotRevision": 1,
+      "_links": {
+        "web": {
+          "href": "https://dev.azure.com/contoso/b61e6ba5-3682-4dd6-b804-69b84b2d451c/_release?releaseId=8679&_a=release-summary"
+        }
+      },
+      "triggeringArtifactAlias": null
+    },
+    {
+      "id": 8678,
+      "name": "2026.11.20.4",
+      "status": "active",
+      "createdOn": "2026-11-20T23:21:35.163Z",
+      "modifiedOn": "2026-11-20T23:21:35.163Z",
+      "createdBy": {
+        "displayName": "Person 2",
+        "id": "8c0a70a7-a845-47f9-953a-5154281fa6f5",
+        "uniqueName": "person2@example.com"
+      },
+      "artifacts": [
+        {
+          "sourceId": "b61e6ba5-3682-4dd6-b804-69b84b2d451c:37",
+          "type": "Build",
+          "alias": "repo-iota",
+          "definitionReference": {
+            "branches": {
+              "id": "main",
+              "name": "main"
+            },
+            "buildUri": {
+              "id": "vstfs:///Build/Build/51118",
+              "name": null
+            },
+            "definition": {
+              "id": "37",
+              "name": "app-ci"
+            },
+            "project": {
+              "id": "b61e6ba5-3682-4dd6-b804-69b84b2d451c",
+              "name": "repo-delta"
+            },
+            "repository.provider": {
+              "id": "TfsGit",
+              "name": null
+            },
+            "repository": {
+              "id": "939ae232-588e-4bce-b71e-d78a1dc02e27",
+              "name": "repo-iota"
+            },
+            "requestedFor": {
+              "id": "Person 3",
+              "name": null
+            },
+            "sourceVersion": {
+              "id": "00e287d75eda7e46a386c4a7670c589145d28c06",
+              "name": null
+            },
+            "version": {
+              "id": "51118",
+              "name": "20261120.34"
+            }
+          },
+          "isPrimary": true,
+          "isRetained": true
+        }
+      ],
+      "releaseDefinition": {
+        "id": 6,
+        "name": "web-release",
+        "path": "\\Web",
+        "_links": {
+          "web": {
+            "href": "https://dev.azure.com/contoso/b61e6ba5-3682-4dd6-b804-69b84b2d451c/_release?definitionId=6"
+          }
+        }
+      },
+      "releaseDefinitionRevision": 160,
+      "reason": "continuousIntegration",
+      "releaseNameFormat": "$(Date:yyyy).$(Date:MM).$(Date:dd).$(Rev:r)",
+      "keepForever": false,
+      "definitionSnapshotRevision": 1,
+      "_links": {
+        "web": {
+          "href": "https://dev.azure.com/contoso/b61e6ba5-3682-4dd6-b804-69b84b2d451c/_release?releaseId=8678&_a=release-summary"
+        }
+      },
+      "triggeringArtifactAlias": null
+    }
+  ]
+}

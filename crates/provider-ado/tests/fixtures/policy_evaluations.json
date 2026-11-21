@@ -1,0 +1,138 @@
+{
+ "value": [
+  {
+   "configuration": {
+    "createdBy": {
+     "displayName": "Person 1",
+     "id": "54a5054c-da2e-4003-9e0e-14ca778e6176",
+     "uniqueName": "person2@example.com"
+    },
+    "createdDate": "2026-11-16T22:38:09.5686369Z",
+    "isEnabled": true,
+    "isBlocking": true,
+    "isDeleted": false,
+    "settings": {
+     "buildDefinitionId": 43,
+     "queueOnSourceUpdateOnly": true,
+     "manualQueueOnly": false,
+     "displayName": null,
+     "validDuration": 360.0,
+     "scope": [
+      {
+       "refName": "refs/heads/main",
+       "matchKind": "Exact",
+       "repositoryId": "62f746b4-84e6-4ceb-95bd-447e7184d454"
+      }
+     ],
+     "filenamePatterns": [
+      "/*",
+      "!/repo-gamma/*",
+      "!/repo-beta/*"
+     ]
+    },
+    "isEnterpriseManaged": false,
+    "revision": 6,
+    "id": 48,
+    "type": {
+     "id": "9e6a1947-d757-42ef-8e5c-6000c6e5ff4d",
+     "displayName": "Build"
+    }
+   },
+   "artifactId": "vstfs:///CodeReview/CodeReviewId/b61e6ba5-3682-4dd6-b804-69b84b2d451c%2f7123",
+   "evaluationId": "54a8dc38-bf76-4314-8480-6bd0e15b72c2",
+   "startedDate": "2026-11-21T00:03:56.3597725Z",
+   "completedDate": "2026-11-21T00:13:45.5990055Z",
+   "status": "approved",
+   "context": {
+    "lastMergeCommitId": "0ded97bb7ec0c9226ed91f2e3af9f30c5a661477",
+    "lastMergeSourceCommitId": "5e5c41765df6f817b0992bcf60ec6db25097c040",
+    "lastMergeTargetCommitId": "3da9d8c096d38ff58c3f846cc6a942d303f84c48",
+    "buildId": 51151,
+    "buildDefinitionId": 43,
+    "buildDefinitionName": "repo-alpha",
+    "buildIsNotCurrent": false,
+    "buildStartedUtc": "2026-11-21T00:03:55.461416Z",
+    "isExpired": false,
+    "buildAfterMerge": false,
+    "wasAutoRequeued": false,
+    "buildOutputPreview": null
+   }
+  },
+  {
+   "configuration": {
+    "createdBy": {
+     "displayName": "Person 3",
+     "id": "49469a5e-6b91-46e7-a45c-8f2d7e2d1302",
+     "uniqueName": "person4@example.com"
+    },
+    "createdDate": "2023-08-17T20:28:25.6531771Z",
+    "isEnabled": true,
+    "isBlocking": true,
+    "isDeleted": false,
+    "settings": {
+     "allowSquash": true,
+     "scope": [
+      {
+       "refName": "refs/heads/main",
+       "matchKind": "Exact",
+       "repositoryId": "62f746b4-84e6-4ceb-95bd-447e7184d454"
+      }
+     ]
+    },
+    "isEnterpriseManaged": false,
+    "revision": 4,
+    "id": 58,
+    "type": {
+     "id": "cb9b515f-e4ec-4f0d-be03-0f59e5e5b240",
+     "displayName": "Require a merge strategy"
+    }
+   },
+   "artifactId": "vstfs:///CodeReview/CodeReviewId/b61e6ba5-3682-4dd6-b804-69b84b2d451c%2f7123",
+   "evaluationId": "479dd02e-5974-4f6b-8eeb-4467a5c46004",
+   "startedDate": "2026-11-21T00:03:56.3597725Z",
+   "status": "rejected"
+  },
+  {
+   "configuration": {
+    "createdBy": {
+     "displayName": "Person 5",
+     "id": "a35ffc5b-8ba0-40f1-8dfe-d74b768c6714",
+     "uniqueName": "person6@example.com"
+    },
+    "createdDate": "2024-03-29T14:45:23.2296744Z",
+    "isEnabled": true,
+    "isBlocking": true,
+    "isDeleted": false,
+    "settings": {
+     "minimumApproverCount": 1,
+     "creatorVoteCounts": false,
+     "allowDownvotes": false,
+     "resetOnSourcePush": true,
+     "requireVoteOnLastIteration": false,
+     "resetRejectionsOnSourcePush": true,
+     "blockLastPusherVote": true,
+     "requireVoteOnEachIteration": false,
+     "scope": [
+      {
+       "refName": "refs/heads/main",
+       "matchKind": "Exact",
+       "repositoryId": "62f746b4-84e6-4ceb-95bd-447e7184d454"
+      }
+     ]
+    },
+    "isEnterpriseManaged": false,
+    "revision": 6,
+    "id": 63,
+    "type": {
+     "id": "cac858bb-4cca-438c-ae2d-3c616fb35c13",
+     "displayName": "Minimum number of reviewers"
+    }
+   },
+   "artifactId": "vstfs:///CodeReview/CodeReviewId/b61e6ba5-3682-4dd6-b804-69b84b2d451c%2f7123",
+   "evaluationId": "e465b1f1-ac59-47b6-8861-f3a5f201da49",
+   "startedDate": "2026-11-21T00:03:56.3597725Z",
+   "status": "queued"
+  }
+ ],
+ "count": 3
+}

@@ -1,0 +1,59 @@
+{
+ "value": [
+  {
+   "id": "d66b4b4d-b47a-4101-8681-89f46a84e8d5",
+   "name": "repo-zeta",
+   "project": {
+    "id": "b61e6ba5-3682-4dd6-b804-69b84b2d451c",
+    "name": "Project One",
+    "description": "[redacted]",
+    "state": "wellFormed",
+    "revision": 336,
+    "visibility": "private",
+    "lastUpdateTime": "2026-10-20T16:07:58.313Z"
+   },
+   "defaultBranch": "refs/heads/main",
+   "size": 22326,
+   "webUrl": "https://dev.azure.com/contoso/Project%20One/_git/repo-zeta",
+   "isDisabled": false,
+   "isInMaintenance": false
+  },
+  {
+   "id": "a9533ae2-2fa8-41ef-b8ea-18827ead13ff",
+   "name": "repo-theta",
+   "project": {
+    "id": "b61e6ba5-3682-4dd6-b804-69b84b2d451c",
+    "name": "Project One",
+    "description": "[redacted]",
+    "state": "wellFormed",
+    "revision": 336,
+    "visibility": "private",
+    "lastUpdateTime": "2026-10-20T16:07:58.313Z"
+   },
+   "defaultBranch": "refs/heads/main",
+   "size": 13936642,
+   "webUrl": "https://dev.azure.com/contoso/Project%20One/_git/repo-theta",
+   "isDisabled": false,
+   "isInMaintenance": false
+  },
+  {
+   "id": "afe16f01-69a0-4cb0-bb63-cd5fcd64fb1e",
+   "name": "repo-eta",
+   "project": {
+    "id": "b61e6ba5-3682-4dd6-b804-69b84b2d451c",
+    "name": "Project One",
+    "description": "[redacted]",
+    "state": "wellFormed",
+    "revision": 336,
+    "visibility": "private",
+    "lastUpdateTime": "2026-10-20T16:07:58.313Z"
+   },
+   "defaultBranch": "refs/heads/main",
+   "size": 207935,
+   "webUrl": "https://dev.azure.com/contoso/Project%20One/_git/repo-eta",
+   "isDisabled": false,
+   "isInMaintenance": false
+  }
+ ],
+ "count": 3
+}

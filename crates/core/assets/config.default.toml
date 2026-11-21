@@ -1,0 +1,80 @@
+# Herald configuration. Edit and save; a running app reloads this file.
+
+[polling]
+fast_secs = 60          # pipelines, releases, approvals
+pr_secs = 120           # pull requests
+slow_secs = 600         # branches, discovery scan, identity and group refresh, local clone index
+max_lookback_days = 14  # how far back the first sync and catch-up look
+
+[alerts]
+# Event type globs that never raise a toast or sound, e.g. ["pr.iteration.*"].
+mute_types = []
+
+[roles.group_reviewer]
+# Alerting types for PRs where you are only a reviewer through a group.
+alert_types = ["pr.created", "pr.published", "pr.mentioned"]
+
+[sound]
+# A relative file resolves against the config folder (HERALD_HOME).
+file = ""     # empty = built-in chime
+volume = 0.8  # 0.0 to 1.0
+
+[toast]
+duration_secs = 6
+critical_duration_secs = 12
+max_visible = 4
+
+[local]
+scan_roots = []  # folders searched for local clones and worktrees
+scan_depth = 2
+
+[stream]
+# Changing port needs an app restart.
+port = 0  # 0 = pick a free port; the port and token are written to stream.json
+
+# Connections. Herald needs at least one to watch anything.
+# `id` is lowercase letters, digits and dashes; it keys secrets and watermarks.
+# Keys other than id, provider, enabled, auth and bots are provider-specific.
+#
+# [[connections]]
+# id = "work"
+# provider = "ado"
+# enabled = true
+# auth = { method = "pat" }   # ado: "pat" (token stored in the OS keychain) or "azcli"
+# bots = ["svc-build@example.com", "Build\\*", "*Build Service*"]  # globs on unique or display name
+# organization = "my-org"
+# projects = []               # empty = all projects
+
+# Hooks run on events. Fields:
+#   name           unique name
+#   on             event type globs, e.g. ["pr.created", "run.*"]
+#   action         builtin action: "open-url" (opens the event url; http/https only)
+#   run            command as an argv list (no shell); use either action or run
+#                  run = { default = [...], windows = [...], macos = [...], linux = [...] }
+#                  the per-OS list wins over default
+#   match          extra conditions: { "pr.targetBranch" = "refs/heads/main", "actor.kind" = ["human", "bot"] }
+#                  keys are dotted event paths, values are globs (a list means any of)
+#   cwd            working directory
+#   env            extra environment variables
+#   catch_up       also run for catch-up events (default false)
+#   respect_snooze skip while snoozed (default false)
+#   include_test   also run for test events (default true)
+#   detached       start and do not wait or kill (default false)
+#   timeout_secs   kill after this long (default 60)
+#   debounce_secs  ignore repeats for the same hook and subject within this window (default 0)
+# {dotted.path} placeholders in argv, cwd and env expand from the event JSON; a missing one
+# stops the run. Hooks also get HERALD_* environment variables and the event JSON on stdin.
+
+[[hooks]]
+name = "open-link"
+on = ["record.activated"]
+action = "open-url"
+
+# [[hooks]]
+# name = "notify-failed-build"
+# on = ["run.completed"]
+# match = { "run.result" = ["failed", "partiallySucceeded"] }
+# run = { default = ["my-notifier", "--title", "{title}", "--url", "{url}"] }
+# env = { MY_TOKEN_NAME = "build-alerts" }
+# timeout_secs = 30
+# debounce_secs = 10

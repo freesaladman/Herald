@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-unviewed-count"
+description = "Enables the unviewed_count command without any pre-configured scope."
+commands.allow = ["unviewed_count"]
+
+[[permission]]
+identifier = "deny-unviewed-count"
+description = "Denies the unviewed_count command without any pre-configured scope."
+commands.deny = ["unviewed_count"]

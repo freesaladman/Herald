@@ -1,0 +1,158 @@
+{
+  "count": 3,
+  "value": [
+    {
+      "_links": {
+        "web": {
+          "href": "https://dev.azure.com/contoso/b61e6ba5-3682-4dd6-b804-69b84b2d451c/_build/results?buildId=48567"
+        }
+      },
+      "triggerInfo": {},
+      "id": 48567,
+      "buildNumber": "20261031.3",
+      "status": "completed",
+      "result": "failed",
+      "queueTime": "2026-11-01T00:45:55.9656352Z",
+      "startTime": "2026-11-01T00:46:02.0220152Z",
+      "finishTime": "2026-11-01T01:10:35.2548529Z",
+      "definition": {
+        "drafts": [],
+        "id": 101,
+        "name": "app-ci",
+        "uri": "vstfs:///Build/Definition/101",
+        "path": "\\",
+        "type": "build",
+        "queueStatus": "enabled",
+        "revision": 1
+      },
+      "project": {
+        "id": "b61e6ba5-3682-4dd6-b804-69b84b2d451c",
+        "name": "Project One",
+        "state": "wellFormed",
+        "revision": 336,
+        "visibility": "private",
+        "lastUpdateTime": "2026-10-20T16:07:58.313Z"
+      },
+      "sourceBranch": "refs/heads/feature/branch-1",
+      "sourceVersion": "9f6d26b2d4ae6af5fb68eb68bda039233dde8fcb",
+      "reason": "manual",
+      "requestedFor": {
+        "displayName": "Person 1",
+        "id": "1404cd3a-ec32-4b3b-837b-1bf3b938eca4",
+        "uniqueName": "person1@example.com"
+      },
+      "requestedBy": {
+        "displayName": "Person 1",
+        "id": "1404cd3a-ec32-4b3b-837b-1bf3b938eca4",
+        "uniqueName": "person1@example.com"
+      },
+      "repository": {
+        "id": "603ae5da-4663-4a99-a910-fc8d0f06e36b",
+        "type": "TfsGit"
+      },
+      "triggeredByBuild": null
+    },
+    {
+      "_links": {
+        "web": {
+          "href": "https://dev.azure.com/contoso/b61e6ba5-3682-4dd6-b804-69b84b2d451c/_build/results?buildId=48568"
+        }
+      },
+      "triggerInfo": {},
+      "id": 48568,
+      "buildNumber": "20261031.4",
+      "status": "completed",
+      "result": "failed",
+      "queueTime": "2026-11-01T03:50:19.7344649Z",
+      "startTime": "2026-11-01T03:50:26.1214711Z",
+      "finishTime": "2026-11-01T04:36:16.2812697Z",
+      "definition": {
+        "drafts": [],
+        "id": 101,
+        "name": "app-ci",
+        "uri": "vstfs:///Build/Definition/101",
+        "path": "\\",
+        "type": "build",
+        "queueStatus": "enabled",
+        "revision": 1
+      },
+      "project": {
+        "id": "b61e6ba5-3682-4dd6-b804-69b84b2d451c",
+        "name": "Project One",
+        "state": "wellFormed",
+        "revision": 336,
+        "visibility": "private",
+        "lastUpdateTime": "2026-10-20T16:07:58.313Z"
+      },
+      "sourceBranch": "refs/heads/feature/branch-1",
+      "sourceVersion": "0d5feb548d301caf5b3916640d9792c14fba675d",
+      "reason": "manual",
+      "requestedFor": {
+        "displayName": "Person 1",
+        "id": "1404cd3a-ec32-4b3b-837b-1bf3b938eca4",
+        "uniqueName": "person1@example.com"
+      },
+      "requestedBy": {
+        "displayName": "Person 1",
+        "id": "1404cd3a-ec32-4b3b-837b-1bf3b938eca4",
+        "uniqueName": "person1@example.com"
+      },
+      "repository": {
+        "id": "603ae5da-4663-4a99-a910-fc8d0f06e36b",
+        "type": "TfsGit"
+      },
+      "triggeredByBuild": null
+    },
+    {
+      "_links": {
+        "web": {
+          "href": "https://dev.azure.com/contoso/b61e6ba5-3682-4dd6-b804-69b84b2d451c/_build/results?buildId=48569"
+        }
+      },
+      "triggerInfo": {},
+      "id": 48569,
+      "buildNumber": "20261101.1",
+      "status": "completed",
+      "result": "failed",
+      "queueTime": "2026-11-01T04:57:51.6383569Z",
+      "startTime": "2026-11-01T04:57:57.8362335Z",
+      "finishTime": "2026-11-01T05:50:26.613352Z",
+      "definition": {
+        "drafts": [],
+        "id": 101,
+        "name": "app-ci",
+        "uri": "vstfs:///Build/Definition/101",
+        "path": "\\",
+        "type": "build",
+        "queueStatus": "enabled",
+        "revision": 1
+      },
+      "project": {
+        "id": "b61e6ba5-3682-4dd6-b804-69b84b2d451c",
+        "name": "Project One",
+        "state": "wellFormed",
+        "revision": 336,
+        "visibility": "private",
+        "lastUpdateTime": "2026-10-20T16:07:58.313Z"
+      },
+      "sourceBranch": "refs/heads/feature/branch-1",
+      "sourceVersion": "0822e8e7edeed7391ee6db62e8948dc322aab6fe",
+      "reason": "manual",
+      "requestedFor": {
+        "displayName": "Person 1",
+        "id": "1404cd3a-ec32-4b3b-837b-1bf3b938eca4",
+        "uniqueName": "person1@example.com"
+      },
+      "requestedBy": {
+        "displayName": "Person 1",
+        "id": "1404cd3a-ec32-4b3b-837b-1bf3b938eca4",
+        "uniqueName": "person1@example.com"
+      },
+      "repository": {
+        "id": "603ae5da-4663-4a99-a910-fc8d0f06e36b",
+        "type": "TfsGit"
+      },
+      "triggeredByBuild": null
+    }
+  ]
+}

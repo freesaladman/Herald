@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-toast-clicked"
+description = "Enables the toast_clicked command without any pre-configured scope."
+commands.allow = ["toast_clicked"]
+
+[[permission]]
+identifier = "deny-toast-clicked"
+description = "Denies the toast_clicked command without any pre-configured scope."
+commands.deny = ["toast_clicked"]

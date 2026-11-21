@@ -1,0 +1,122 @@
+{
+ "value": [
+  {
+   "pullRequestThreadContext": null,
+   "id": 67284,
+   "publishedDate": "2026-11-18T14:27:19.723Z",
+   "lastUpdatedDate": "2026-11-18T14:27:19.723Z",
+   "comments": [
+    {
+     "id": 1,
+     "parentCommentId": 0,
+     "author": {
+      "displayName": "Person 1",
+      "id": "95814675-5260-4ba9-9362-3b53b93e295f",
+      "uniqueName": "person2@example.com"
+     },
+     "content": "[redacted]",
+     "publishedDate": "2026-11-18T14:27:19.723Z",
+     "lastUpdatedDate": "2026-11-18T14:27:19.723Z",
+     "lastContentUpdatedDate": "2026-11-18T14:27:19.723Z",
+     "commentType": "system",
+     "usersLiked": []
+    }
+   ],
+   "threadContext": null,
+   "properties": {
+    "CodeReviewReviewersUpdatedNumAdded": {
+     "$type": "System.Int32",
+     "$value": 1
+    },
+    "CodeReviewReviewersUpdatedNumChanged": {
+     "$type": "System.Int32",
+     "$value": 0
+    },
+    "CodeReviewReviewersUpdatedNumDeclined": {
+     "$type": "System.Int32",
+     "$value": 0
+    },
+    "CodeReviewReviewersUpdatedNumRemoved": {
+     "$type": "System.Int32",
+     "$value": 0
+    },
+    "CodeReviewThreadType": {
+     "$type": "System.String",
+     "$value": "ReviewersUpdate"
+    },
+    "CodeReviewReviewersUpdatedAddedIdentity": {
+     "$type": "System.String",
+     "$value": "1"
+    },
+    "CodeReviewReviewersUpdatedByIdentity": {
+     "$type": "System.String",
+     "$value": "2"
+    }
+   },
+   "identities": {
+    "1": {
+     "displayName": "Person 3",
+     "id": "2936be1a-54e6-4454-a922-5a7d3e21b31d",
+     "uniqueName": "person4@example.com"
+    },
+    "2": {
+     "displayName": "Person 5",
+     "id": "08d01bfe-b36f-4c48-8fee-8d493ce468a1",
+     "uniqueName": "person6@example.com"
+    }
+   },
+   "isDeleted": false
+  },
+  {
+   "pullRequestThreadContext": null,
+   "id": 68157,
+   "publishedDate": "2026-11-20T19:17:07.377Z",
+   "lastUpdatedDate": "2026-11-20T19:17:07.377Z",
+   "comments": [
+    {
+     "id": 1,
+     "parentCommentId": 0,
+     "author": {
+      "displayName": "Person 3",
+      "id": "2936be1a-54e6-4454-a922-5a7d3e21b31d",
+      "uniqueName": "person4@example.com"
+     },
+     "content": "[redacted]",
+     "publishedDate": "2026-11-20T19:17:07.377Z",
+     "lastUpdatedDate": "2026-11-20T19:17:07.377Z",
+     "lastContentUpdatedDate": "2026-11-20T19:17:07.377Z",
+     "commentType": "system",
+     "usersLiked": []
+    }
+   ],
+   "threadContext": null,
+   "properties": {
+    "CodeReviewThreadType": {
+     "$type": "System.String",
+     "$value": "VoteUpdate"
+    },
+    "CodeReviewVoteResult": {
+     "$type": "System.String",
+     "$value": "10"
+    },
+    "CodeReviewVotedByInitiatorIdentity": {
+     "$type": "System.String",
+     "$value": "1"
+    },
+    "CodeReviewVotedByIdentity": {
+     "$type": "System.String",
+     "$value": "1"
+    }
+   },
+   "identities": {
+    "1": {
+     "displayName": "Person 3",
+     "id": "2936be1a-54e6-4454-a922-5a7d3e21b31d",
+     "uniqueName": "person4@example.com"
+    }
+   },
+   "isDeleted": false
+  }
+ ],
+ "count": 2
+}

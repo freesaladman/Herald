@@ -1,0 +1,54 @@
+{
+ "value": [
+  {
+   "iterationId": 1,
+   "id": 1,
+   "description": "[redacted]",
+   "context": {
+    "name": "codecoverage",
+    "genre": "ci/coverage"
+   },
+   "creationDate": "2026-11-21T00:04:00.7723432Z",
+   "updatedDate": "2026-11-21T00:04:00.7723432Z",
+   "createdBy": {
+    "displayName": "Person 1",
+    "id": "2d9cf439-699f-462a-942a-4dafff35f810",
+    "uniqueName": "person2@example.com"
+   }
+  },
+  {
+   "iterationId": 1,
+   "id": 2,
+   "description": "[redacted]",
+   "context": {
+    "name": "codecoverage",
+    "genre": "ci/build"
+   },
+   "creationDate": "2026-11-21T00:04:00.8202048Z",
+   "updatedDate": "2026-11-21T00:04:00.8202048Z",
+   "createdBy": {
+    "displayName": "Person 1",
+    "id": "2d9cf439-699f-462a-942a-4dafff35f810",
+    "uniqueName": "person2@example.com"
+   }
+  },
+  {
+   "iterationId": 1,
+   "id": 3,
+   "state": "pending",
+   "description": "[redacted]",
+   "context": {
+    "name": "codecoverage",
+    "genre": "ci/coverage"
+   },
+   "creationDate": "2026-11-21T00:08:14.370352Z",
+   "updatedDate": "2026-11-21T00:08:14.370352Z",
+   "createdBy": {
+    "displayName": "Person 1",
+    "id": "2d9cf439-699f-462a-942a-4dafff35f810",
+    "uniqueName": "person2@example.com"
+   }
+  }
+ ],
+ "count": 3
+}

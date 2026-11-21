@@ -1,0 +1,15 @@
+{
+  "build": {
+    "beforeBuildCommand": "npm run build && cargo build -p herald-cli --release && node scripts/copy-sidecar.mjs"
+  },
+  "bundle": {
+    "targets": ["nsis"],
+    "externalBin": ["binaries/herald"],
+    "windows": {
+      "nsis": {
+        "installerHooks": "windows/installer.nsh",
+        "installMode": "currentUser"
+      }
+    }
+  }
+}

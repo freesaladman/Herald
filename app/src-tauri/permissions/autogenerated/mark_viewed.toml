@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mark-viewed"
+description = "Enables the mark_viewed command without any pre-configured scope."
+commands.allow = ["mark_viewed"]
+
+[[permission]]
+identifier = "deny-mark-viewed"
+description = "Denies the mark_viewed command without any pre-configured scope."
+commands.deny = ["mark_viewed"]

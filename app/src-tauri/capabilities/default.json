@@ -1,0 +1,22 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "pane",
+  "description": "Herald pane window: listen to app events and call the pane commands",
+  "windows": ["pane"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-list-unviewed",
+    "allow-unviewed-count",
+    "allow-mark-viewed",
+    "allow-mark-all-viewed",
+    "allow-activate-record",
+    "allow-get-ui-state",
+    "allow-set-pinned",
+    "allow-list-connections",
+    "allow-set-secret",
+    "allow-clear-secret",
+    "allow-test-connection",
+    "allow-hide-pane"
+  ]
+}

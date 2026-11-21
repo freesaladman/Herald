@@ -759,7 +759,7 @@ mod tests {
         closed["closedBy"] =
             json!({ "id": "closer", "displayName": "Cam", "uniqueName": "cam@example.test" });
         Mock::given(method("GET"))
-            .and(path("/p1/_apis/git/repositories/Repo%2D1/pullRequests/1"))
+            .and(path("/p1/_apis/git/repositories/Repo-1/pullRequests/1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(closed))
             .mount(&server)
             .await;
@@ -837,7 +837,7 @@ mod tests {
     async fn serve_pr(server: &MockServer, id: i64, body: ResponseTemplate) {
         Mock::given(method("GET"))
             .and(path(format!(
-                "/p1/_apis/git/repositories/Repo%2D1/pullRequests/{id}"
+                "/p1/_apis/git/repositories/Repo-1/pullRequests/{id}"
             )))
             .respond_with(body)
             .mount(server)
@@ -903,7 +903,7 @@ mod tests {
         full["description"] = json!(format!("{} @<{ME}>", "x".repeat(450)));
         serve_active(&server, vec![listed]).await;
         Mock::given(method("GET"))
-            .and(path("/p1/_apis/git/repositories/Repo%2D1/pullRequests/1"))
+            .and(path("/p1/_apis/git/repositories/Repo-1/pullRequests/1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(full))
             .expect(1)
             .mount(&server)

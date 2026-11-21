@@ -41,8 +41,18 @@ pub enum Host {
     Vssps,
 }
 
-/// Path-segment encoding for the organization; keeps the characters a valid name may contain.
-const ORG_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'.').remove(b'-').remove(b'_');
+/// Path-segment encoding: RFC 3986 unreserved characters stay as they are, so GUIDs and
+/// hyphenated names read normally in URLs and logs.
+const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'.')
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'~');
+
+/// Percent-encodes one URL path segment (project, repository, organization names and ids).
+pub(crate) fn encode_segment(s: &str) -> String {
+    utf8_percent_encode(s, PATH_SEGMENT).to_string()
+}
 
 /// Safety net against a server that ignores the paging parameters.
 const MAX_PAGES: usize = 1000;
@@ -69,8 +79,8 @@ pub enum AdoError {
     TooManyPages { pages: usize },
     #[error("server repeated a continuation token")]
     PagingCycle,
-    #[error("could not decode response from {0}")]
-    Decode(String),
+    #[error("could not decode response from {path}: {detail}")]
+    Decode { path: String, detail: String },
     #[error(transparent)]
     Auth(ProviderError),
 }
@@ -89,7 +99,7 @@ impl From<AdoError> for ProviderError {
             AdoError::Http { .. }
             | AdoError::TooManyPages { .. }
             | AdoError::PagingCycle
-            | AdoError::Decode(_) => ProviderError::Other(e.to_string()),
+            | AdoError::Decode { .. } => ProviderError::Other(e.to_string()),
             AdoError::Auth(p) => p,
         }
     }
@@ -125,7 +135,7 @@ pub struct AdoClient {
 impl AdoClient {
     /// Production constructor: PR threads are cached briefly so the Pr-tier sources share one fetch.
     pub fn new(organization: &str, auth: AdoAuth) -> AdoClient {
-        let org = utf8_percent_encode(organization, ORG_SEGMENT);
+        let org = encode_segment(organization);
         let mut client = Self::with_base_urls(
             organization,
             auth,
@@ -255,7 +265,10 @@ impl AdoClient {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| DateTime::parse_from_rfc2822(s).ok())
             .map(|d| d.with_timezone(&Utc))
-            .ok_or_else(|| AdoError::Decode("Date header of connectionData".to_string()))
+            .ok_or_else(|| AdoError::Decode {
+                path: "_apis/connectionData".to_string(),
+                detail: "missing Date header".to_string(),
+            })
     }
 
     pub async fn identify(&self) -> Result<Identity, AdoError> {
@@ -508,8 +521,19 @@ fn descriptor_queries(descriptors: &[String]) -> Vec<String> {
 }
 
 fn decode<T: DeserializeOwned>(body: &[u8], path_and_query: &str) -> Result<T, AdoError> {
-    serde_json::from_slice(body)
-        .map_err(|_| AdoError::Decode(path_only(path_and_query).to_string()))
+    let mut de = serde_json::Deserializer::from_slice(body);
+    serde_path_to_error::deserialize(&mut de).map_err(|e| decode_error(path_and_query, &e))
+}
+
+/// Carries serde's message with the field path and line/column; never the response body.
+pub(crate) fn decode_error(
+    path_and_query: &str,
+    e: &serde_path_to_error::Error<serde_json::Error>,
+) -> AdoError {
+    AdoError::Decode {
+        path: path_only(path_and_query).to_string(),
+        detail: format!("{} (at {})", e.inner(), e.path()),
+    }
 }
 
 fn path_only(pq: &str) -> &str {
@@ -581,6 +605,56 @@ mod tests {
     fn list(values: serde_json::Value) -> ResponseTemplate {
         let count = values.as_array().map_or(0, Vec::len);
         ResponseTemplate::new(200).set_body_json(json!({ "count": count, "value": values }))
+    }
+
+    #[tokio::test]
+    async fn decode_error_names_the_field_path_and_position_but_not_the_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/P/_apis/things"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"value":[{"id":1,"inner":{"name":{"secret":"hunter2"}}}]}"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+        #[derive(Debug, Deserialize)]
+        struct Thing {
+            #[allow(dead_code)]
+            inner: Inner,
+        }
+        #[derive(Debug, Deserialize)]
+        struct Inner {
+            #[allow(dead_code)]
+            name: String,
+        }
+        let err = client(&server)
+            .get_paged::<Thing>(Host::Dev, "P/_apis/things?api-version=7.1")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("could not decode response from P/_apis/things: "),
+            "{err}"
+        );
+        assert!(
+            err.contains("invalid type: map, expected a string"),
+            "{err}"
+        );
+        assert!(err.contains("value[0].inner.name"), "{err}");
+        assert!(err.contains("line 1 column"), "{err}");
+        assert!(!err.contains("hunter2"), "{err}");
+    }
+
+    #[test]
+    fn segments_keep_hyphens_and_encode_spaces() {
+        assert_eq!(
+            encode_segment("6f1c2a9e-0b7d-4e3a-9c58-2d4f7a1e8b30"),
+            "6f1c2a9e-0b7d-4e3a-9c58-2d4f7a1e8b30"
+        );
+        assert_eq!(encode_segment("Project One"), "Project%20One");
+        assert_eq!(encode_segment("a/b"), "a%2Fb");
     }
 
     #[tokio::test]

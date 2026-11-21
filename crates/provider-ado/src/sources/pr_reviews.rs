@@ -645,7 +645,7 @@ mod tests {
 
     async fn serve(server: &MockServer, threads: ResponseTemplate, iterations: ResponseTemplate) {
         server.reset().await;
-        let base = "/p1/_apis/git/repositories/Repo%2D1/pullRequests/1";
+        let base = "/p1/_apis/git/repositories/Repo-1/pullRequests/1";
         Mock::given(method("GET"))
             .and(path(format!("{base}/threads")))
             .respond_with(threads)

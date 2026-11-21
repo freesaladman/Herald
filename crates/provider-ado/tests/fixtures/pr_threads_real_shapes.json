@@ -1,0 +1,48 @@
+{
+  "value": [
+    {
+      "pullRequestThreadContext": null,
+      "id": 101,
+      "publishedDate": "2026-01-10T09:00:00.000Z",
+      "lastUpdatedDate": "2026-01-10T09:00:00.000Z",
+      "comments": [
+        {
+          "id": 1,
+          "parentCommentId": 0,
+          "author": {
+            "displayName": "Person 1",
+            "id": "aaaaaaaa-0000-0000-0000-000000000001",
+            "uniqueName": "person1@example.com"
+          },
+          "content": "Please rename this.",
+          "publishedDate": "2026-01-10T09:00:00.000Z",
+          "lastUpdatedDate": "2026-01-10T09:00:00.000Z",
+          "commentType": "text"
+        }
+      ],
+      "status": "active",
+      "threadContext": null,
+      "properties": {},
+      "identities": null,
+      "isDeleted": false
+    },
+    {
+      "id": 102,
+      "publishedDate": "2026-01-10T10:00:00.000Z",
+      "lastUpdatedDate": "2026-01-10T10:00:00.000Z",
+      "comments": [
+        {
+          "id": 1,
+          "parentCommentId": 0,
+          "author": { "displayName": "Person 2", "id": "aaaaaaaa-0000-0000-0000-000000000002" },
+          "content": null,
+          "commentType": null,
+          "isDeleted": true
+        }
+      ],
+      "status": null,
+      "properties": null,
+      "identities": null
+    }
+  ]
+}

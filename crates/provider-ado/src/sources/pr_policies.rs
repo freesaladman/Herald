@@ -388,7 +388,7 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path(
-                "/p1/_apis/git/repositories/Repo%2D1/pullRequests/1/statuses",
+                "/p1/_apis/git/repositories/Repo-1/pullRequests/1/statuses",
             ))
             .respond_with(statuses)
             .mount(server)

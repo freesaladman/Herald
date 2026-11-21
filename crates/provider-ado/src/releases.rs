@@ -1,7 +1,6 @@
 //! Classic release endpoints on the vsrm host. All are project-scoped.
 
 use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
-use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
@@ -147,7 +146,7 @@ pub struct ReleaseApproval {
 }
 
 fn enc(s: &str) -> String {
-    utf8_percent_encode(s, NON_ALPHANUMERIC).to_string()
+    crate::client::encode_segment(s)
 }
 
 fn ts(t: DateTime<Utc>) -> String {

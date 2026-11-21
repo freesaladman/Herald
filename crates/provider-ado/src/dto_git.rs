@@ -2,15 +2,27 @@
 //! so a missing or extra field never fails a poll.
 
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use std::collections::BTreeMap;
+
+/// Treats an explicit JSON `null` like a missing field (`serde(default)` only covers missing).
+fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct IdentityRef {
+    #[serde(deserialize_with = "null_default")]
     pub id: String,
+    #[serde(deserialize_with = "null_default")]
     pub display_name: String,
+    #[serde(deserialize_with = "null_default")]
     pub unique_name: String,
     pub is_container: bool,
 }
@@ -73,7 +85,9 @@ pub struct Comment {
     pub content: Option<String>,
     pub published_date: Option<DateTime<Utc>>,
     pub last_updated_date: Option<DateTime<Utc>>,
+    #[serde(deserialize_with = "null_default")]
     pub comment_type: String,
+    #[serde(deserialize_with = "null_default")]
     pub is_deleted: bool,
 }
 
@@ -84,10 +98,13 @@ pub struct GitPullRequestCommentThread {
     pub published_date: Option<DateTime<Utc>>,
     pub last_updated_date: Option<DateTime<Utc>>,
     pub status: Option<String>,
+    #[serde(deserialize_with = "null_default")]
     pub is_deleted: bool,
     pub properties: Value,
+    #[serde(deserialize_with = "null_default")]
     pub comments: Vec<Comment>,
-    /// Keyed by the placeholder ids that identity-valued properties point at.
+    /// Keyed by the placeholder ids that identity-valued properties point at; `null` when absent.
+    #[serde(deserialize_with = "null_default")]
     pub identities: BTreeMap<String, IdentityRef>,
 }
 

@@ -11,6 +11,7 @@ tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "time", "sy
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_path_to_error = "0.1"
 toml = "1.2"
 chrono = { version = "0.4", features = ["serde"] }
 rusqlite = { version = "0.43", features = ["bundled"] }

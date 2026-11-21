@@ -128,3 +128,17 @@ fn repos_refs_pushes_and_diffs_deserialize() {
     let d: GitCommitDiffs = serde_json::from_str(&fixture("commit_diffs")).unwrap();
     assert_eq!((d.ahead_count, d.behind_count), (3, 1));
 }
+
+#[test]
+fn threads_with_null_identities_and_nulls_decode() {
+    let threads: Vec<GitPullRequestCommentThread> = list("pr_threads_real_shapes");
+    assert_eq!(threads.len(), 2);
+    assert!(threads[0].identities.is_empty());
+    assert_eq!(
+        threads[0].comments[0].content.as_deref(),
+        Some("Please rename this.")
+    );
+    assert!(threads[1].comments[0].is_deleted);
+    assert_eq!(threads[1].comments[0].comment_type, "");
+    assert_eq!(threads[1].thread_type(), None);
+}

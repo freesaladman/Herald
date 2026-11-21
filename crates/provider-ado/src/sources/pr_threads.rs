@@ -511,7 +511,7 @@ mod tests {
         server.reset().await;
         Mock::given(method("GET"))
             .and(path(format!(
-                "/p1/_apis/git/repositories/Repo%2D1/pullRequests/{pr_id}/threads"
+                "/p1/_apis/git/repositories/Repo-1/pullRequests/{pr_id}/threads"
             )))
             .respond_with(body)
             .mount(server)

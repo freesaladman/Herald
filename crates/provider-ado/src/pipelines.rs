@@ -1,7 +1,6 @@
 //! Builds, timelines and YAML pipeline approvals. All endpoints are project-scoped.
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
@@ -165,7 +164,7 @@ fn string_or_number<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error>
 }
 
 fn enc(s: &str) -> String {
-    utf8_percent_encode(s, NON_ALPHANUMERIC).to_string()
+    crate::client::encode_segment(s)
 }
 
 fn ts(t: DateTime<Utc>) -> String {

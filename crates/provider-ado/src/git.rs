@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use tokio::time::Instant;
 
 use crate::client::{AdoClient, AdoError, Host};
@@ -62,7 +61,7 @@ impl ThreadsCache {
 }
 
 fn enc(s: &str) -> String {
-    utf8_percent_encode(s, NON_ALPHANUMERIC).to_string()
+    crate::client::encode_segment(s)
 }
 
 fn ts(t: DateTime<Utc>) -> String {
@@ -158,11 +157,26 @@ impl AdoClient {
         repo_id: &str,
         pr_id: i64,
     ) -> Result<Vec<GitPullRequestCommentThread>, AdoError> {
-        self.get_paged(
-            Host::Dev,
-            &format!("{}/threads", pr_path(project, repo_id, pr_id)),
-        )
-        .await
+        let raw: Vec<serde_json::Value> = self
+            .get_paged(
+                Host::Dev,
+                &format!("{}/threads", pr_path(project, repo_id, pr_id)),
+            )
+            .await?;
+        // One odd thread must not hide the rest of the PR.
+        Ok(raw
+            .into_iter()
+            .filter_map(|v| {
+                let id = v.get("id").and_then(|i| i.as_i64());
+                match serde_path_to_error::deserialize(v) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        tracing::debug!(thread_id = ?id, "skipping undecodable thread: {e}");
+                        None
+                    }
+                }
+            })
+            .collect())
     }
 
     pub async fn pr_iterations(
@@ -410,7 +424,7 @@ mod tests {
             raw.url
                 .query()
                 .unwrap()
-                .contains("2026%2D11%2D18T01%3A02%3A03Z")
+                .contains("2026-11-18T01%3A02%3A03Z")
         );
     }
 
@@ -491,6 +505,35 @@ mod tests {
         c.pr_threads("P", "r1", 7).await.unwrap();
         offset.store(THREADS_CACHE_TTL.as_secs() + 1, Ordering::SeqCst);
         c.pr_threads("P", "r1", 7).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_threads_skips_a_malformed_thread_and_keeps_the_rest() {
+        let server = MockServer::start().await;
+        let body = json!({ "value": [
+            { "id": 1, "comments": [] },
+            { "id": 2, "comments": "not a list" },
+            { "id": 3, "identities": null, "comments": [{ "id": 1, "author": { "displayName": "Person 1" } }] },
+        ] });
+        mount_threads(&server, ResponseTemplate::new(200).set_body_json(body), 1).await;
+        let c = client(&server);
+        let ids: Vec<i64> = c
+            .pr_threads("P", "r1", 7)
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(ids, vec![1, 3]);
+    }
+
+    #[test]
+    fn segments_keep_unreserved_characters_and_encode_spaces() {
+        assert_eq!(
+            pr_path("11111111-2222-3333-4444-555555555555", "my.repo_x~1", 7),
+            "11111111-2222-3333-4444-555555555555/_apis/git/repositories/my.repo_x~1/pullRequests/7"
+        );
+        assert_eq!(enc("Project One/x"), "Project%20One%2Fx");
     }
 
     #[tokio::test]

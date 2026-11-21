@@ -1,0 +1,39 @@
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 24 24" width="1024" height="1024"
+ 
+>
+  <defs>
+    <g id="glyph" stroke-width="1.8" stroke-linecap="round">
+      <g fill="none">
+        <path d="M12 8.5 V16" />
+        <path d="M7 8.5 V10 C7 12.5 12 12 12 14.5" />
+        <path d="M17 8.5 V10 C17 12.5 12 12 12 14.5" />
+      </g>
+      <g stroke="none">
+        <circle cx="7" cy="7" r="1.8" />
+        <circle cx="12" cy="7" r="1.8" />
+        <circle cx="17" cy="7" r="1.8" />
+        <circle cx="12" cy="17.5" r="1.8" />
+      </g>
+    </g>
+    <mask id="cut">
+      <rect width="24" height="24" fill="#fff" />
+      <use href="#glyph" fill="#000" stroke="#000" />
+    </mask>
+  </defs>
+
+  <!-- Shield with the glyph cut out -->
+  <path
+    fill="#000000"
+    mask="url(#cut)"
+    d="M12 1 L21 4 V11 C21 17 17 21 12 23 C7 21 3 17 3 11 V4 Z"
+  />
+
+  <!-- Optional glyph colour (transparent when "none") -->
+  <use
+    href="#glyph"
+    fill="#ff4500"
+    stroke="#ff4500"
+  />
+</svg>

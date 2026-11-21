@@ -21,6 +21,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 mod alerts;
 mod commands;
 mod sound;
+mod theme;
 mod tray;
 mod windows;
 

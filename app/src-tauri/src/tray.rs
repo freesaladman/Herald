@@ -14,6 +14,7 @@ use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_opener::OpenerExt as _;
 use tokio::sync::watch;
 
+use crate::theme::{self, TaskbarTheme};
 use crate::{EngineHandle, commands, windows};
 
 const TRAY_ID: &str = "herald";
@@ -23,6 +24,10 @@ const ACCENT: [u8; 3] = [0x3B, 0x82, 0xF6];
 const AMBER: [u8; 3] = [0xF5, 0xA5, 0x24];
 const DOT_DIAMETER: f32 = 0.35;
 const FALLBACK_ICON_SIZE: u32 = 32;
+const THEME_POLL: std::time::Duration = std::time::Duration::from_secs(10);
+// Artwork is named by the taskbar it suits: a dark taskbar gets the light-coloured set.
+const ART_FOR_DARK_TASKBAR: &[u8] = include_bytes!("../icons/tray/tray-light.png");
+const ART_FOR_LIGHT_TASKBAR: &[u8] = include_bytes!("../icons/tray/tray-dark.png");
 const TOMORROW_HOUR: u32 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,36 +121,61 @@ fn composite_dot(rgba: &[u8], width: u32, height: u32, color: [u8; 3]) -> Vec<u8
     img.into_raw()
 }
 
+fn art_for(theme: TaskbarTheme) -> &'static [u8] {
+    match theme {
+        TaskbarTheme::Dark => ART_FOR_DARK_TASKBAR,
+        TaskbarTheme::Light => ART_FOR_LIGHT_TASKBAR,
+    }
+}
+
+/// Index into `Icons::images`: theme-major, then base/dot/warning.
+fn icon_slot(theme: TaskbarTheme, variant: IconVariant) -> usize {
+    let t = match theme {
+        TaskbarTheme::Dark => 0,
+        TaskbarTheme::Light => 3,
+    };
+    t + match variant {
+        IconVariant::Base => 0,
+        IconVariant::Dot => 1,
+        IconVariant::Warning => 2,
+    }
+}
+
+fn decode_art(png: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let img = image::load_from_memory(png).ok()?.into_rgba8();
+    let (w, h) = img.dimensions();
+    Some((img.into_raw(), w, h))
+}
+
+fn theme_images(theme: TaskbarTheme) -> [Image<'static>; 3] {
+    let (rgba, w, h) = decode_art(art_for(theme)).unwrap_or_else(|| {
+        tracing::warn!("tray artwork failed to decode; using a plain tray icon");
+        let n = FALLBACK_ICON_SIZE;
+        (vec![0x80; (n * n * 4) as usize], n, n)
+    });
+    let variant = |color| Image::new_owned(composite_dot(&rgba, w, h, color), w, h);
+    [
+        Image::new_owned(rgba.clone(), w, h),
+        variant(ACCENT),
+        variant(AMBER),
+    ]
+}
+
 struct Icons {
-    base: Image<'static>,
-    dot: Image<'static>,
-    warning: Image<'static>,
+    images: [Image<'static>; 6],
 }
 
 impl Icons {
-    fn build(app: &AppHandle) -> Self {
-        let (rgba, w, h) = match app.default_window_icon() {
-            Some(i) => (i.rgba().to_vec(), i.width(), i.height()),
-            None => {
-                tracing::warn!("no default window icon; using a plain tray icon");
-                let n = FALLBACK_ICON_SIZE;
-                (vec![0x80; (n * n * 4) as usize], n, n)
-            }
-        };
-        let variant = |color| Image::new_owned(composite_dot(&rgba, w, h, color), w, h);
+    fn build() -> Self {
+        let [a, b, c] = theme_images(TaskbarTheme::Dark);
+        let [d, e, f] = theme_images(TaskbarTheme::Light);
         Self {
-            dot: variant(ACCENT),
-            warning: variant(AMBER),
-            base: Image::new_owned(rgba, w, h),
+            images: [a, b, c, d, e, f],
         }
     }
 
-    fn get(&self, v: IconVariant) -> Image<'static> {
-        match v {
-            IconVariant::Base => self.base.clone(),
-            IconVariant::Dot => self.dot.clone(),
-            IconVariant::Warning => self.warning.clone(),
-        }
+    fn get(&self, theme: TaskbarTheme, v: IconVariant) -> Image<'static> {
+        self.images[icon_slot(theme, v)].clone()
     }
 }
 
@@ -263,10 +293,15 @@ fn apply(
     icons: &Icons,
     statuses: &[herald_core::scheduler::ConnectionStatus],
     unviewed: u32,
+    theme: TaskbarTheme,
+    shown: &mut Option<(TaskbarTheme, IconVariant)>,
 ) {
     let variant = icon_variant(auth_needed(statuses), unviewed);
-    if let Err(e) = tray.set_icon(Some(icons.get(variant))) {
-        tracing::warn!(error = %e, "setting tray icon failed");
+    if *shown != Some((theme, variant)) {
+        match tray.set_icon(Some(icons.get(theme, variant))) {
+            Ok(()) => *shown = Some((theme, variant)),
+            Err(e) => tracing::warn!(error = %e, "setting tray icon failed"),
+        }
     }
     if let Err(e) = tray.set_tooltip(Some(tooltip_text(variant, unviewed))) {
         tracing::warn!(error = %e, "setting tray tooltip failed");
@@ -314,9 +349,10 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         ],
     )?;
 
-    let icons = Icons::build(app);
+    let icons = Icons::build();
+    let initial_theme = theme::current();
     let tray = TrayIconBuilder::with_id(TRAY_ID)
-        .icon(icons.get(IconVariant::Base))
+        .icon(icons.get(initial_theme, IconVariant::Base))
         .tooltip("Herald")
         .menu(&menu)
         .show_menu_on_left_click(false)
@@ -359,6 +395,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
                 status_rx,
                 unviewed_rx,
                 ui_rx,
+                initial_theme,
             )
         });
 
@@ -380,13 +417,27 @@ fn spawn_updater(
     mut status_rx: watch::Receiver<Vec<herald_core::scheduler::ConnectionStatus>>,
     mut unviewed_rx: watch::Receiver<u32>,
     mut ui_rx: watch::Receiver<()>,
+    initial_theme: TaskbarTheme,
 ) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
+        let mut theme_tick = tokio::time::interval(THEME_POLL);
+        let mut shown = Some((initial_theme, IconVariant::Base));
+        let mut dirty = true;
         loop {
-            let unviewed = *unviewed_rx.borrow_and_update();
-            apply(&tray, &icons, &status_rx.borrow_and_update(), unviewed);
-            refresh_menu(&app);
-            ui_rx.borrow_and_update();
+            if dirty {
+                let unviewed = *unviewed_rx.borrow_and_update();
+                apply(
+                    &tray,
+                    &icons,
+                    &status_rx.borrow_and_update(),
+                    unviewed,
+                    theme::current(),
+                    &mut shown,
+                );
+                refresh_menu(&app);
+                ui_rx.borrow_and_update();
+            }
+            dirty = true;
             let snoozed_until =
                 store_of(&app).and_then(|s| s.get_ui_state(SNOOZE_KEY).ok().flatten());
             let wake = snooze_remaining(snoozed_until.as_deref(), Utc::now())
@@ -395,6 +446,10 @@ fn spawn_updater(
                 r = status_rx.changed() => if r.is_err() { break },
                 r = unviewed_rx.changed() => if r.is_err() { break },
                 r = ui_rx.changed() => if r.is_err() { break },
+                _ = theme_tick.tick() => {
+                    // Cheap registry read; only re-apply when the theme actually moved.
+                    dirty = shown.is_some_and(|(t, _)| t != theme::current());
+                }
                 () = sleep_until_or_pending(wake) => {
                     refresh_menu(&app);
                     commands::emit_ui_state(&app);
@@ -433,6 +488,28 @@ mod tests {
         assert_eq!(icon_variant(true, 5), IconVariant::Warning);
         assert_eq!(icon_variant(false, 1), IconVariant::Dot);
         assert_eq!(icon_variant(false, 0), IconVariant::Base);
+    }
+
+    #[test]
+    fn icon_slot_is_unique_per_theme_and_variant() {
+        let mut slots = Vec::new();
+        for t in [TaskbarTheme::Dark, TaskbarTheme::Light] {
+            for v in [IconVariant::Base, IconVariant::Dot, IconVariant::Warning] {
+                slots.push(icon_slot(t, v));
+            }
+        }
+        slots.sort_unstable();
+        assert_eq!(slots, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn embedded_art_decodes_to_64x64_rgba_and_differs_per_theme() {
+        for theme in [TaskbarTheme::Dark, TaskbarTheme::Light] {
+            let (rgba, w, h) = decode_art(art_for(theme)).unwrap();
+            assert_eq!((w, h), (64, 64));
+            assert_eq!(rgba.len(), 64 * 64 * 4);
+        }
+        assert_ne!(art_for(TaskbarTheme::Dark), art_for(TaskbarTheme::Light));
     }
 
     #[test]

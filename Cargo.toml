@@ -42,7 +42,7 @@ tauri-plugin-autostart = "2.7"
 tauri-plugin-opener = "2.7"
 rodio = "0.23"
 image = "0.25"
-windows = { version = "0.62", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows = { version = "0.62", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_Threading"] }
 wiremock = "0.6"
 tempfile = "3.27"
 pretty_assertions = "1.4"

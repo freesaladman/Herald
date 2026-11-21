@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-draft-scopes"
+description = "Enables the list_draft_scopes command without any pre-configured scope."
+commands.allow = ["list_draft_scopes"]
+
+[[permission]]
+identifier = "deny-list-draft-scopes"
+description = "Denies the list_draft_scopes command without any pre-configured scope."
+commands.deny = ["list_draft_scopes"]

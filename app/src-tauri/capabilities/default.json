@@ -17,6 +17,12 @@
     "allow-set-secret",
     "allow-clear-secret",
     "allow-test-connection",
-    "allow-hide-pane"
+    "allow-hide-pane",
+    "allow-list-providers",
+    "allow-get-connection-draft",
+    "allow-test-draft-connection",
+    "allow-list-draft-scopes",
+    "allow-save-connection",
+    "allow-remove-connection"
   ]
 }

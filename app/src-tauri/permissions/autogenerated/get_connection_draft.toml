@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-connection-draft"
+description = "Enables the get_connection_draft command without any pre-configured scope."
+commands.allow = ["get_connection_draft"]
+
+[[permission]]
+identifier = "deny-get-connection-draft"
+description = "Denies the get_connection_draft command without any pre-configured scope."
+commands.deny = ["get_connection_draft"]

@@ -141,9 +141,21 @@ describe("Pane", () => {
 
     setup([], makeUi({ connections: [] }));
     render(<Pane />);
+    expect(await screen.findByText("No connections yet.")).toBeInTheDocument();
+  });
+
+  it("opens the connection wizard from the no-connections banner", async () => {
+    setup([], makeUi({ connections: [] }));
+    render(<Pane />);
+    await screen.findByText("No connections yet.");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Add connection" }),
+    );
     expect(
-      await screen.findByText("No connections configured: edit config.toml"),
+      await screen.findByRole("button", { name: "Cancel" }),
     ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Back" })).toBeNull();
+    expect(screen.queryByText("No connections yet.")).toBeNull();
   });
 
   it("renders ADO-controlled titles as literal text", async () => {

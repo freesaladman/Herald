@@ -9,8 +9,9 @@ use futures_util::future::BoxFuture;
 use crate::config::{Config, ConfigError, ConnectionConfig};
 use crate::event::ConnectionRef;
 use crate::provider::{
-    Connection, Identity, PollOutcome, ProviderError, ProviderFactory, RemoteRepo, ScopedSnapshots,
-    Source, SyncContext, Tier,
+    AuthMethodSpec, Connection, FieldKind, FieldSpec, Identity, PollOutcome, ProviderError,
+    ProviderFactory, RemoteRepo, ScopeOption, ScopedSnapshots, SecretSpec, Source, SyncContext,
+    Tier,
 };
 use crate::secrets::SecretStore;
 use crate::store::Store;
@@ -38,6 +39,8 @@ struct State {
     credentials_changed_calls: usize,
     validate_errors: Vec<ConfigError>,
     connect_error: Option<ProviderError>,
+    scopes: Vec<(String, Result<Vec<ScopeOption>, ProviderError>)>,
+    scope_calls: Vec<String>,
 }
 
 /// Cloneable handle onto the shared script of a fake provider. Every factory,
@@ -74,6 +77,8 @@ impl FakeProvider {
                 credentials_changed_calls: 0,
                 validate_errors: Vec::new(),
                 connect_error: None,
+                scopes: Vec::new(),
+                scope_calls: Vec::new(),
             })),
         }
     }
@@ -129,6 +134,18 @@ impl FakeProvider {
 
     pub fn poll_count(&self, source: &str) -> usize {
         self.with_source(source, |s| s.calls.len()).unwrap_or(0)
+    }
+
+    /// Scripts the result of `list_scopes(field_key)`; unscripted fields are unsupported.
+    pub fn set_scopes(&self, field_key: &str, result: Result<Vec<ScopeOption>, ProviderError>) {
+        let mut s = self.lock();
+        s.scopes.retain(|(k, _)| k != field_key);
+        s.scopes.push((field_key.into(), result));
+    }
+
+    /// Field keys passed to `list_scopes`, oldest first.
+    pub fn scope_calls(&self) -> Vec<String> {
+        self.lock().scope_calls.clone()
     }
 
     /// Sticky server time returned once the one-shot queue is empty.
@@ -214,6 +231,46 @@ impl ProviderFactory for FakeProviderFactory {
 
     fn secret_label(&self) -> &'static str {
         "Fake secret"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Fake"
+    }
+
+    fn connection_fields(&self) -> Vec<FieldSpec> {
+        vec![FieldSpec {
+            key: "host".into(),
+            label: "Host".into(),
+            kind: FieldKind::Text,
+            required: false,
+            placeholder: None,
+            help: None,
+            advanced: false,
+        }]
+    }
+
+    fn default_bots(&self) -> Vec<String> {
+        vec!["fake-bot*".into()]
+    }
+
+    fn auth_methods(&self) -> Vec<AuthMethodSpec> {
+        vec![
+            AuthMethodSpec {
+                id: "token".into(),
+                label: "Token".into(),
+                help: None,
+                secret: Some(SecretSpec {
+                    label: "Fake secret".into(),
+                    help: None,
+                }),
+            },
+            AuthMethodSpec {
+                id: "none".into(),
+                label: "None".into(),
+                help: None,
+                secret: None,
+            },
+        ]
     }
 
     fn validate(&self, _cfg: &ConnectionConfig) -> Vec<ConfigError> {
@@ -322,6 +379,22 @@ impl Connection for FakeConnection {
 
     fn credentials_changed(&self) {
         self.provider.lock().credentials_changed_calls += 1;
+    }
+
+    fn list_scopes<'a>(
+        &'a self,
+        field_key: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<ScopeOption>, ProviderError>> {
+        let mut s = self.provider.lock();
+        s.scope_calls.push(field_key.into());
+        let result = s
+            .scopes
+            .iter()
+            .find(|(k, _)| k == field_key)
+            .map(|(_, r)| r.clone())
+            .unwrap_or_else(|| Err(ProviderError::Config("not supported".into())));
+        drop(s);
+        Box::pin(async move { result })
     }
 }
 

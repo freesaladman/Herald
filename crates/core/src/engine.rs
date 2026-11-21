@@ -11,13 +11,56 @@ use crate::classify::Classifier;
 use crate::config::{Config, ConnectionConfig, Paths};
 use crate::hooks::HookRunner;
 use crate::local_repos::LocalIndex;
-use crate::provider::{Identity, ProviderError, ProviderRegistry};
+use crate::provider::{Connection, Identity, ProviderError, ProviderRegistry, ScopeOption};
 use crate::scheduler::{ConnectionStatus, Scheduler};
-use crate::secrets::SecretStore;
+use crate::secrets::{SecretError, SecretStore};
 use crate::store::Store;
 use crate::stream::StreamServer;
 
+/// Upper bound for a draft connection test, so a hung provider cannot stall the caller.
+const DRAFT_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const RELOAD_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Serves one in-memory secret under one key; refuses writes and never reads the real store.
+struct DraftSecretStore {
+    key: String,
+    value: Option<String>,
+}
+
+impl SecretStore for DraftSecretStore {
+    fn get(&self, key: &str) -> Result<Option<String>, SecretError> {
+        Ok(if key == self.key {
+            self.value.clone()
+        } else {
+            None
+        })
+    }
+
+    fn set(&self, _key: &str, _value: &str) -> Result<(), SecretError> {
+        Err(SecretError::Backend(
+            "draft secret store is read-only".into(),
+        ))
+    }
+
+    fn delete(&self, _key: &str) -> Result<(), SecretError> {
+        Err(SecretError::Backend(
+            "draft secret store is read-only".into(),
+        ))
+    }
+
+    fn is_native(&self) -> bool {
+        false
+    }
+}
+
+async fn draft_timeout<T>(
+    fut: impl std::future::Future<Output = Result<T, ProviderError>>,
+) -> Result<T, ProviderError> {
+    match tokio::time::timeout(DRAFT_TEST_TIMEOUT, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(ProviderError::Transient("connection test timed out".into())),
+    }
+}
 
 /// Nothing in start-up can fail today; kept so callers already handle a failing start.
 #[derive(Debug, thiserror::Error)]
@@ -27,6 +70,7 @@ pub struct Engine {
     bus: Arc<Bus>,
     store: Arc<Store>,
     secrets: Arc<dyn SecretStore>,
+    registry: Arc<ProviderRegistry>,
     paths: Paths,
     config: watch::Sender<Arc<Config>>,
     scheduler: Arc<Scheduler>,
@@ -183,7 +227,7 @@ impl Engine {
         let scheduler = Arc::new(Scheduler::start(
             bus.clone(),
             store.clone(),
-            registry,
+            registry.clone(),
             secrets.clone(),
             config_rx,
         ));
@@ -224,6 +268,7 @@ impl Engine {
             bus,
             store,
             secrets,
+            registry,
             paths,
             config: config_tx,
             scheduler,
@@ -302,6 +347,60 @@ impl Engine {
             .clone()
             .ok_or_else(|| ProviderError::Config("connection not connected".to_string()))?;
         connection.identify().await
+    }
+
+    /// Tests an unsaved connection config. Nothing is persisted, published or
+    /// registered with the scheduler, and the connection is dropped on return.
+    /// `stored_secret_id` names the connection whose stored secret may stand in when
+    /// `secret` is None (the id being edited); None uses no stored secret.
+    pub async fn test_draft(
+        &self,
+        cfg: ConnectionConfig,
+        secret: Option<String>,
+        stored_secret_id: Option<&str>,
+    ) -> Result<Identity, ProviderError> {
+        let connection = self.draft_connection(&cfg, secret, stored_secret_id)?;
+        draft_timeout(connection.identify()).await
+    }
+
+    /// Lists the options of a scope field for an unsaved connection config, under the
+    /// same rules as `test_draft`.
+    pub async fn list_draft_scopes(
+        &self,
+        cfg: ConnectionConfig,
+        secret: Option<String>,
+        stored_secret_id: Option<&str>,
+        field_key: &str,
+    ) -> Result<Vec<ScopeOption>, ProviderError> {
+        let connection = self.draft_connection(&cfg, secret, stored_secret_id)?;
+        draft_timeout(connection.list_scopes(field_key)).await
+    }
+
+    fn draft_connection(
+        &self,
+        cfg: &ConnectionConfig,
+        secret: Option<String>,
+        stored_secret_id: Option<&str>,
+    ) -> Result<Arc<dyn Connection>, ProviderError> {
+        let factory = self
+            .registry
+            .get(&cfg.provider)
+            .ok_or_else(|| ProviderError::Config(format!("unknown provider {}", cfg.provider)))?;
+        let secret = match (secret, stored_secret_id) {
+            (Some(s), _) => Some(s),
+            (None, Some(id)) => self
+                .secrets
+                .get(id)
+                .map_err(|e| ProviderError::Other(format!("secret store: {e}")))?,
+            (None, None) => None,
+        };
+        factory.connect(
+            cfg,
+            Arc::new(DraftSecretStore {
+                key: cfg.id.clone(),
+                value: secret,
+            }),
+        )
     }
 
     pub fn poll_now(&self) {
@@ -787,6 +886,243 @@ mod tests {
             Err(ProviderError::MissingCredentials)
         );
         engine.shutdown().await;
+    }
+
+    /// Delegates to the fake factory but reads the connection's secret at connect time.
+    struct SecretProbe {
+        inner: FakeProviderFactory,
+        seen: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    }
+
+    impl ProviderFactory for SecretProbe {
+        fn kind(&self) -> &'static str {
+            self.inner.kind()
+        }
+        fn secret_label(&self) -> &'static str {
+            self.inner.secret_label()
+        }
+        fn display_name(&self) -> &'static str {
+            self.inner.display_name()
+        }
+        fn connection_fields(&self) -> Vec<crate::provider::FieldSpec> {
+            self.inner.connection_fields()
+        }
+        fn auth_methods(&self) -> Vec<crate::provider::AuthMethodSpec> {
+            self.inner.auth_methods()
+        }
+        fn default_bots(&self) -> Vec<String> {
+            self.inner.default_bots()
+        }
+        fn validate(&self, cfg: &ConnectionConfig) -> Vec<crate::config::ConfigError> {
+            self.inner.validate(cfg)
+        }
+        fn connect(
+            &self,
+            cfg: &ConnectionConfig,
+            secrets: Arc<dyn SecretStore>,
+        ) -> Result<Arc<dyn crate::provider::Connection>, ProviderError> {
+            let secret = secrets.get(&cfg.id).unwrap();
+            self.seen.lock().unwrap().push(secret.clone());
+            // Only the draft's store is probed: the scheduler's own connections get the real one.
+            if cfg.id == "d1" {
+                assert!(secrets.set(&cfg.id, "leak").is_err());
+                assert!(secrets.delete(&cfg.id).is_err());
+            }
+            if secret.is_none() {
+                return Err(ProviderError::MissingCredentials);
+            }
+            self.inner.connect(cfg, secrets)
+        }
+        fn parse_remote(&self, url: &str) -> Option<crate::provider::RemoteRepo> {
+            self.inner.parse_remote(url)
+        }
+    }
+
+    /// Records every call that reaches it.
+    #[derive(Default)]
+    struct RecordingStore {
+        values: std::sync::Mutex<BTreeMap<String, String>>,
+        writes: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl SecretStore for RecordingStore {
+        fn get(&self, key: &str) -> Result<Option<String>, crate::secrets::SecretError> {
+            Ok(self.values.lock().unwrap().get(key).cloned())
+        }
+        fn set(&self, key: &str, _value: &str) -> Result<(), crate::secrets::SecretError> {
+            self.writes.lock().unwrap().push(format!("set {key}"));
+            Ok(())
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::secrets::SecretError> {
+            self.writes.lock().unwrap().push(format!("delete {key}"));
+            Ok(())
+        }
+        fn is_native(&self) -> bool {
+            false
+        }
+    }
+
+    struct DraftHarness {
+        engine: Engine,
+        fake: FakeProvider,
+        seen: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        store: Arc<RecordingStore>,
+        draft: ConnectionConfig,
+    }
+
+    async fn draft_harness(stored: Option<&str>) -> DraftHarness {
+        let fake = fake();
+        let seen = Arc::new(std::sync::Mutex::default());
+        let store = Arc::new(RecordingStore::default());
+        if let Some(v) = stored {
+            store.values.lock().unwrap().insert("d1".into(), v.into());
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            home: dir.path().join("home"),
+            runtime: dir.path().join("runtime"),
+        };
+        let engine = Engine::start(
+            config_of(&[("c1", "ka", "1")]),
+            Arc::new(Store::open_in_memory().unwrap()),
+            Arc::new(ProviderRegistry::new(vec![Arc::new(SecretProbe {
+                inner: FakeProviderFactory::with_kind(fake.clone(), "ka"),
+                seen: seen.clone(),
+            })])),
+            store.clone(),
+            paths,
+        )
+        .await
+        .unwrap();
+        let draft = config_of(&[("d1", "ka", "x")]).connections.remove(0);
+        DraftHarness {
+            engine,
+            fake,
+            seen,
+            store,
+            draft,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_draft_uses_override_secret_and_writes_nothing() {
+        let h = draft_harness(Some("stored")).await;
+        pass(1).await;
+        h.seen.lock().unwrap().clear();
+        let before = h.engine.connections();
+        let me = h
+            .engine
+            .test_draft(h.draft.clone(), Some("typed".into()), None)
+            .await
+            .unwrap();
+        assert_eq!(me.id, "me");
+        assert_eq!(*h.seen.lock().unwrap(), [Some("typed".to_string())]);
+        assert!(h.store.writes.lock().unwrap().is_empty());
+        assert_eq!(h.store.get("d1").unwrap().as_deref(), Some("stored"));
+        assert_eq!(h.engine.connections(), before);
+        assert_eq!(h.fake.credentials_changed_calls(), 0);
+        h.engine.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_draft_without_override_falls_back_to_stored_secret() {
+        let h = draft_harness(Some("stored")).await;
+        h.seen.lock().unwrap().clear();
+        h.engine
+            .test_draft(h.draft.clone(), None, Some("d1"))
+            .await
+            .unwrap();
+        assert_eq!(*h.seen.lock().unwrap(), [Some("stored".to_string())]);
+        h.engine.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_draft_never_uses_another_connections_stored_secret() {
+        let h = draft_harness(Some("stored")).await;
+        h.seen.lock().unwrap().clear();
+        assert_eq!(
+            h.engine.test_draft(h.draft.clone(), None, None).await,
+            Err(ProviderError::MissingCredentials)
+        );
+        assert_eq!(
+            h.engine
+                .test_draft(h.draft.clone(), None, Some("other"))
+                .await,
+            Err(ProviderError::MissingCredentials)
+        );
+        assert_eq!(*h.seen.lock().unwrap(), [None, None]);
+        h.engine.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_draft_rename_uses_the_original_ids_stored_secret() {
+        let h = draft_harness(Some("stored")).await;
+        h.seen.lock().unwrap().clear();
+        let mut cfg = h.draft.clone();
+        cfg.id = "d1".into();
+        h.store
+            .values
+            .lock()
+            .unwrap()
+            .insert("old".into(), "old-secret".into());
+        h.engine.test_draft(cfg, None, Some("old")).await.unwrap();
+        assert_eq!(*h.seen.lock().unwrap(), [Some("old-secret".to_string())]);
+        h.engine.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn list_draft_scopes_returns_scripted_options_with_the_secret_rule() {
+        let h = draft_harness(Some("stored")).await;
+        let opts = vec![ScopeOption {
+            id: "a".into(),
+            name: "A".into(),
+        }];
+        h.fake.set_scopes("projects", Ok(opts.clone()));
+        h.seen.lock().unwrap().clear();
+        let got = h
+            .engine
+            .list_draft_scopes(h.draft.clone(), None, Some("d1"), "projects")
+            .await
+            .unwrap();
+        assert_eq!(got, opts);
+        assert_eq!(*h.seen.lock().unwrap(), [Some("stored".to_string())]);
+        assert_eq!(h.fake.scope_calls(), ["projects"]);
+        assert!(h.store.writes.lock().unwrap().is_empty());
+        assert_eq!(
+            h.engine
+                .list_draft_scopes(h.draft.clone(), Some("t".into()), None, "other")
+                .await,
+            Err(ProviderError::Config("not supported".into()))
+        );
+        assert_eq!(
+            h.engine
+                .list_draft_scopes(h.draft.clone(), None, None, "projects")
+                .await,
+            Err(ProviderError::MissingCredentials)
+        );
+        h.engine.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_draft_without_any_secret_reports_missing_credentials() {
+        let h = draft_harness(None).await;
+        assert_eq!(
+            h.engine.test_draft(h.draft.clone(), None, Some("d1")).await,
+            Err(ProviderError::MissingCredentials)
+        );
+        h.engine.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_draft_unknown_provider_is_a_config_error() {
+        let h = draft_harness(None).await;
+        let mut cfg = h.draft.clone();
+        cfg.provider = "nope".into();
+        assert!(matches!(
+            h.engine.test_draft(cfg, Some("s".into()), None).await,
+            Err(ProviderError::Config(_))
+        ));
+        h.engine.shutdown().await;
     }
 
     #[tokio::test(start_paused = true)]

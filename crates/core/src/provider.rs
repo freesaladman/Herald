@@ -135,11 +135,25 @@ pub trait Connection: Send + Sync {
     fn server_time(&self) -> BoxFuture<'_, Result<DateTime<Utc>, ProviderError>>;
     fn sources(&self) -> Vec<Box<dyn Source>>;
     fn credentials_changed(&self);
+    /// Options for a `FieldKind::Scope` field, listed live from the provider.
+    fn list_scopes<'a>(
+        &'a self,
+        _field_key: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<ScopeOption>, ProviderError>> {
+        Box::pin(async { Err(ProviderError::Config("not supported".into())) })
+    }
 }
 
 pub trait ProviderFactory: Send + Sync {
     fn kind(&self) -> &'static str;
     fn secret_label(&self) -> &'static str;
+    fn display_name(&self) -> &'static str;
+    /// Provider-specific settings only; id, provider, enabled, auth and bots are generic.
+    fn connection_fields(&self) -> Vec<FieldSpec>;
+    /// Bot globs suggested for a new connection.
+    fn default_bots(&self) -> Vec<String>;
+    /// The first entry is the default.
+    fn auth_methods(&self) -> Vec<AuthMethodSpec>;
     /// Error paths are relative to the connection (e.g. `organization`);
     /// `Config::validate_providers` prefixes them with `connections[i].`.
     fn validate(&self, cfg: &ConnectionConfig) -> Vec<ConfigError>;
@@ -154,6 +168,66 @@ pub trait ProviderFactory: Send + Sync {
     fn host_key(&self, _cfg: &ConnectionConfig) -> Option<String> {
         None
     }
+}
+
+const BOTS_HELP: &str =
+    "Activity from these accounts won't alert you. Globs on the account's unique or display name.";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderDescriptor {
+    pub kind: String,
+    pub display_name: String,
+    pub fields: Vec<FieldSpec>,
+    pub auth_methods: Vec<AuthMethodSpec>,
+    pub default_bots: Vec<String>,
+    pub bots_help: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScopeOption {
+    /// The value stored in config.
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FieldSpec {
+    pub key: String,
+    pub label: String,
+    pub kind: FieldKind,
+    pub required: bool,
+    pub placeholder: Option<String>,
+    pub help: Option<String>,
+    #[serde(default)]
+    pub advanced: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FieldKind {
+    Text,
+    List,
+    /// A list whose options come from `Connection::list_scopes`; empty means all.
+    Scope,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthMethodSpec {
+    pub id: String,
+    pub label: String,
+    pub help: Option<String>,
+    pub secret: Option<SecretSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretSpec {
+    pub label: String,
+    pub help: Option<String>,
 }
 
 #[derive(Clone)]
@@ -172,6 +246,20 @@ impl ProviderRegistry {
 
     pub fn all(&self) -> &[Arc<dyn ProviderFactory>] {
         &self.factories
+    }
+
+    pub fn descriptors(&self) -> Vec<ProviderDescriptor> {
+        self.factories
+            .iter()
+            .map(|f| ProviderDescriptor {
+                kind: f.kind().into(),
+                display_name: f.display_name().into(),
+                fields: f.connection_fields(),
+                auth_methods: f.auth_methods(),
+                default_bots: f.default_bots(),
+                bots_help: BOTS_HELP.into(),
+            })
+            .collect()
     }
 }
 
@@ -204,6 +292,32 @@ mod tests {
     use super::*;
     use crate::testing::{FakeProvider, FakeProviderFactory, sync_context};
     use chrono::TimeZone;
+
+    #[test]
+    fn descriptors_follow_registry_order_and_fake_shape() {
+        let a = FakeProviderFactory::with_kind(FakeProvider::new(), "alpha");
+        let b = FakeProviderFactory::new(FakeProvider::new());
+        let reg = ProviderRegistry::new(vec![Arc::new(a), Arc::new(b)]);
+        let d = reg.descriptors();
+        assert_eq!(
+            d.iter().map(|x| x.kind.as_str()).collect::<Vec<_>>(),
+            ["alpha", "fake"]
+        );
+        assert_eq!(d[1].display_name, "Fake");
+        assert_eq!(d[1].fields.len(), 1);
+        assert_eq!(d[1].fields[0].key, "host");
+        assert_eq!(d[1].fields[0].kind, FieldKind::Text);
+        assert!(!d[1].fields[0].required);
+        assert!(!d[1].fields[0].advanced);
+        assert_eq!(d[1].default_bots, ["fake-bot*"]);
+        assert!(d[1].bots_help.contains("Globs"));
+        let methods: Vec<_> = d[1]
+            .auth_methods
+            .iter()
+            .map(|m| (m.id.as_str(), m.secret.is_some()))
+            .collect();
+        assert_eq!(methods, [("token", true), ("none", false)]);
+    }
 
     fn identity() -> Identity {
         Identity {

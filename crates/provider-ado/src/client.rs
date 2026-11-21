@@ -93,9 +93,9 @@ impl From<AdoError> for ProviderError {
             AdoError::NotFound(m) => ProviderError::NotFound(m),
             AdoError::Throttled { retry_after } => ProviderError::Throttled { retry_after },
             AdoError::Transport(m) => ProviderError::Transient(m),
-            AdoError::Http { status, .. } if status >= 500 => {
-                ProviderError::Transient(format!("http {status}"))
-            }
+            AdoError::Http { status, .. } if status >= 500 => ProviderError::Transient(format!(
+                "Azure DevOps returned http {status}; try again shortly"
+            )),
             AdoError::Http { .. }
             | AdoError::TooManyPages { .. }
             | AdoError::PagingCycle
@@ -118,6 +118,8 @@ pub struct ListResponse<T> {
 pub struct Project {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub state: Option<String>,
 }
 
 pub struct AdoClient {
@@ -272,7 +274,10 @@ impl AdoClient {
     }
 
     pub async fn identify(&self) -> Result<Identity, AdoError> {
-        let data: ConnectionData = self.get_json(Host::Dev, CONNECTION_DATA).await?;
+        let data: ConnectionData = self
+            .get_json(Host::Dev, CONNECTION_DATA)
+            .await
+            .map_err(|e| self.identify_error(e))?;
         let user = data.authenticated_user;
         let unique_name = user
             .properties
@@ -297,6 +302,24 @@ impl AdoClient {
             unique_name,
             group_ids,
         })
+    }
+
+    /// User-facing wording for the failures the connection wizard can hit on the first call.
+    fn identify_error(&self, e: AdoError) -> AdoError {
+        match e {
+            AdoError::NotFound(_) => AdoError::Auth(ProviderError::Config(format!(
+                "Organization \"{}\" was not found on dev.azure.com. Check the spelling.",
+                self.organization
+            ))),
+            AdoError::Forbidden(_) => AdoError::Forbidden(
+                "Signed in, but this account can't access the organization.".to_string(),
+            ),
+            AdoError::Transport(reason) => AdoError::Auth(ProviderError::Transient(format!(
+                "Couldn't reach dev.azure.com: {}",
+                short_reason(&reason)
+            ))),
+            other => other,
+        }
     }
 
     pub async fn projects(&self) -> Result<Vec<Project>, AdoError> {
@@ -486,6 +509,12 @@ fn is_sign_in_redirect(headers: &HeaderMap) -> bool {
     ]
     .iter()
     .any(|m| location.contains(m))
+}
+
+/// The innermost cause of a transport error chain, capped for display.
+fn short_reason(chain: &str) -> String {
+    let last = chain.rsplit(": ").next().unwrap_or(chain);
+    last.chars().take(120).collect()
 }
 
 fn transport_error(e: reqwest::Error) -> AdoError {
@@ -1160,6 +1189,72 @@ mod tests {
             !msg.contains("127.0.0.1") && !msg.contains("secret-path"),
             "{msg}"
         );
+    }
+
+    async fn identify_status_error(status: u16) -> ProviderError {
+        let server = MockServer::start().await;
+        Mock::given(path("/_apis/connectionData"))
+            .respond_with(ResponseTemplate::new(status).set_body_string("body"))
+            .mount(&server)
+            .await;
+        ProviderError::from(client(&server).identify().await.unwrap_err())
+    }
+
+    #[tokio::test]
+    async fn identify_unknown_organization_is_a_config_error() {
+        assert_eq!(
+            identify_status_error(404).await,
+            ProviderError::Config(
+                "Organization \"org\" was not found on dev.azure.com. Check the spelling.".into()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn identify_forbidden_has_a_readable_message() {
+        assert_eq!(
+            identify_status_error(403).await,
+            ProviderError::Forbidden(
+                "Signed in, but this account can't access the organization.".into()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn identify_sign_in_redirect_stays_unauthorized() {
+        assert_eq!(
+            identify_status_error(203).await,
+            ProviderError::Unauthorized
+        );
+    }
+
+    #[tokio::test]
+    async fn identify_unreachable_host_is_transient_and_leaks_nothing() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let u = format!("http://127.0.0.1:{port}");
+        let c = AdoClient::with_base_urls("org", test_auth(), &u, &u, &u);
+        let ProviderError::Transient(msg) = ProviderError::from(c.identify().await.unwrap_err())
+        else {
+            panic!("expected transient");
+        };
+        assert!(msg.starts_with("Couldn't reach dev.azure.com: "), "{msg}");
+        assert!(
+            !msg.contains("127.0.0.1") && !msg.contains(PAT) && !msg.contains(&basic_pat()),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn not_found_outside_identify_keeps_its_kind() {
+        let server = MockServer::start().await;
+        let e = client(&server)
+            .get_json::<serde_json::Value>(Host::Dev, "_apis/missing")
+            .await
+            .unwrap_err();
+        assert!(matches!(ProviderError::from(e), ProviderError::NotFound(_)));
     }
 
     #[tokio::test]

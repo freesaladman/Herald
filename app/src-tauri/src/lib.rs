@@ -77,15 +77,22 @@ fn build_registry() -> Arc<ProviderRegistry> {
     Arc::new(ProviderRegistry::new(vec![Arc::new(AdoProviderFactory)]))
 }
 
-/// Load + provider validation; all problems come back together.
-fn load_config(path: &Path, registry: &ProviderRegistry) -> Result<Config, Vec<ConfigError>> {
-    let config = Config::load(path)?;
+/// Parse + provider validation of `text`; all problems come back together.
+fn parse_config(text: &str, registry: &ProviderRegistry) -> Result<Config, Vec<ConfigError>> {
+    let config = Config::from_toml_str(text)?;
     let errors = config.validate_providers(registry);
     if errors.is_empty() {
         Ok(config)
     } else {
         Err(errors)
     }
+}
+
+/// Load + provider validation; all problems come back together.
+fn load_config(path: &Path, registry: &ProviderRegistry) -> Result<Config, Vec<ConfigError>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| vec![ConfigError::new(path.display().to_string(), e.to_string())])?;
+    parse_config(&text, registry)
 }
 
 /// Falls back to the template config (no connections) so the app still runs.
@@ -127,8 +134,38 @@ fn set_config_errors(app: &AppHandle, errors: Vec<ConfigError>) {
     state.lock().unwrap_or_else(PoisonError::into_inner).config = errors;
 }
 
-fn reload_config(app: &AppHandle, path: &Path, registry: &ProviderRegistry) {
-    match load_config(path, registry) {
+/// Text of the config file as of the last reload. Lets the watcher skip the event
+/// echo of a write the app already applied itself.
+#[derive(Default)]
+pub struct AppliedConfig(Mutex<Option<String>>);
+
+/// A readable file reloads only when its text changed; an unreadable one or `force` always does.
+fn should_reload(last: Option<&str>, text: &str, force: bool) -> bool {
+    force || last != Some(text)
+}
+
+/// Reloads when the file text differs from the last applied text, or always when `force`.
+fn reload_config(app: &AppHandle, path: &Path, registry: &ProviderRegistry, force: bool) {
+    let applied = app.state::<AppliedConfig>();
+    let mut last = applied.0.lock().unwrap_or_else(PoisonError::into_inner);
+    let result = match std::fs::read_to_string(path) {
+        Ok(text) => {
+            if !should_reload(last.as_deref(), &text, force) {
+                return;
+            }
+            let result = parse_config(&text, registry);
+            *last = Some(text);
+            result
+        }
+        Err(e) => {
+            *last = None;
+            Err(vec![ConfigError::new(
+                path.display().to_string(),
+                e.to_string(),
+            )])
+        }
+    };
+    match result {
         Ok(config) => {
             if let Some(engine) = app.state::<EngineHandle>().get() {
                 engine.reload(config);
@@ -143,13 +180,24 @@ fn reload_config(app: &AppHandle, path: &Path, registry: &ProviderRegistry) {
     }
 }
 
+/// Reloads after the app wrote the config itself. Skips when the watcher already applied
+/// that text, so a write is applied exactly once.
+pub fn reload_config_if_changed(app: &AppHandle) {
+    let Some(engine) = app.try_state::<EngineHandle>().and_then(|h| h.get()) else {
+        return;
+    };
+    let path = engine.paths().home.join(CONFIG_FILE);
+    reload_config(app, &path, &build_registry(), false);
+    commands::emit_ui_state(app);
+}
+
 /// Re-runs the watcher's load, validate and reload path on demand (tray menu).
 pub fn reload_config_now(app: &AppHandle) {
     let Some(engine) = app.try_state::<EngineHandle>().and_then(|h| h.get()) else {
         return;
     };
     let path = engine.paths().home.join(CONFIG_FILE);
-    reload_config(app, &path, &build_registry());
+    reload_config(app, &path, &build_registry(), true);
     commands::emit_ui_state(app);
 }
 
@@ -185,7 +233,7 @@ fn watch_config(
         .name("config-watcher".into())
         .spawn(move || {
             while wait_debounced(&rx, CONFIG_DEBOUNCE) {
-                reload_config(&app, &path, &registry);
+                reload_config(&app, &path, &registry, false);
             }
         })?;
     Ok(watcher)
@@ -323,6 +371,7 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_opener::init())
         .manage(QuitFlag::default())
+        .manage(AppliedConfig::default())
         .manage(log_guard)
         .manage(commands::ToastHover(tokio::sync::watch::channel(false).0))
         .invoke_handler(tauri::generate_handler![
@@ -341,6 +390,12 @@ pub fn run() {
             commands::toast_hover,
             commands::toast_resize,
             commands::hide_pane,
+            commands::list_providers,
+            commands::get_connection_draft,
+            commands::test_draft_connection,
+            commands::list_draft_scopes,
+            commands::save_connection,
+            commands::remove_connection,
         ])
         .setup(move |app| {
             bootstrap(app.handle(), &paths)?;
@@ -487,6 +542,44 @@ mod tests {
         .unwrap();
         let errors = load_config(&path, &build_registry()).unwrap_err();
         assert!(!errors.is_empty());
+    }
+
+    #[test]
+    fn should_reload_table() {
+        // (last applied, current text, force, expected)
+        let cases = [
+            (None, "a", false, true),
+            (Some("a"), "a", false, false),
+            (Some("a"), "b", false, true),
+            (Some("a"), "a", true, true),
+            (Some("a"), "", false, true),
+            (None, "", false, true),
+        ];
+        for (last, text, force, want) in cases {
+            assert_eq!(
+                should_reload(last, text, force),
+                want,
+                "{last:?} {text:?} {force}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_config_matches_load_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        let text = "[[connections]]
+id = \"x\"
+provider = \"nope\"
+auth = { method = \"pat\" }
+";
+        std::fs::write(&path, text).unwrap();
+        let reg = build_registry();
+        assert_eq!(
+            parse_config(text, &reg).unwrap_err(),
+            load_config(&path, &reg).unwrap_err()
+        );
+        assert!(load_config(&dir.path().join("missing.toml"), &reg).is_err());
     }
 
     #[test]

@@ -1782,6 +1782,18 @@ mod tests {
         fn secret_label(&self) -> &'static str {
             self.inner.secret_label()
         }
+        fn display_name(&self) -> &'static str {
+            self.inner.display_name()
+        }
+        fn connection_fields(&self) -> Vec<crate::provider::FieldSpec> {
+            self.inner.connection_fields()
+        }
+        fn auth_methods(&self) -> Vec<crate::provider::AuthMethodSpec> {
+            self.inner.auth_methods()
+        }
+        fn default_bots(&self) -> Vec<String> {
+            self.inner.default_bots()
+        }
         fn validate(&self, cfg: &ConnectionConfig) -> Vec<crate::config::ConfigError> {
             self.inner.validate(cfg)
         }

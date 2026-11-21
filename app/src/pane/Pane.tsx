@@ -37,10 +37,14 @@ function Banners({
   ui,
   now,
   onConnections,
+  onAdd,
+  hideEmptyNote,
 }: {
   ui: UiState;
   now: number;
   onConnections: () => void;
+  onAdd: () => void;
+  hideEmptyNote: boolean;
 }) {
   const snoozed =
     ui.snoozedUntilUtc && Date.parse(ui.snoozedUntilUtc) > now
@@ -53,8 +57,15 @@ function Banners({
       {snoozed && (
         <div style={banner}>Snoozed until {snoozed.toLocaleTimeString()}</div>
       )}
-      {ui.connections.length === 0 && (
-        <div style={banner}>No connections configured: edit config.toml</div>
+      {ui.connections.length === 0 && !hideEmptyNote && (
+        <div
+          style={{ ...banner, display: "flex", alignItems: "center", gap: 8 }}
+        >
+          <span>No connections yet.</span>
+          <button type="button" className="btn" onClick={onAdd}>
+            Add connection
+          </button>
+        </div>
       )}
       {ui.connections.map((c) => (
         <div key={c.id}>
@@ -110,6 +121,11 @@ export function Pane() {
   const [ui, setUi] = useState<UiState | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [view, setView] = useState<View>("records");
+  const [startWizard, setStartWizard] = useState(false);
+  const openConnections = (wizard: boolean) => {
+    setStartWizard(wizard);
+    setView("connections");
+  };
   const [error, setError] = useState<string | null>(null);
 
   const applyUi = useCallback((state: UiState) => {
@@ -182,7 +198,7 @@ export function Pane() {
           className="btn btn-ghost"
           aria-label="Settings"
           onClick={() =>
-            setView(view === "records" ? "connections" : "records")
+            view === "records" ? openConnections(false) : setView("records")
           }
         >
           ⚙
@@ -192,7 +208,9 @@ export function Pane() {
         <Banners
           ui={ui}
           now={now}
-          onConnections={() => setView("connections")}
+          onConnections={() => openConnections(false)}
+          onAdd={() => openConnections(true)}
+          hideEmptyNote={view === "connections"}
         />
       )}
       {error && (
@@ -212,21 +230,12 @@ export function Pane() {
         </div>
       )}
       {view === "connections" ? (
-        <>
-          <div style={{ padding: "4px 12px" }}>
-            <button
-              type="button"
-              className="btn btn-ghost"
-              onClick={() => setView("records")}
-            >
-              Back
-            </button>
-          </div>
-          <Connections
-            connections={ui?.connections ?? []}
-            secretsNative={ui?.secretsNative ?? true}
-          />
-        </>
+        <Connections
+          connections={ui?.connections ?? []}
+          secretsNative={ui?.secretsNative ?? true}
+          startWizard={startWizard}
+          onBack={() => setView("records")}
+        />
       ) : (
         <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
           {events.length === 0 ? (

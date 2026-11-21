@@ -3,6 +3,7 @@
 pub mod bus;
 pub mod classify;
 pub mod config;
+pub mod config_edit;
 pub mod engine;
 pub mod event;
 pub mod hooks;

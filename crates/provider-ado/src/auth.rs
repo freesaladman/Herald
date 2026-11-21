@@ -302,7 +302,7 @@ fn classify_failure(f: AzFailure) -> ProviderError {
         return ProviderError::MissingCredentials;
     }
     let excerpt: String = f.stderr.trim().chars().take(STDERR_EXCERPT_CHARS).collect();
-    ProviderError::Other(format!("az failed: {excerpt}"))
+    ProviderError::Other(format!("Azure CLI sign-in failed: {excerpt}"))
 }
 
 fn parse_token(stdout: &str) -> Result<(String, DateTime<Utc>), ProviderError> {
@@ -499,7 +499,7 @@ mod tests {
         );
         assert_eq!(
             auth.authorization().await.unwrap_err(),
-            ProviderError::Other("az failed: boom".into())
+            ProviderError::Other("Azure CLI sign-in failed: boom".into())
         );
     }
 

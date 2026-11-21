@@ -14,6 +14,12 @@ const COMMANDS: &[&str] = &[
     "toast_hover",
     "toast_resize",
     "hide_pane",
+    "list_providers",
+    "get_connection_draft",
+    "test_draft_connection",
+    "list_draft_scopes",
+    "save_connection",
+    "remove_connection",
 ];
 
 fn main() {

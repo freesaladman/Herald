@@ -7,7 +7,8 @@ use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
 use herald_core::config::{ConfigError, ConnectionConfig};
 use herald_core::provider::{
-    Connection, Identity, ProviderError, ProviderFactory, RemoteRepo, Source,
+    AuthMethodSpec, Connection, FieldKind, FieldSpec, Identity, ProviderError, ProviderFactory,
+    RemoteRepo, ScopeOption, SecretSpec, Source,
 };
 use herald_core::secrets::SecretStore;
 use percent_encoding::percent_decode_str;
@@ -44,6 +45,62 @@ impl ProviderFactory for AdoProviderFactory {
 
     fn secret_label(&self) -> &'static str {
         "Personal access token"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Azure DevOps"
+    }
+
+    fn connection_fields(&self) -> Vec<FieldSpec> {
+        vec![
+            FieldSpec {
+                key: "organization".into(),
+                label: "Organization".into(),
+                kind: FieldKind::Text,
+                required: true,
+                placeholder: Some("my-org".into()),
+                help: Some("The name after dev.azure.com/".into()),
+                advanced: false,
+            },
+            FieldSpec {
+                key: "projects".into(),
+                label: "Projects".into(),
+                kind: FieldKind::Scope,
+                required: false,
+                placeholder: None,
+                help: Some(
+                    "Projects to watch. Leave all unticked to watch every project you can see."
+                        .into(),
+                ),
+                advanced: false,
+            },
+        ]
+    }
+
+    fn default_bots(&self) -> Vec<String> {
+        vec!["*Build Service*".into()]
+    }
+
+    fn auth_methods(&self) -> Vec<AuthMethodSpec> {
+        vec![
+            AuthMethodSpec {
+                id: "pat".into(),
+                label: "Personal access token".into(),
+                help: None,
+                secret: Some(SecretSpec {
+                    label: "Personal access token".into(),
+                    help: Some(
+                        "Scopes: Code (Read), Build (Read), Release (Read), Identity (Read)".into(),
+                    ),
+                }),
+            },
+            AuthMethodSpec {
+                id: "azcli".into(),
+                label: "Azure CLI login".into(),
+                help: Some("Uses az account get-access-token; nothing is stored".into()),
+                secret: None,
+            },
+        ]
     }
 
     fn validate(&self, cfg: &ConnectionConfig) -> Vec<ConfigError> {
@@ -234,6 +291,24 @@ impl AdoShared {
     }
 }
 
+/// Project names are the stored value: `AdoShared::projects` matches config entries by name.
+fn project_scopes(projects: Vec<Project>) -> Vec<ScopeOption> {
+    let mut options: Vec<ScopeOption> = projects
+        .into_iter()
+        .filter(|p| {
+            p.state
+                .as_deref()
+                .is_none_or(|s| s.eq_ignore_ascii_case("wellFormed"))
+        })
+        .map(|p| ScopeOption {
+            id: p.name.clone(),
+            name: p.name,
+        })
+        .collect();
+    options.sort_by_key(|o| o.name.to_lowercase());
+    options
+}
+
 pub struct AdoConnection {
     id: String,
     auth_method: String,
@@ -292,6 +367,20 @@ impl Connection for AdoConnection {
     fn credentials_changed(&self) {
         self.shared.client.invalidate_auth();
     }
+
+    fn list_scopes<'a>(
+        &'a self,
+        field_key: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<ScopeOption>, ProviderError>> {
+        Box::pin(async move {
+            if field_key != "projects" {
+                return Err(ProviderError::Config(format!(
+                    "unknown scope field {field_key}"
+                )));
+            }
+            Ok(project_scopes(self.shared.client.projects().await?))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -305,6 +394,56 @@ mod tests {
             "[[connections]]\nid = \"c1\"\nprovider = \"ado\"\nauth = {{ method = \"{auth}\" }}\n{extra}\n"
         );
         Config::from_toml_str(&text).unwrap().connections.remove(0)
+    }
+
+    #[test]
+    fn descriptor_serialises_camel_case() {
+        let reg = ProviderRegistry::new(vec![Arc::new(AdoProviderFactory)]);
+        let json = serde_json::to_value(reg.descriptors()).unwrap();
+        let expected = serde_json::json!([{
+            "kind": "ado",
+            "displayName": "Azure DevOps",
+            "fields": [
+                {
+                    "key": "organization",
+                    "label": "Organization",
+                    "kind": "text",
+                    "required": true,
+                    "placeholder": "my-org",
+                    "help": "The name after dev.azure.com/",
+                    "advanced": false
+                },
+                {
+                    "key": "projects",
+                    "label": "Projects",
+                    "kind": "scope",
+                    "required": false,
+                    "placeholder": null,
+                    "help": "Projects to watch. Leave all unticked to watch every project you can see.",
+                    "advanced": false
+                }
+            ],
+            "authMethods": [
+                {
+                    "id": "pat",
+                    "label": "Personal access token",
+                    "help": null,
+                    "secret": {
+                        "label": "Personal access token",
+                        "help": "Scopes: Code (Read), Build (Read), Release (Read), Identity (Read)"
+                    }
+                },
+                {
+                    "id": "azcli",
+                    "label": "Azure CLI login",
+                    "help": "Uses az account get-access-token; nothing is stored",
+                    "secret": null
+                }
+            ],
+            "defaultBots": ["*Build Service*"],
+            "botsHelp": "Activity from these accounts won't alert you. Globs on the account's unique or display name."
+        }]);
+        assert_eq!(json, expected);
     }
 
     fn paths(errors: Vec<ConfigError>) -> Vec<String> {
@@ -439,5 +578,71 @@ organization = \"{org}\"
         ] {
             assert_eq!(f.parse_remote(url), None, "{url}");
         }
+    }
+
+    fn mock_connection(server: &wiremock::MockServer) -> AdoConnection {
+        let secrets = herald_core::secrets::MemorySecretStore::new();
+        secrets.set("c1", "pat").unwrap();
+        let auth = AdoAuth::from_config(&conn("organization = \"org\"", "pat"), Arc::new(secrets))
+            .unwrap();
+        let u = server.uri();
+        let client = AdoClient::with_base_urls("org", auth, &u, &u, &format!("{u}/vssps"));
+        AdoConnection::new(
+            "c1".into(),
+            "pat".into(),
+            AdoShared::new(Arc::new(client), "org".into(), Vec::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn list_scopes_projects_pages_filters_and_sorts_by_name() {
+        use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/_apis/projects"))
+            .and(query_param_is_missing("continuationToken"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "count": 2, "value": [
+                        { "id": "1", "name": "zeta", "state": "wellFormed" },
+                        { "id": "2", "name": "Gone", "state": "deleting" }
+                    ]}))
+                    .insert_header("x-ms-continuationtoken", "next"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/_apis/projects"))
+            .and(query_param("continuationToken", "next"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "count": 2, "value": [
+                    { "id": "3", "name": "Alpha", "state": "wellFormed" },
+                    { "id": "4", "name": "mid", "state": "wellFormed" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let got = mock_connection(&server)
+            .list_scopes("projects")
+            .await
+            .unwrap();
+        let pairs: Vec<_> = got
+            .iter()
+            .map(|o| (o.id.as_str(), o.name.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [("Alpha", "Alpha"), ("mid", "mid"), ("zeta", "zeta")]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_scopes_rejects_unknown_field() {
+        let server = wiremock::MockServer::start().await;
+        assert!(matches!(
+            mock_connection(&server).list_scopes("nope").await,
+            Err(ProviderError::Config(_))
+        ));
     }
 }

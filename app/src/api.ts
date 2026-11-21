@@ -4,11 +4,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 export type Severity = "critical" | "warn" | "success" | "info";
 export type ActorKind = "me" | "human" | "bot" | "system";
 export type PrRole =
-  | "author"
-  | "reviewer"
-  | "groupReviewer"
-  | "commenter"
-  | "mentioned";
+  "author" | "reviewer" | "groupReviewer" | "commenter" | "mentioned";
 export type AuthState = "unknown" | "ok" | "missing" | "invalid";
 
 export interface ConnectionRef {
@@ -149,6 +145,53 @@ export interface ToastCard {
   test: boolean;
 }
 
+export type FieldKind = "text" | "list" | "scope";
+
+export interface FieldSpec {
+  key: string;
+  label: string;
+  kind: FieldKind;
+  required: boolean;
+  placeholder?: string | null;
+  help?: string | null;
+  advanced?: boolean;
+}
+
+export interface ScopeOption {
+  id: string;
+  name: string;
+}
+
+export interface SecretSpec {
+  label: string;
+  help?: string | null;
+}
+
+export interface AuthMethodSpec {
+  id: string;
+  label: string;
+  help?: string | null;
+  secret?: SecretSpec | null;
+}
+
+export interface ProviderDescriptor {
+  kind: string;
+  displayName: string;
+  fields: FieldSpec[];
+  authMethods: AuthMethodSpec[];
+  defaultBots: string[];
+  botsHelp: string;
+}
+
+export interface ConnectionDraft {
+  id: string;
+  provider: string;
+  enabled: boolean;
+  authMethod: string;
+  bots: string[];
+  settings: Record<string, string | string[]>;
+}
+
 export class ApiError extends Error {
   constructor(message: string) {
     super(message);
@@ -184,6 +227,33 @@ export const clearSecret = (connectionId: string) =>
   call<void>("clear_secret", { connectionId });
 export const testConnection = (connectionId: string) =>
   call<Identity>("test_connection", { connectionId });
+export const listProviders = () => call<ProviderDescriptor[]>("list_providers");
+export const getConnectionDraft = (id: string) =>
+  call<ConnectionDraft>("get_connection_draft", { id });
+export const testDraftConnection = (
+  draft: ConnectionDraft,
+  secret: string | null,
+  originalId: string | null,
+) => call<Identity>("test_draft_connection", { draft, secret, originalId });
+export const listDraftScopes = (
+  draft: ConnectionDraft,
+  secret: string | null,
+  originalId: string | null,
+  fieldKey: string,
+) =>
+  call<ScopeOption[]>("list_draft_scopes", {
+    draft,
+    secret,
+    originalId,
+    fieldKey,
+  });
+export const saveConnection = (
+  draft: ConnectionDraft,
+  secret: string | null,
+  originalId: string | null,
+) => call<void>("save_connection", { draft, secret, originalId });
+export const removeConnection = (id: string) =>
+  call<void>("remove_connection", { id });
 export const toastClicked = () => call<void>("toast_clicked");
 export const toastHover = (hovering: boolean) =>
   call<void>("toast_hover", { hovering });

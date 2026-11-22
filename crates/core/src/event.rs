@@ -35,6 +35,10 @@ pub struct Event {
     /// Provider extras plus the pinned per-type keys; `Null` when none.
     #[serde(default)]
     pub data: serde_json::Value,
+    /// Store-assigned sequence number; set only on events read from the store (or published
+    /// after being stored), never part of the stored json.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
 }
 
 impl Event {
@@ -78,6 +82,7 @@ impl Event {
             approval: None,
             local: None,
             data: serde_json::Value::Null,
+            seq: None,
         }
     }
 

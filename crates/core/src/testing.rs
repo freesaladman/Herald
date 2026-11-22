@@ -14,7 +14,7 @@ use crate::provider::{
     SyncContext, Tier,
 };
 use crate::secrets::SecretStore;
-use crate::store::Store;
+use crate::store::{SqliteStore, Store};
 
 type PollResult = Result<PollOutcome, ProviderError>;
 
@@ -456,9 +456,9 @@ pub fn sync_context(
     server_now: DateTime<Utc>,
     watermark: Option<DateTime<Utc>>,
     catch_up: bool,
-) -> (SyncContext, Arc<Store>) {
+) -> (SyncContext, Arc<dyn Store>) {
     let config = Config::from_toml_str(Config::default_toml()).expect("default config template");
-    let store = Arc::new(Store::open_in_memory().expect("in-memory store"));
+    let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
     let ctx = SyncContext {
         connection: ConnectionRef {
             id: connection_config.id.clone(),

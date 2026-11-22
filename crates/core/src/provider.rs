@@ -75,24 +75,24 @@ pub struct RemoteRepo {
 /// Snapshot access namespaced to one connection ("{connId}:{key}").
 #[derive(Clone)]
 pub struct ScopedSnapshots {
-    store: Arc<Store>,
+    store: Arc<dyn Store>,
     prefix: String,
 }
 
 impl ScopedSnapshots {
-    pub fn new(store: Arc<Store>, connection_id: &str) -> Self {
+    pub fn new(store: Arc<dyn Store>, connection_id: &str) -> Self {
         Self {
             store,
             prefix: format!("{connection_id}:"),
         }
     }
 
-    pub fn get<T: DeserializeOwned>(&self, key: &str) -> store::Result<Option<T>> {
-        self.store.get_snapshot(&self.scoped(key))
+    pub async fn get<T: DeserializeOwned>(&self, key: &str) -> store::Result<Option<T>> {
+        self.store.get_snapshot(&self.scoped(key)).await
     }
 
-    pub fn put<T: Serialize>(&self, key: &str, value: &T) -> store::Result<()> {
-        self.store.put_snapshot(&self.scoped(key), value)
+    pub async fn put<T: Serialize>(&self, key: &str, value: &T) -> store::Result<()> {
+        self.store.put_snapshot(&self.scoped(key), value).await
     }
 
     fn scoped(&self, key: &str) -> String {
@@ -319,6 +319,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::SqliteStore;
     use crate::testing::{FakeProvider, FakeProviderFactory, sync_context};
     use chrono::TimeZone;
 
@@ -368,17 +369,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn scoped_snapshots_prefix_keys_per_connection() {
-        let store = Arc::new(Store::open_in_memory().unwrap());
+    #[tokio::test]
+    async fn scoped_snapshots_prefix_keys_per_connection() {
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
         let a = ScopedSnapshots::new(store.clone(), "conn-a");
         let b = ScopedSnapshots::new(store.clone(), "conn-b");
-        a.put("k", &1_i32).unwrap();
-        b.put("k", &2_i32).unwrap();
-        assert_eq!(a.get::<i32>("k").unwrap(), Some(1));
-        assert_eq!(b.get::<i32>("k").unwrap(), Some(2));
-        assert_eq!(store.get_snapshot::<i32>("conn-a:k").unwrap(), Some(1));
-        assert_eq!(a.get::<i32>("other").unwrap(), None);
+        a.put("k", &1_i32).await.unwrap();
+        b.put("k", &2_i32).await.unwrap();
+        assert_eq!(a.get::<i32>("k").await.unwrap(), Some(1));
+        assert_eq!(b.get::<i32>("k").await.unwrap(), Some(2));
+        assert_eq!(
+            store.get_snapshot::<i32>("conn-a:k").await.unwrap(),
+            Some(1)
+        );
+        assert_eq!(a.get::<i32>("other").await.unwrap(), None);
     }
 
     #[test]

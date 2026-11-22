@@ -90,8 +90,12 @@ impl PrReviewsSource {
     }
 
     async fn poll_inner(&self, ctx: &SyncContext) -> Result<PollOutcome, ProviderError> {
-        let tracked: TrackedPrs = ctx.snapshots.get(SNAPSHOT_TRACKED_PRS)?.unwrap_or_default();
-        let old: SeenState = ctx.snapshots.get(SNAPSHOT_SEEN)?.unwrap_or_default();
+        let tracked: TrackedPrs = ctx
+            .snapshots
+            .get(SNAPSHOT_TRACKED_PRS)
+            .await?
+            .unwrap_or_default();
+        let old: SeenState = ctx.snapshots.get(SNAPSHOT_SEEN).await?.unwrap_or_default();
 
         let fetches: Vec<BoxFuture<'_, Result<Fetched, ProviderError>>> = tracked
             .prs
@@ -136,7 +140,7 @@ impl PrReviewsSource {
             }
             state.prs.insert(key, seen);
         }
-        ctx.snapshots.put(SNAPSHOT_SEEN, &state)?;
+        ctx.snapshots.put(SNAPSHOT_SEEN, &state).await?;
         Ok(PollOutcome { events })
     }
 }
@@ -662,11 +666,11 @@ mod tests {
         ResponseTemplate::new(200).set_body_json(json!({ "value": items }))
     }
 
-    fn track(ctx: &SyncContext, role: PrRole) {
-        track_with_vote(ctx, role, None);
+    async fn track(ctx: &SyncContext, role: PrRole) {
+        track_with_vote(ctx, role, None).await;
     }
 
-    fn track_with_vote(ctx: &SyncContext, role: PrRole, my_vote: Option<i32>) {
+    async fn track_with_vote(ctx: &SyncContext, role: PrRole, my_vote: Option<i32>) {
         ctx.snapshots
             .put(
                 SNAPSHOT_TRACKED_PRS,
@@ -684,6 +688,7 @@ mod tests {
                     }],
                 },
             )
+            .await
             .unwrap();
     }
 
@@ -707,7 +712,7 @@ mod tests {
     async fn seeded_poll(role: PrRole, threads: Vec<Value>, iterations: Vec<Value>) -> Vec<Event> {
         let server = MockServer::start().await;
         let (ctx, _store) = sync_context(cfg(), me(), at(10, 0), None, false);
-        track(&ctx, role);
+        track(&ctx, role).await;
         let mut src = source(&server);
         serve(&server, ok(vec![]), ok(vec![iteration(1, at(1, 0))])).await;
         assert!(
@@ -726,7 +731,7 @@ mod tests {
     async fn seed_emits_nothing_and_first_sight_skips_old_history() {
         let server = MockServer::start().await;
         let (ctx, _store) = sync_context(cfg(), me(), at(20, 0), None, false);
-        track(&ctx, PrRole::Reviewer);
+        track(&ctx, PrRole::Reviewer).await;
         let mut src = source(&server);
         let old = vec![
             vote_thread(5, at(2, 0), ("other", "Person 2"), "10"),
@@ -754,7 +759,7 @@ mod tests {
 
         // A PR first seen after the seed emits only what falls inside the window.
         let (ctx2, _s2) = sync_context(cfg(), me(), at(20, 2), Some(at(20, 0)), false);
-        track(&ctx2, PrRole::Reviewer);
+        track(&ctx2, PrRole::Reviewer).await;
         let mut src2 = source(&server);
         let events = run(&mut src2, &ctx2, Some(at(20, 0)), at(20, 2))
             .await
@@ -897,7 +902,7 @@ mod tests {
         // The seed poll already knows the vote; only the reset is new.
         let server = MockServer::start().await;
         let (ctx, _store) = sync_context(cfg(), me(), at(10, 0), None, false);
-        track(&ctx, PrRole::Reviewer);
+        track(&ctx, PrRole::Reviewer).await;
         let mut src = source(&server);
         serve(
             &server,
@@ -919,7 +924,7 @@ mod tests {
     async fn new_iteration_after_my_vote_needs_rereview_once() {
         let server = MockServer::start().await;
         let (ctx, _store) = sync_context(cfg(), me(), at(10, 0), None, false);
-        track(&ctx, PrRole::Reviewer);
+        track(&ctx, PrRole::Reviewer).await;
         let mut src = source(&server);
         let vote = vote_thread(30, at(9, 1), (ME, "Me"), "10");
         serve(
@@ -966,7 +971,7 @@ mod tests {
     async fn transient_aborts_without_writing() {
         let server = MockServer::start().await;
         let (ctx, _store) = sync_context(cfg(), me(), at(10, 0), Some(at(9, 0)), false);
-        track(&ctx, PrRole::Reviewer);
+        track(&ctx, PrRole::Reviewer).await;
         let mut src = source(&server);
         serve(&server, ResponseTemplate::new(500), ok(vec![])).await;
         let err = run(&mut src, &ctx, Some(at(9, 0)), at(10, 0))
@@ -976,6 +981,7 @@ mod tests {
         assert!(
             ctx.snapshots
                 .get::<SeenState>(SNAPSHOT_SEEN)
+                .await
                 .unwrap()
                 .is_none()
         );
@@ -1004,7 +1010,7 @@ mod tests {
     async fn first_sight_skips_my_reviewer_added_but_keeps_others() {
         let server = MockServer::start().await;
         let (ctx, _store) = sync_context(cfg(), me(), at(10, 12), Some(at(10, 0)), false);
-        track(&ctx, PrRole::Reviewer);
+        track(&ctx, PrRole::Reviewer).await;
         let mut src = source(&server);
         let t = reviewers_added(
             9,
@@ -1034,7 +1040,7 @@ mod tests {
     async fn list_vote_of_zero_suppresses_iteration_rereview() {
         let server = MockServer::start().await;
         let (ctx, _store) = sync_context(cfg(), me(), at(10, 0), None, false);
-        track_with_vote(&ctx, PrRole::Reviewer, Some(10));
+        track_with_vote(&ctx, PrRole::Reviewer, Some(10)).await;
         let mut src = source(&server);
         let vote = vote_thread(30, at(9, 1), (ME, "Me"), "10");
         serve(
@@ -1046,7 +1052,7 @@ mod tests {
         run(&mut src, &ctx, None, at(10, 0)).await.unwrap();
 
         // The reset thread doesn't list me, but the list now says my vote is 0.
-        track_with_vote(&ctx, PrRole::Reviewer, Some(0));
+        track_with_vote(&ctx, PrRole::Reviewer, Some(0)).await;
         let reset = sys(
             31,
             "ResetMultipleVotes",
@@ -1069,7 +1075,7 @@ mod tests {
     async fn reset_right_after_push_rereview_is_not_a_second_rereview() {
         let server = MockServer::start().await;
         let (ctx, _store) = sync_context(cfg(), me(), at(10, 0), None, false);
-        track(&ctx, PrRole::Reviewer);
+        track(&ctx, PrRole::Reviewer).await;
         let mut src = source(&server);
         let vote = vote_thread(30, at(9, 1), (ME, "Me"), "10");
         serve(

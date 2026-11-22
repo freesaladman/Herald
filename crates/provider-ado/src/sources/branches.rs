@@ -97,8 +97,16 @@ impl BranchesSource {
     }
 
     async fn poll_inner(&self, ctx: &SyncContext) -> Result<PollOutcome, ProviderError> {
-        let previous: MyBranches = ctx.snapshots.get(SNAPSHOT_MY_BRANCHES)?.unwrap_or_default();
-        let last_seen_prev: LastSeen = ctx.snapshots.get(SNAPSHOT_LAST_SEEN)?.unwrap_or_default();
+        let previous: MyBranches = ctx
+            .snapshots
+            .get(SNAPSHOT_MY_BRANCHES)
+            .await?
+            .unwrap_or_default();
+        let last_seen_prev: LastSeen = ctx
+            .snapshots
+            .get(SNAPSHOT_LAST_SEEN)
+            .await?
+            .unwrap_or_default();
         let mut last_seen = LastSeen::new();
         let now = ctx.server_now;
 
@@ -194,8 +202,9 @@ impl BranchesSource {
         current.sort_by(|a, b| (&a.repo_id, &a.ref_name).cmp(&(&b.repo_id, &b.ref_name)));
         current.dedup();
         ctx.snapshots
-            .put(SNAPSHOT_MY_BRANCHES, &MyBranches { branches: current })?;
-        ctx.snapshots.put(SNAPSHOT_LAST_SEEN, &last_seen)?;
+            .put(SNAPSHOT_MY_BRANCHES, &MyBranches { branches: current })
+            .await?;
+        ctx.snapshots.put(SNAPSHOT_LAST_SEEN, &last_seen).await?;
         Ok(PollOutcome { events })
     }
 
@@ -475,15 +484,20 @@ mod tests {
         src.poll(&c).await.map(|o| o.events)
     }
 
-    fn snapshot(ctx: &SyncContext) -> Vec<(String, String)> {
-        let s: MyBranches = ctx.snapshots.get(SNAPSHOT_MY_BRANCHES).unwrap().unwrap();
+    async fn snapshot(ctx: &SyncContext) -> Vec<(String, String)> {
+        let s: MyBranches = ctx
+            .snapshots
+            .get(SNAPSHOT_MY_BRANCHES)
+            .await
+            .unwrap()
+            .unwrap();
         s.branches
             .into_iter()
             .map(|b| (b.repo_id, b.ref_name))
             .collect()
     }
 
-    fn seed_snapshot(ctx: &SyncContext, repo_id: &str, name: &str) {
+    async fn seed_snapshot(ctx: &SyncContext, repo_id: &str, name: &str) {
         ctx.snapshots
             .put(
                 SNAPSHOT_MY_BRANCHES,
@@ -495,6 +509,7 @@ mod tests {
                     }],
                 },
             )
+            .await
             .unwrap();
     }
 
@@ -517,7 +532,7 @@ mod tests {
         let events = run(&mut source(&server), &ctx, None).await.unwrap();
         assert!(events.is_empty());
         assert_eq!(
-            snapshot(&ctx),
+            snapshot(&ctx).await,
             vec![("r1".into(), "refs/heads/mine".into())]
         );
     }
@@ -595,7 +610,7 @@ mod tests {
         )
         .await;
         let ctx = live_ctx();
-        seed_snapshot(&ctx, "r1", "gone");
+        seed_snapshot(&ctx, "r1", "gone").await;
         let events = run(&mut source(&server), &ctx, Some(at(20, 11)))
             .await
             .unwrap();
@@ -605,7 +620,7 @@ mod tests {
         assert_eq!(events[1].event_type, event_types::BRANCH_CREATED);
         assert_eq!(events[1].actor.kind, ActorKind::Me);
         assert_eq!(
-            snapshot(&ctx),
+            snapshot(&ctx).await,
             vec![("r1".into(), "refs/heads/fresh".into())]
         );
     }
@@ -627,11 +642,11 @@ mod tests {
         .await;
         serve_repo(&server, "r3", ok(vec![head("c", ME)]), ok(vec![])).await;
         let ctx = live_ctx();
-        seed_snapshot(&ctx, "r1", "kept");
+        seed_snapshot(&ctx, "r1", "kept").await;
         run(&mut source(&server), &ctx, Some(at(20, 11)))
             .await
             .unwrap();
-        let mut got = snapshot(&ctx);
+        let mut got = snapshot(&ctx).await;
         got.sort();
         assert_eq!(
             got,
@@ -656,25 +671,30 @@ mod tests {
         )
         .await;
         let ctx = live_ctx();
-        seed_snapshot(&ctx, "r1", "stale");
+        seed_snapshot(&ctx, "r1", "stale").await;
         let key = seen_key("r1", "refs/heads/stale");
         let mut seen = LastSeen::new();
         seen.insert(key.clone(), at(20, 12) - Duration::days(15));
-        ctx.snapshots.put(SNAPSHOT_LAST_SEEN, &seen).unwrap();
+        ctx.snapshots.put(SNAPSHOT_LAST_SEEN, &seen).await.unwrap();
         run(&mut source(&server), &ctx, Some(at(20, 11)))
             .await
             .unwrap();
-        assert!(snapshot(&ctx).is_empty());
+        assert!(snapshot(&ctx).await.is_empty());
 
         // Within the lookback it is still carried and its stamp is preserved.
-        seed_snapshot(&ctx, "r1", "stale");
+        seed_snapshot(&ctx, "r1", "stale").await;
         seen.insert(key.clone(), at(20, 12) - Duration::days(13));
-        ctx.snapshots.put(SNAPSHOT_LAST_SEEN, &seen).unwrap();
+        ctx.snapshots.put(SNAPSHOT_LAST_SEEN, &seen).await.unwrap();
         run(&mut source(&server), &ctx, Some(at(20, 11)))
             .await
             .unwrap();
-        assert_eq!(snapshot(&ctx).len(), 1);
-        let after: LastSeen = ctx.snapshots.get(SNAPSHOT_LAST_SEEN).unwrap().unwrap();
+        assert_eq!(snapshot(&ctx).await.len(), 1);
+        let after: LastSeen = ctx
+            .snapshots
+            .get(SNAPSHOT_LAST_SEEN)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(after[&key], seen[&key]);
     }
 
@@ -690,13 +710,18 @@ mod tests {
         )
         .await;
         let ctx = live_ctx();
-        seed_snapshot(&ctx, "r1", "gone");
+        seed_snapshot(&ctx, "r1", "gone").await;
         let events = run(&mut source(&server), &ctx, Some(at(20, 11)))
             .await
             .unwrap();
         assert_eq!(events[0].event_type, event_types::BRANCH_DELETED);
-        assert!(snapshot(&ctx).is_empty());
-        let seen: LastSeen = ctx.snapshots.get(SNAPSHOT_LAST_SEEN).unwrap().unwrap();
+        assert!(snapshot(&ctx).await.is_empty());
+        let seen: LastSeen = ctx
+            .snapshots
+            .get(SNAPSHOT_LAST_SEEN)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(seen.is_empty());
     }
 

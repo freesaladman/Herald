@@ -95,8 +95,12 @@ impl PrPoliciesSource {
     }
 
     async fn poll_inner(&self, ctx: &SyncContext) -> Result<PollOutcome, ProviderError> {
-        let tracked: TrackedPrs = ctx.snapshots.get(SNAPSHOT_TRACKED_PRS)?.unwrap_or_default();
-        let old: SeenState = ctx.snapshots.get(SNAPSHOT_SEEN)?.unwrap_or_default();
+        let tracked: TrackedPrs = ctx
+            .snapshots
+            .get(SNAPSHOT_TRACKED_PRS)
+            .await?
+            .unwrap_or_default();
+        let old: SeenState = ctx.snapshots.get(SNAPSHOT_SEEN).await?.unwrap_or_default();
 
         // Policy noise on PRs I only watch (group review, commenter, mention) is not wanted.
         let wanted: Vec<&TrackedPr> = tracked
@@ -146,7 +150,7 @@ impl PrPoliciesSource {
                 observed.into_iter().map(|o| (o.key, o.state)).collect(),
             );
         }
-        ctx.snapshots.put(SNAPSHOT_SEEN, &state)?;
+        ctx.snapshots.put(SNAPSHOT_SEEN, &state).await?;
         Ok(PollOutcome { events })
     }
 }
@@ -395,7 +399,7 @@ mod tests {
             .await;
     }
 
-    fn track(ctx: &SyncContext, role: PrRole) {
+    async fn track(ctx: &SyncContext, role: PrRole) {
         ctx.snapshots
             .put(
                 SNAPSHOT_TRACKED_PRS,
@@ -412,6 +416,7 @@ mod tests {
                     }],
                 },
             )
+            .await
             .unwrap();
     }
 
@@ -434,7 +439,7 @@ mod tests {
     ) -> Vec<Event> {
         let server = MockServer::start().await;
         let (ctx, _store) = sync_context(cfg(), me(), at(10, 0), None, false);
-        track(&ctx, PrRole::Author);
+        track(&ctx, PrRole::Author).await;
         let mut src = source(&server);
         serve(&server, ok(before.0), ok(before.1)).await;
         assert!(
@@ -453,7 +458,7 @@ mod tests {
     async fn seed_and_first_sight_are_silent_then_queued_to_approved_emits() {
         let server = MockServer::start().await;
         let (ctx, _store) = sync_context(cfg(), me(), at(10, 0), None, false);
-        track(&ctx, PrRole::Author);
+        track(&ctx, PrRole::Author).await;
         let mut src = source(&server);
         serve(
             &server,
@@ -577,7 +582,7 @@ mod tests {
     async fn repeated_failure_of_a_stable_evaluation_gets_a_new_id() {
         let server = MockServer::start().await;
         let (ctx, _store) = sync_context(cfg(), me(), at(10, 0), None, false);
-        track(&ctx, PrRole::Author);
+        track(&ctx, PrRole::Author).await;
         let mut src = source(&server);
         let run_of = |status: &str, started: DateTime<Utc>, done: Option<DateTime<Utc>>| {
             let mut v = evaluation("e1", status, done);
@@ -618,7 +623,7 @@ mod tests {
     async fn group_reviewer_prs_are_not_polled() {
         let server = MockServer::start().await;
         let (ctx, _store) = sync_context(cfg(), me(), at(10, 0), Some(at(9, 0)), false);
-        track(&ctx, PrRole::GroupReviewer);
+        track(&ctx, PrRole::GroupReviewer).await;
         let mut src = source(&server);
         serve(
             &server,
@@ -639,7 +644,7 @@ mod tests {
     async fn transient_aborts_without_writing() {
         let server = MockServer::start().await;
         let (ctx, _store) = sync_context(cfg(), me(), at(10, 0), Some(at(9, 0)), false);
-        track(&ctx, PrRole::Reviewer);
+        track(&ctx, PrRole::Reviewer).await;
         let mut src = source(&server);
         serve(&server, ResponseTemplate::new(500), ok(vec![])).await;
         let err = run(&mut src, &ctx, Some(at(9, 0)), at(10, 0))
@@ -649,6 +654,7 @@ mod tests {
         assert!(
             ctx.snapshots
                 .get::<SeenState>(SNAPSHOT_SEEN)
+                .await
                 .unwrap()
                 .is_none()
         );

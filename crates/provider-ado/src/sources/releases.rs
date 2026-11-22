@@ -83,10 +83,17 @@ impl ReleasesSource {
     }
 
     async fn poll_inner(&self, ctx: &SyncContext) -> Result<PollOutcome, ProviderError> {
-        let prev_mine: MineReleases = ctx.snapshots.get(SNAPSHOT_MINE)?.unwrap_or_default();
-        let prev_approvals: ApprovalSnapshot =
-            ctx.snapshots.get(SNAPSHOT_APPROVALS)?.unwrap_or_default();
-        let builds: MyBuilds = ctx.snapshots.get(SNAPSHOT_MY_BUILDS)?.unwrap_or_default();
+        let prev_mine: MineReleases = ctx.snapshots.get(SNAPSHOT_MINE).await?.unwrap_or_default();
+        let prev_approvals: ApprovalSnapshot = ctx
+            .snapshots
+            .get(SNAPSHOT_APPROVALS)
+            .await?
+            .unwrap_or_default();
+        let builds: MyBuilds = ctx
+            .snapshots
+            .get(SNAPSHOT_MY_BUILDS)
+            .await?
+            .unwrap_or_default();
 
         let projects = self.shared.projects().await?;
         let work: Vec<BoxFuture<'_, Result<(usize, ProjectOut), ProviderError>>> = projects
@@ -116,8 +123,8 @@ impl ReleasesSource {
         }
         let cutoff = ctx.server_now - Duration::days(RETENTION_DAYS);
         mine.releases.retain(|r| r.seen_utc >= cutoff);
-        ctx.snapshots.put(SNAPSHOT_MINE, &mine)?;
-        ctx.snapshots.put(SNAPSHOT_APPROVALS, &approvals)?;
+        ctx.snapshots.put(SNAPSHOT_MINE, &mine).await?;
+        ctx.snapshots.put(SNAPSHOT_APPROVALS, &approvals).await?;
         Ok(PollOutcome { events })
     }
 
@@ -597,17 +604,17 @@ mod tests {
         src.poll(&c).await.map(|o| o.events)
     }
 
-    fn with_my_build(ctx: &SyncContext, id: i64) {
+    async fn with_my_build(ctx: &SyncContext, id: i64) {
         let mut b = MyBuilds::default();
         b.insert(id, ctx.server_now);
-        ctx.snapshots.put(SNAPSHOT_MY_BUILDS, &b).unwrap();
+        ctx.snapshots.put(SNAPSHOT_MY_BUILDS, &b).await.unwrap();
     }
 
-    fn mine(ctx: &SyncContext) -> MineReleases {
-        ctx.snapshots.get(SNAPSHOT_MINE).unwrap().unwrap()
+    async fn mine(ctx: &SyncContext) -> MineReleases {
+        ctx.snapshots.get(SNAPSHOT_MINE).await.unwrap().unwrap()
     }
 
-    fn track_release_1(ctx: &SyncContext) {
+    async fn track_release_1(ctx: &SyncContext) {
         let tracked = MineReleases {
             releases: vec![MineRelease {
                 id: 1,
@@ -615,7 +622,7 @@ mod tests {
                 seen_utc: at(19, 0),
             }],
         };
-        ctx.snapshots.put(SNAPSHOT_MINE, &tracked).unwrap();
+        ctx.snapshots.put(SNAPSHOT_MINE, &tracked).await.unwrap();
     }
 
     #[tokio::test]
@@ -637,8 +644,13 @@ mod tests {
         let ctx = live_ctx();
         let events = run(&mut source(&server), &ctx, None).await.unwrap();
         assert!(events.is_empty());
-        assert_eq!(mine(&ctx).releases.len(), 1);
-        let a: ApprovalSnapshot = ctx.snapshots.get(SNAPSHOT_APPROVALS).unwrap().unwrap();
+        assert_eq!(mine(&ctx).await.releases.len(), 1);
+        let a: ApprovalSnapshot = ctx
+            .snapshots
+            .get(SNAPSHOT_APPROVALS)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(a.pending.len(), 1);
     }
 
@@ -657,7 +669,7 @@ mod tests {
         )
         .await;
         let ctx = live_ctx();
-        with_my_build(&ctx, 77);
+        with_my_build(&ctx, 77).await;
         let mut src = source(&server);
         let events = run(&mut src, &ctx, Some(at(20, 11))).await.unwrap();
         let got: Vec<&str> = events.iter().map(|e| e.id.as_str()).collect();
@@ -702,7 +714,7 @@ mod tests {
         )
         .await;
         let ctx = live_ctx();
-        track_release_1(&ctx);
+        track_release_1(&ctx).await;
         let events = run(&mut source(&server), &ctx, Some(at(20, 11)))
             .await
             .unwrap();
@@ -739,7 +751,7 @@ mod tests {
         bare["lastModifiedOn"] = Value::Null;
         serve(&server, vec![], vec![canceled, bare], vec![]).await;
         let ctx = live_ctx();
-        track_release_1(&ctx);
+        track_release_1(&ctx).await;
         let events = run(&mut source(&server), &ctx, Some(at(20, 11)))
             .await
             .unwrap();
@@ -816,7 +828,12 @@ mod tests {
             .await
             .unwrap();
         assert!(events.is_empty());
-        let a: ApprovalSnapshot = ctx.snapshots.get(SNAPSHOT_APPROVALS).unwrap().unwrap();
+        let a: ApprovalSnapshot = ctx
+            .snapshots
+            .get(SNAPSHOT_APPROVALS)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(a.pending.len(), 1);
     }
 
@@ -833,11 +850,11 @@ mod tests {
         let seeded = MineReleases {
             releases: vec![old(1, 10), old(2, 31)],
         };
-        ctx.snapshots.put(SNAPSHOT_MINE, &seeded).unwrap();
+        ctx.snapshots.put(SNAPSHOT_MINE, &seeded).await.unwrap();
         run(&mut source(&server), &ctx, Some(at(20, 11)))
             .await
             .unwrap();
-        let ids: Vec<i64> = mine(&ctx).releases.iter().map(|r| r.id).collect();
+        let ids: Vec<i64> = mine(&ctx).await.releases.iter().map(|r| r.id).collect();
         assert_eq!(ids, [1]);
     }
 

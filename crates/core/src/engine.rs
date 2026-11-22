@@ -68,7 +68,7 @@ pub enum EngineError {}
 
 pub struct Engine {
     bus: Arc<Bus>,
-    store: Arc<Store>,
+    store: Arc<dyn Store>,
     secrets: Arc<dyn SecretStore>,
     registry: Arc<ProviderRegistry>,
     paths: Paths,
@@ -186,7 +186,7 @@ async fn apply_reload(scheduler: &Scheduler, old: &Config, new: &Config) {
         // The old state must be gone before prepare: both would share one id.
         scheduler.stop_connection(id).await;
         if cfg.enabled {
-            let prepared = scheduler.prepare(cfg.clone(), false);
+            let prepared = scheduler.prepare(cfg.clone(), false).await;
             scheduler.launch(prepared);
         }
     }
@@ -198,7 +198,7 @@ impl Engine {
     /// lazily in their tier tasks and the local index is built in the background.
     pub async fn start(
         config: Config,
-        store: Arc<Store>,
+        store: Arc<dyn Store>,
         registry: Arc<ProviderRegistry>,
         secrets: Arc<dyn SecretStore>,
         paths: Paths,
@@ -224,13 +224,16 @@ impl Engine {
         let hooks = HookRunner::start(&bus, store.clone(), paths.clone(), config_tx.subscribe());
         let initial = config_rx.borrow().clone();
         let initial_port = initial.stream.port;
-        let scheduler = Arc::new(Scheduler::start(
-            bus.clone(),
-            store.clone(),
-            registry.clone(),
-            secrets.clone(),
-            config_rx,
-        ));
+        let scheduler = Arc::new(
+            Scheduler::start(
+                bus.clone(),
+                store.clone(),
+                registry.clone(),
+                secrets.clone(),
+                config_rx,
+            )
+            .await,
+        );
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let server = match StreamServer::start(
             bus.clone(),
@@ -285,7 +288,7 @@ impl Engine {
         self.bus.clone()
     }
 
-    pub fn store(&self) -> Arc<Store> {
+    pub fn store(&self) -> Arc<dyn Store> {
         self.store.clone()
     }
 
@@ -441,6 +444,7 @@ mod tests {
     use crate::event::event_types;
     use crate::provider::{AuthState, ProviderFactory, Tier};
     use crate::secrets::MemorySecretStore;
+    use crate::store::SqliteStore;
     use crate::testing::{FakeProvider, FakeProviderFactory};
     use std::time::Duration;
 
@@ -463,7 +467,7 @@ mod tests {
         )]));
         let engine = Engine::start(
             config,
-            Arc::new(Store::open_in_memory().unwrap()),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
             registry,
             Arc::new(MemorySecretStore::new()),
             paths.clone(),
@@ -505,7 +509,7 @@ mod tests {
         };
         let engine = Engine::start(
             config,
-            Arc::new(Store::open_in_memory().unwrap()),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
             Arc::new(ProviderRegistry::new(vec![Arc::new(
                 FakeProviderFactory::new(fake.clone()),
             )])),
@@ -709,7 +713,7 @@ mod tests {
         };
         Engine::start(
             config,
-            Arc::new(Store::open_in_memory().unwrap()),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
             Arc::new(ProviderRegistry::new(factories)),
             Arc::new(MemorySecretStore::new()),
             paths,
@@ -987,7 +991,7 @@ mod tests {
         };
         let engine = Engine::start(
             config_of(&[("c1", "ka", "1")]),
-            Arc::new(Store::open_in_memory().unwrap()),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
             Arc::new(ProviderRegistry::new(vec![Arc::new(SecretProbe {
                 inner: FakeProviderFactory::with_kind(fake.clone(), "ka"),
                 seen: seen.clone(),

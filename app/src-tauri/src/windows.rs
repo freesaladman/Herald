@@ -8,7 +8,7 @@ use tauri::{
     AppHandle, LogicalSize, Manager, Monitor, PhysicalPosition, WebviewWindow, WindowEvent,
 };
 
-use crate::EngineHandle;
+use crate::ui_state::{PANE_SIZE_KEY, UiStateCache};
 
 const PANE: &str = "pane";
 const TOAST: &str = "toast";
@@ -19,8 +19,6 @@ const PANE_WIDTH_FRACTION: f64 = 0.182;
 const PANE_HEIGHT_FRACTION: f64 = 0.417;
 const TOGGLE_DEBOUNCE: Duration = Duration::from_millis(300);
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(500);
-const PANE_SIZE_KEY: &str = "pane_size";
-const PINNED_KEY: &str = "pinned";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Rect {
@@ -143,17 +141,8 @@ fn place(win: &WebviewWindow, monitor: &Monitor, size: (f64, f64)) {
     }
 }
 
-fn engine_store(app: &AppHandle) -> Option<std::sync::Arc<herald_core::store::Store>> {
-    Some(app.try_state::<EngineHandle>()?.get()?.store())
-}
-
 fn saved_pane_size(app: &AppHandle) -> Option<(f64, f64)> {
-    parse_size(
-        &engine_store(app)?
-            .get_ui_state(PANE_SIZE_KEY)
-            .ok()
-            .flatten()?,
-    )
+    parse_size(&app.try_state::<UiStateCache>()?.get(PANE_SIZE_KEY)?)
 }
 
 pub fn show_pane(app: &AppHandle) {
@@ -229,10 +218,7 @@ fn on_pane_event(app: &AppHandle, event: &WindowEvent) {
 }
 
 fn blur_hide(app: &AppHandle) {
-    let pinned = engine_store(app)
-        .and_then(|s| s.get_ui_state(PINNED_KEY).ok().flatten())
-        .is_some_and(|v| v == "true");
-    if pinned {
+    if app.try_state::<UiStateCache>().is_some_and(|c| c.pinned()) {
         return;
     }
     *lock(&app.state::<PaneState>().last_blur_hide) = Some(Instant::now());
@@ -273,11 +259,8 @@ fn persist_pane_size(app: &AppHandle) {
     if applied.is_some_and(|a| (a.0 - logical.0).abs() < 1.5 && (a.1 - logical.1).abs() < 1.5) {
         return;
     }
-    let Some(store) = engine_store(app) else {
-        return;
-    };
-    if let Err(e) = store.set_ui_state(PANE_SIZE_KEY, &format_size(logical)) {
-        tracing::warn!(error = %e, "saving pane size failed");
+    if let Some(cache) = app.try_state::<UiStateCache>() {
+        cache.set(PANE_SIZE_KEY, &format_size(logical));
     }
 }
 

@@ -3,6 +3,7 @@
 //! build.rs lists every command in the app manifest, so each window may call only what its
 //! capability grants (capabilities/default.json for the pane, toast.json for the toast).
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -19,16 +20,14 @@ use herald_core::scheduler::ConnectionStatus;
 use herald_core::secrets::SecretStore;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
+use crate::ui_state::{MUTED_KEY, PINNED_KEY, SNOOZE_KEY, UiStateCache};
 use crate::{
     CONFIG_FILE, EngineHandle, UiErrors, build_registry, reload_config_if_changed, windows,
 };
 
 const UNVIEWED_LIMIT: u32 = 200;
-const PINNED_KEY: &str = "pinned";
-const MUTED_KEY: &str = "muted";
-const SNOOZE_KEY: &str = "snoozed_until_utc";
 pub const EVENT_UNVIEWED_CHANGED: &str = "herald://unviewed-changed";
 pub const EVENT_UI_STATE: &str = "herald://ui-state";
 const MAX_MARK_VIEWED: usize = 1000;
@@ -157,34 +156,97 @@ fn engine(handle: &EngineHandle) -> Result<Arc<Engine>, String> {
 
 fn ui_state(app: &AppHandle) -> Option<UiState> {
     let engine = app.try_state::<EngineHandle>()?.get()?;
-    let store = engine.store();
-    let get = |key| store.get_ui_state(key).ok().flatten();
+    let cache = app.try_state::<UiStateCache>()?;
     let errors = app
         .try_state::<Mutex<UiErrors>>()?
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
     Some(assemble_ui_state(
-        get(PINNED_KEY).as_deref(),
-        get(MUTED_KEY).as_deref(),
-        get(SNOOZE_KEY).as_deref(),
+        cache.get(PINNED_KEY).as_deref(),
+        cache.get(MUTED_KEY).as_deref(),
+        cache.get(SNOOZE_KEY).as_deref(),
         Utc::now(),
         engine.connections(),
         &errors,
     ))
 }
 
+/// Asks the refresher to re-read the unviewed count and emit it. Never blocks.
 pub fn emit_unviewed_changed(app: &AppHandle) {
-    let Some(engine) = app.try_state::<EngineHandle>().and_then(|h| h.get()) else {
-        return;
-    };
-    match engine.store().unviewed_count() {
-        Ok(n) => {
-            if let Err(e) = app.emit(EVENT_UNVIEWED_CHANGED, n) {
-                tracing::warn!(error = %e, "emit unviewed-changed failed");
-            }
+    if let Some(r) = app.try_state::<UnviewedRefresher>() {
+        r.signal();
+    }
+}
+
+/// One task owns count queries and emits, so badge counts never arrive out of order.
+/// Signals that land while a query runs coalesce into one more query (latest wins).
+pub struct UnviewedRefresher {
+    notify: Arc<Notify>,
+    task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+}
+
+impl UnviewedRefresher {
+    /// Emits the current count once at start, then once per burst of signals.
+    pub fn spawn(app: &AppHandle) -> Self {
+        let notify = Arc::new(Notify::new());
+        notify.notify_one();
+        let count_app = app.clone();
+        let emit_app = app.clone();
+        let handle = tauri::async_runtime::spawn(refresh_loop(
+            notify.clone(),
+            move || {
+                let app = count_app.clone();
+                async move {
+                    let store = app.try_state::<EngineHandle>()?.get()?.store();
+                    match store.unviewed_count().await {
+                        Ok(n) => Some(n),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "unviewed count failed");
+                            None
+                        }
+                    }
+                }
+            },
+            move |n| {
+                if let Err(e) = emit_app.emit(EVENT_UNVIEWED_CHANGED, n) {
+                    tracing::warn!(error = %e, "emit unviewed-changed failed");
+                }
+            },
+        ));
+        Self {
+            notify,
+            task: Mutex::new(Some(handle)),
         }
-        Err(e) => tracing::warn!(error = %e, "unviewed count failed"),
+    }
+
+    pub fn signal(&self) {
+        self.notify.notify_one();
+    }
+
+    pub fn abort(&self) {
+        if let Some(h) = self
+            .task
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            h.abort();
+        }
+    }
+}
+
+async fn refresh_loop<C, Fut, E>(notify: Arc<Notify>, count: C, emit: E)
+where
+    C: Fn() -> Fut,
+    Fut: Future<Output = Option<u32>>,
+    E: Fn(u32),
+{
+    loop {
+        notify.notified().await;
+        if let Some(n) = count().await {
+            emit(n);
+        }
     }
 }
 
@@ -225,23 +287,25 @@ impl StatusWatcher {
 }
 
 #[tauri::command]
-pub fn list_unviewed(engine_h: State<'_, EngineHandle>) -> Result<Vec<Event>, String> {
+pub async fn list_unviewed(engine_h: State<'_, EngineHandle>) -> Result<Vec<Event>, String> {
     engine(&engine_h)?
         .store()
         .unviewed(UNVIEWED_LIMIT)
+        .await
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn unviewed_count(engine_h: State<'_, EngineHandle>) -> Result<u32, String> {
+pub async fn unviewed_count(engine_h: State<'_, EngineHandle>) -> Result<u32, String> {
     engine(&engine_h)?
         .store()
         .unviewed_count()
+        .await
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn mark_viewed(
+pub async fn mark_viewed(
     app: AppHandle,
     engine_h: State<'_, EngineHandle>,
     ids: Vec<String>,
@@ -252,23 +316,28 @@ pub fn mark_viewed(
     engine(&engine_h)?
         .store()
         .mark_viewed(&ids)
+        .await
         .map_err(|e| e.to_string())?;
     emit_unviewed_changed(&app);
     Ok(())
 }
 
 #[tauri::command]
-pub fn mark_all_viewed(app: AppHandle, engine_h: State<'_, EngineHandle>) -> Result<(), String> {
+pub async fn mark_all_viewed(
+    app: AppHandle,
+    engine_h: State<'_, EngineHandle>,
+) -> Result<(), String> {
     engine(&engine_h)?
         .store()
         .mark_all_viewed()
+        .await
         .map_err(|e| e.to_string())?;
     emit_unviewed_changed(&app);
     Ok(())
 }
 
 #[tauri::command]
-pub fn activate_record(
+pub async fn activate_record(
     app: AppHandle,
     engine_h: State<'_, EngineHandle>,
     id: String,
@@ -277,12 +346,13 @@ pub fn activate_record(
     let store = engine.store();
     let original = store
         .get_event(&id)
+        .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "That record no longer exists".to_string())?;
     engine
         .bus()
         .publish_transient(build_activated(&original, Utc::now()));
-    store.mark_viewed(&[id]).map_err(|e| e.to_string())?;
+    store.mark_viewed(&[id]).await.map_err(|e| e.to_string())?;
     emit_unviewed_changed(&app);
     Ok(())
 }
@@ -295,13 +365,10 @@ pub fn get_ui_state(app: AppHandle) -> Result<UiState, String> {
 #[tauri::command]
 pub fn set_pinned(
     app: AppHandle,
-    engine_h: State<'_, EngineHandle>,
+    cache: State<'_, UiStateCache>,
     pinned: bool,
 ) -> Result<(), String> {
-    engine(&engine_h)?
-        .store()
-        .set_ui_state(PINNED_KEY, if pinned { "true" } else { "false" })
-        .map_err(|e| e.to_string())?;
+    cache.set_flag(PINNED_KEY, pinned);
     emit_ui_state(&app);
     Ok(())
 }
@@ -659,6 +726,45 @@ mod tests {
     use chrono::TimeZone;
     use herald_core::event::{ConnectionRef, LocalPaths, PrRef, PrRole, RepoRef, RunRef};
     use herald_core::secrets::MemorySecretStore;
+
+    #[tokio::test]
+    async fn refresher_coalesces_signals_and_emits_the_latest_count() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let notify = Arc::new(Notify::new());
+        let count = Arc::new(AtomicU32::new(0));
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let source = count.clone();
+        let task = tokio::spawn(refresh_loop(
+            notify.clone(),
+            move || {
+                let n = source.load(Ordering::SeqCst);
+                async move { Some(n) }
+            },
+            move |n| {
+                let _ = out_tx.send(n);
+            },
+        ));
+        // The count moves 1..=5 with a signal each time, before the task gets to run.
+        for n in 1..=5 {
+            count.store(n, Ordering::SeqCst);
+            notify.notify_one();
+        }
+        let first = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, 5);
+        count.store(7, Ordering::SeqCst);
+        notify.notify_one();
+        let next = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next, 7);
+        assert!(out_rx.try_recv().is_err());
+        task.abort();
+    }
 
     #[test]
     fn ensure_known_connection_rejects_unconfigured_ids() {

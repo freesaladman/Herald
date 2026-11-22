@@ -4,7 +4,6 @@ use std::sync::{Mutex, PoisonError};
 
 use chrono::{DateTime, Duration, Local, NaiveTime, SecondsFormat, TimeZone, Utc};
 use herald_core::provider::AuthState;
-use herald_core::store::Store;
 use image::{Pixel, Rgba, RgbaImage};
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
@@ -15,11 +14,10 @@ use tauri_plugin_opener::OpenerExt as _;
 use tokio::sync::watch;
 
 use crate::theme::{self, TaskbarTheme};
+use crate::ui_state::{MUTED_KEY, SNOOZE_KEY, UiStateCache};
 use crate::{EngineHandle, commands, windows};
 
 const TRAY_ID: &str = "herald";
-const SNOOZE_KEY: &str = "snoozed_until_utc";
-const MUTED_KEY: &str = "muted";
 const ACCENT: [u8; 3] = [0x3B, 0x82, 0xF6];
 const AMBER: [u8; 3] = [0xF5, 0xA5, 0x24];
 const DOT_DIAMETER: f32 = 0.35;
@@ -188,15 +186,9 @@ pub struct TrayState {
     task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
 }
 
-fn store_of(app: &AppHandle) -> Option<std::sync::Arc<Store>> {
-    Some(app.try_state::<EngineHandle>()?.get()?.store())
-}
-
-fn write_ui_state(app: &AppHandle, key: &str, value: &str) {
-    if let Some(store) = store_of(app)
-        && let Err(e) = store.set_ui_state(key, value)
-    {
-        tracing::warn!(error = %e, key, "saving ui state failed");
+fn write_ui_state(app: &AppHandle, key: &'static str, value: &str) {
+    if let Some(cache) = app.try_state::<UiStateCache>() {
+        cache.set(key, value);
     }
     commands::emit_ui_state(app);
     refresh_menu(app);
@@ -206,18 +198,14 @@ fn refresh_menu(app: &AppHandle) {
     let Some(state) = app.try_state::<TrayState>() else {
         return;
     };
-    let store = store_of(app);
-    let get = |key| {
-        store
-            .as_ref()
-            .and_then(|s| s.get_ui_state(key).ok().flatten())
-    };
+    let cache = app.try_state::<UiStateCache>();
     let _ = state
         .mute
-        .set_checked(get(MUTED_KEY).as_deref() == Some("true"));
+        .set_checked(cache.as_ref().is_some_and(|c| c.muted()));
+    let snoozed = cache.as_ref().and_then(|c| c.get(SNOOZE_KEY));
     let _ = state
         .resume
-        .set_enabled(is_snoozed(get(SNOOZE_KEY).as_deref(), Utc::now()));
+        .set_enabled(is_snoozed(snoozed.as_deref(), Utc::now()));
     let autostart = app.autolaunch().is_enabled().unwrap_or(false);
     let _ = state.autostart.set_checked(autostart);
 }
@@ -231,10 +219,7 @@ fn snooze(app: &AppHandle, choice: SnoozeChoice) {
 }
 
 fn toggle_mute(app: &AppHandle) {
-    let muted = store_of(app)
-        .and_then(|s| s.get_ui_state(MUTED_KEY).ok().flatten())
-        .as_deref()
-        == Some("true");
+    let muted = app.try_state::<UiStateCache>().is_some_and(|c| c.muted());
     write_ui_state(app, MUTED_KEY, if muted { "false" } else { "true" });
 }
 
@@ -369,11 +354,8 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         })
         .build(app)?;
 
-    let (unviewed_tx, unviewed_rx) = watch::channel(
-        store_of(app)
-            .and_then(|s| s.unviewed_count().ok())
-            .unwrap_or(0),
-    );
+    // The refresher emits the real count once the listener below exists.
+    let (unviewed_tx, unviewed_rx) = watch::channel(0);
     app.listen(commands::EVENT_UNVIEWED_CHANGED, move |ev| {
         if let Ok(n) = serde_json::from_str::<u32>(ev.payload()) {
             let _ = unviewed_tx.send(n);
@@ -438,8 +420,9 @@ fn spawn_updater(
                 ui_rx.borrow_and_update();
             }
             dirty = true;
-            let snoozed_until =
-                store_of(&app).and_then(|s| s.get_ui_state(SNOOZE_KEY).ok().flatten());
+            let snoozed_until = app
+                .try_state::<UiStateCache>()
+                .and_then(|c| c.get(SNOOZE_KEY));
             let wake = snooze_remaining(snoozed_until.as_deref(), Utc::now())
                 .map(|d| tokio::time::Instant::now() + d);
             tokio::select! {

@@ -8,12 +8,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Local, NaiveDate, TimeDelta, TimeZone, Utc};
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 use futures_util::{SinkExt, Stream, StreamExt};
 use herald_core::config::{Config, ConfigError, ConnectionConfig, DB_FILE, Paths};
+use herald_core::event::Event;
 use herald_core::provider::ProviderRegistry;
 use herald_core::secrets::{KeyringSecretStore, SecretStore};
-use herald_core::store::Store;
+use herald_core::store::{SqliteStore, Store};
 use herald_provider_ado::AdoProviderFactory;
 use serde_json::{Map, Value, json};
 use tokio_tungstenite::tungstenite::Message;
@@ -50,6 +51,9 @@ enum Command {
         /// Skip events replayed from a catch-up poll.
         #[arg(long)]
         no_catch_up: bool,
+        /// Replay stored events with a seq above this one, then continue live.
+        #[arg(long)]
+        after: Option<u64>,
         /// Print raw event JSON, one per line.
         #[arg(long)]
         json: bool,
@@ -74,10 +78,14 @@ enum Command {
         sets: Vec<String>,
     },
     /// List stored events, oldest first.
+    #[command(group(ArgGroup::new("from").required(true).multiple(false).args(["since", "after"])))]
     Events {
         /// RFC3339 timestamp, a date (YYYY-MM-DD, UTC midnight) or a duration like 30m, 2h, 7d.
         #[arg(long)]
-        since: String,
+        since: Option<String>,
+        /// List events with a seq above this one.
+        #[arg(long)]
+        after: Option<u64>,
         #[arg(long, default_value_t = 200)]
         limit: u32,
         #[arg(long)]
@@ -145,8 +153,18 @@ async fn run(command: Command) -> Result<()> {
             types,
             matches,
             no_catch_up,
+            after,
             json,
-        } => tail(&paths, types, build_match(&matches)?, !no_catch_up, json).await,
+        } => {
+            let opts = TailOptions {
+                types,
+                matches: build_match(&matches)?,
+                include_catch_up: !no_catch_up,
+                after,
+                json_out: json,
+            };
+            tail(&paths, opts).await
+        }
         Command::EmitTest {
             event_type,
             title,
@@ -169,7 +187,19 @@ async fn run(command: Command) -> Result<()> {
             };
             emit_test(&paths, build_emit_event(&args)?).await
         }
-        Command::Events { since, limit, json } => events(&paths, &since, limit, json),
+        Command::Events {
+            since,
+            after,
+            limit,
+            json,
+        } => {
+            let from = match (since, after) {
+                (Some(since), None) => EventsFrom::Since(parse_since(&since, Utc::now())?),
+                (None, Some(seq)) => EventsFrom::After(seq),
+                _ => bail!("pass exactly one of --since or --after"),
+            };
+            events(&paths, from, limit, json).await
+        }
         Command::Auth { action } => match action {
             AuthAction::Set { connection } => auth_set(&paths, connection.as_deref()).await,
             AuthAction::Test { connection } => auth_test(&paths, connection.as_deref()).await,
@@ -301,21 +331,54 @@ fn expect_ok(reply: Value) -> Result<Value> {
 
 // ---- tail ----
 
-async fn tail(
-    paths: &Paths,
+struct TailOptions {
     types: Vec<String>,
     matches: Map<String, Value>,
     include_catch_up: bool,
+    after: Option<u64>,
     json_out: bool,
-) -> Result<()> {
-    let mut ws = connect(paths).await?;
-    let subscribe = json!({
+}
+
+fn subscribe_message(opts: &TailOptions) -> Value {
+    let mut msg = json!({
         "type": "subscribe",
-        "types": types,
-        "match": matches,
-        "includeCatchUp": include_catch_up,
+        "types": opts.types,
+        "match": opts.matches,
+        "includeCatchUp": opts.include_catch_up,
     });
-    expect_ok(request_reply(&mut ws, &subscribe).await?)?;
+    if let Some(after) = opts.after {
+        msg["afterSeq"] = json!(after);
+    }
+    msg
+}
+
+/// Human line for replay notices. These go to stderr so `--json` stdout stays events only.
+fn notice_line(msg: &Value) -> Option<String> {
+    let num = |k: &str| msg.get(k).and_then(Value::as_u64).unwrap_or(0);
+    match msg.get("type").and_then(Value::as_str)? {
+        "overflow" => {
+            let through = num("replayedThrough");
+            Some(format!(
+                "replay overflow: replayed through {through}, latest {}; run `herald events --after {through}` to fill the gap",
+                num("latestSeq")
+            ))
+        }
+        "reset" => Some(format!(
+            "replay reset: the store changed, latest seq is {}; discard any saved position",
+            num("latestSeq")
+        )),
+        _ => None,
+    }
+}
+
+async fn tail(paths: &Paths, opts: TailOptions) -> Result<()> {
+    let json_out = opts.json_out;
+    let mut ws = connect(paths).await?;
+    let reply = expect_ok(request_reply(&mut ws, &subscribe_message(&opts)).await?)?;
+    if let Some(after) = opts.after {
+        let num = |k: &str| reply.get(k).and_then(Value::as_u64).unwrap_or(0);
+        eprintln!("replaying after seq {after}, latest {}", num("latestSeq"));
+    }
     let stdout = std::io::stdout();
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
@@ -341,6 +404,11 @@ async fn tail(
                 writeln!(out, "{line}")?;
                 out.flush()?;
             }
+            Some("overflow" | "reset") => {
+                if let Some(line) = notice_line(&msg) {
+                    eprintln!("{line}");
+                }
+            }
             Some("error") => {
                 let text = msg
                     .get("message")
@@ -353,7 +421,7 @@ async fn tail(
     }
 }
 
-/// `HH:MM:SS  type  title  url` in the given zone; url omitted when absent.
+/// `[seq  ]HH:MM:SS  type  title  url` in the given zone; seq and url omitted when absent.
 fn format_line<Tz>(event: &Value, tz: &Tz) -> String
 where
     Tz: TimeZone,
@@ -363,7 +431,11 @@ where
     let time = DateTime::parse_from_rfc3339(field("occurredUtc"))
         .map(|t| t.with_timezone(tz).format("%H:%M:%S").to_string())
         .unwrap_or_else(|_| "--:--:--".to_string());
-    let mut line = format!("{time}  {}  {}", field("type"), field("title"));
+    let mut line = String::new();
+    if let Some(seq) = event.get("seq").and_then(Value::as_u64) {
+        line.push_str(&format!("{seq}  "));
+    }
+    line.push_str(&format!("{time}  {}  {}", field("type"), field("title")));
     let url = field("url");
     if !url.is_empty() {
         line.push_str("  ");
@@ -475,17 +547,38 @@ async fn emit_test(paths: &Paths, event: Value) -> Result<()> {
 
 // ---- events ----
 
-fn events(paths: &Paths, since: &str, limit: u32, json_out: bool) -> Result<()> {
-    let since = parse_since(since, Utc::now())?;
+enum EventsFrom {
+    Since(DateTime<Utc>),
+    After(u64),
+}
+
+impl EventsFrom {
+    fn describe(&self) -> String {
+        match self {
+            Self::Since(t) => format!("since {}", t.to_rfc3339()),
+            Self::After(seq) => format!("after seq {seq}"),
+        }
+    }
+}
+
+async fn query_events(store: &dyn Store, from: &EventsFrom, limit: u32) -> Result<Vec<Event>> {
+    Ok(match from {
+        EventsFrom::Since(t) => store.events_since(*t, limit).await?,
+        EventsFrom::After(seq) => store.events_after_seq(*seq, limit).await?,
+    })
+}
+
+async fn events(paths: &Paths, from: EventsFrom, limit: u32, json_out: bool) -> Result<()> {
     let db = paths.home.join(DB_FILE);
     if !db.exists() {
         eprintln!("no events (no database at {})", db.display());
         return Ok(());
     }
-    let store = Store::open_read_only(&db).context("opening the event database")?;
-    let found = store.events_since(since, limit)?;
+    let store: Arc<dyn Store> =
+        Arc::new(SqliteStore::open_read_only(&db).context("opening the event database")?);
+    let found = query_events(store.as_ref(), &from, limit).await?;
     if found.is_empty() {
-        eprintln!("no events since {}", since.to_rfc3339());
+        eprintln!("no events {}", from.describe());
         return Ok(());
     }
     let hit_limit = found.len() >= limit as usize;
@@ -837,6 +930,97 @@ mod tests {
             format_line(&event, &Utc),
             "09:05:03  run.completed  Build failed  https://example.com/r/1"
         );
+    }
+
+    #[test]
+    fn format_line_leads_with_seq_when_present() {
+        let event = json!({
+            "seq": 42,
+            "occurredUtc": "2026-01-10T09:05:03Z",
+            "type": "run.completed",
+            "title": "Build failed",
+        });
+        assert_eq!(
+            format_line(&event, &Utc),
+            "42  09:05:03  run.completed  Build failed"
+        );
+    }
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("herald").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn events_requires_exactly_one_of_since_and_after() {
+        assert!(parse(&["events"]).is_err());
+        assert!(parse(&["events", "--since", "1h", "--after", "5"]).is_err());
+        assert!(parse(&["events", "--since", "1h"]).is_ok());
+        let cli = parse(&["events", "--after", "5", "--limit", "10"]).unwrap();
+        let Command::Events {
+            since,
+            after,
+            limit,
+            ..
+        } = cli.command
+        else {
+            panic!("expected events");
+        };
+        assert_eq!((since, after, limit), (None, Some(5), 10));
+    }
+
+    #[test]
+    fn tail_after_is_sent_as_after_seq_in_subscribe() {
+        let cli = parse(&["tail", "--after", "120"]).unwrap();
+        let Command::Tail { after, .. } = cli.command else {
+            panic!("expected tail");
+        };
+        let mut opts = TailOptions {
+            types: vec![],
+            matches: Map::new(),
+            include_catch_up: true,
+            after,
+            json_out: true,
+        };
+        assert_eq!(subscribe_message(&opts)["afterSeq"], 120);
+        opts.after = None;
+        assert!(subscribe_message(&opts).get("afterSeq").is_none());
+    }
+
+    #[test]
+    fn notice_line_describes_overflow_and_reset_and_ignores_events() {
+        let overflow =
+            notice_line(&json!({"type":"overflow","replayedThrough":1234,"latestSeq":9876}))
+                .unwrap();
+        assert!(overflow.contains("replayed through 1234, latest 9876"));
+        assert!(overflow.contains("herald events --after 1234"));
+        let reset = notice_line(&json!({"type":"reset","latestSeq":7,"storeId":"s"})).unwrap();
+        assert!(reset.contains("latest seq is 7"));
+        assert!(notice_line(&json!({"type":"event","event":{}})).is_none());
+    }
+
+    #[tokio::test]
+    async fn query_events_after_returns_only_later_events_with_seq() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let now = Utc::now();
+        for id in ["a", "b", "c"] {
+            let conn = herald_core::event::ConnectionRef {
+                id: "c".into(),
+                provider: "p".into(),
+            };
+            let e = Event::new(conn, "pr.created", now, now, "t", "c:pr:1:1").with_id(id);
+            store.insert_event_if_new(&e).await.unwrap();
+        }
+        let all = query_events(&store, &EventsFrom::After(0), 10)
+            .await
+            .unwrap();
+        let first = all[0].seq.unwrap();
+        let rest = query_events(&store, &EventsFrom::After(first), 1)
+            .await
+            .unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].id, "b");
+        let value = serde_json::to_value(&rest[0]).unwrap();
+        assert_eq!(value["seq"], rest[0].seq.unwrap());
     }
 
     #[test]

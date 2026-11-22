@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
+use futures_util::future::BoxFuture;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Semaphore, broadcast, oneshot, watch};
@@ -31,7 +32,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 60;
 const SNOOZE_KEY: &str = "snoozed_until_utc";
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(8);
 const DEBOUNCE_PRUNE_AT: usize = 1024;
-type Recorder = Arc<dyn Fn(HookRun) + Send + Sync>;
+type Recorder = Arc<dyn Fn(HookRun) -> BoxFuture<'static, ()> + Send + Sync>;
 type RunKey = (String, String);
 type CompiledHooks = Vec<(HookConfig, CompiledHookFilter)>;
 
@@ -45,7 +46,7 @@ impl HookRunner {
     /// Subscribes to the bus before returning, so no event published after this call is missed.
     pub fn start(
         bus: &Bus,
-        store: Arc<Store>,
+        store: Arc<dyn Store>,
         paths: Paths,
         config: watch::Receiver<Arc<Config>>,
     ) -> Self {
@@ -53,9 +54,13 @@ impl HookRunner {
         let recorder: Recorder = {
             let store = store.clone();
             Arc::new(move |run| {
-                if let Err(e) = store.record_hook_run(run) {
-                    tracing::error!(error = %e, "could not record hook run");
+                let store = store.clone();
+                async move {
+                    if let Err(e) = store.record_hook_run(run).await {
+                        tracing::error!(error = %e, "could not record hook run");
+                    }
                 }
+                .boxed()
             })
         };
         let shared = Arc::new(Shared::new(store, paths, recorder));
@@ -104,8 +109,10 @@ async fn run_loop(
             _ = &mut stop => break,
             received = rx.recv() => match received {
                 Ok(event) => {
+                    // Read before dispatch, which must stay sync to claim debounce slots atomically.
+                    let snoozed = hooks.iter().any(|(h, _)| h.respect_snooze) && shared.snoozed().await;
                     let dispatched = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                        shared.dispatch(&hooks, &event)
+                        shared.dispatch(&hooks, &event, snoozed)
                     }));
                     let Ok(jobs) = dispatched else {
                         tracing::error!(event = %event.id, "hook dispatch panicked");
@@ -164,7 +171,7 @@ struct RunState {
 }
 
 struct Shared {
-    store: Arc<Store>,
+    store: Arc<dyn Store>,
     paths: Paths,
     record: Recorder,
     permits: Semaphore,
@@ -213,7 +220,7 @@ struct Job {
 }
 
 impl Shared {
-    fn new(store: Arc<Store>, paths: Paths, record: Recorder) -> Self {
+    fn new(store: Arc<dyn Store>, paths: Paths, record: Recorder) -> Self {
         Self {
             store,
             paths,
@@ -232,8 +239,8 @@ impl Shared {
         self.paths.home.join("tmp")
     }
 
-    fn snoozed(&self) -> bool {
-        let until = match self.store.get_ui_state(SNOOZE_KEY) {
+    async fn snoozed(&self) -> bool {
+        let until = match self.store.get_ui_state(SNOOZE_KEY).await {
             Ok(Some(v)) => v,
             Ok(None) => return false,
             Err(e) => {
@@ -246,7 +253,13 @@ impl Shared {
 
     /// Applies the gates in order and returns the runs to start. Debounce and
     /// re-entrancy slots are claimed here so two events in a row cannot both pass.
-    fn dispatch(self: &Arc<Self>, hooks: &CompiledHooks, event: &Arc<Event>) -> Vec<Job> {
+    /// `snoozed` is read by the caller beforehand.
+    fn dispatch(
+        self: &Arc<Self>,
+        hooks: &CompiledHooks,
+        event: &Arc<Event>,
+        snoozed: bool,
+    ) -> Vec<Job> {
         let json = match serde_json::to_value(event.as_ref()) {
             Ok(v) => v,
             Err(e) => {
@@ -254,7 +267,6 @@ impl Shared {
                 return Vec::new();
             }
         };
-        let mut snoozed = None;
         let mut jobs = Vec::new();
         for (hook, filter) in hooks {
             let name = hook.name.as_str();
@@ -272,7 +284,7 @@ impl Shared {
                 skip("test event");
                 continue;
             }
-            if hook.respect_snooze && *snoozed.get_or_insert_with(|| self.snoozed()) {
+            if hook.respect_snooze && snoozed {
                 skip("snoozed");
                 continue;
             }
@@ -331,7 +343,7 @@ impl Shared {
         }
     }
 
-    fn finish(&self, job: &Job, started: DateTime<Utc>, outcome: Outcome) {
+    async fn finish(&self, job: &Job, started: DateTime<Utc>, outcome: Outcome) {
         (self.record)(HookRun {
             hook: job.hook.name.clone(),
             event_id: job.event.id.clone(),
@@ -340,7 +352,8 @@ impl Shared {
             exit_code: outcome.exit_code,
             error: outcome.error,
             stderr_tail: outcome.stderr_tail,
-        });
+        })
+        .await;
     }
 
     async fn open_url(&self, job: &Job) {
@@ -360,18 +373,21 @@ impl Shared {
             }
             Err(e) => Some(e),
         };
-        self.finish(job, started, Outcome::done(None, error, None));
+        self.finish(job, started, Outcome::done(None, error, None))
+            .await;
+    }
+
+    async fn fail(&self, job: &Job, started: DateTime<Utc>, error: String) {
+        tracing::warn!(hook = %job.hook.name, event = %job.event.id, %error, "hook not run");
+        self.finish(job, started, Outcome::done(None, Some(error), None))
+            .await;
     }
 
     async fn run_command(&self, job: &Job) {
         let started = Utc::now();
-        let fail = |error: String| {
-            tracing::warn!(hook = %job.hook.name, event = %job.event.id, %error, "hook not run");
-            self.finish(job, started, Outcome::done(None, Some(error), None));
-        };
         let spec = match build_spec(&job.hook, &job.json, &job.event) {
             Ok(s) => s,
-            Err(e) => return fail(e),
+            Err(e) => return self.fail(job, started, e).await,
         };
         let detached = job.hook.detached;
         let _permit = if detached {
@@ -381,7 +397,11 @@ impl Shared {
         };
         let event_file = match self.write_event_file(job) {
             Ok(p) => p,
-            Err(e) => return fail(format!("could not write event file: {e}")),
+            Err(e) => {
+                return self
+                    .fail(job, started, format!("could not write event file: {e}"))
+                    .await;
+            }
         };
         let started = Utc::now();
         let mut cmd = tokio::process::Command::new(&spec.argv[0]);
@@ -415,7 +435,13 @@ impl Shared {
             Ok(c) => c,
             Err(e) => {
                 let _ = std::fs::remove_file(&event_file);
-                return fail(format!("could not start {}: {e}", spec.argv[0]));
+                return self
+                    .fail(
+                        job,
+                        started,
+                        format!("could not start {}: {e}", spec.argv[0]),
+                    )
+                    .await;
             }
         };
         let body = job.json.to_string().into_bytes();
@@ -425,7 +451,7 @@ impl Shared {
         }
         if detached {
             tracing::info!(hook = %job.hook.name, pid = ?child.id(), "detached hook started");
-            self.finish(job, started, Outcome::started());
+            self.finish(job, started, Outcome::started()).await;
             // The handle is dropped without killing; the child outlives this task.
             write_stdin(stdin, &body).await;
             return;
@@ -463,7 +489,8 @@ impl Shared {
         guard.disarm();
         drop(guard);
         tracing::debug!(hook = %job.hook.name, ?exit_code, "hook finished");
-        self.finish(job, started, Outcome::done(exit_code, error, tail));
+        self.finish(job, started, Outcome::done(exit_code, error, tail))
+            .await;
     }
 
     /// Named per hook as well as per event so two hooks on one event do not delete each
@@ -874,6 +901,7 @@ mod tests {
     use crate::config::{MatchValue, RunSpec};
     use crate::event::{ConnectionRef, PrRef, PrRole};
     use crate::local_repos::LocalIndex;
+    use crate::store::SqliteStore;
 
     struct Fixture {
         shared: Arc<Shared>,
@@ -892,8 +920,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let runs = Arc::new(Mutex::new(Vec::new()));
         let sink = runs.clone();
-        let recorder: Recorder = Arc::new(move |r| sink.lock().unwrap().push(r));
-        let store = Arc::new(Store::open_in_memory().unwrap());
+        let recorder: Recorder = Arc::new(move |r| {
+            sink.lock().unwrap().push(r);
+            async {}.boxed()
+        });
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         Fixture {
             shared: Arc::new(Shared::new(store, paths_in(dir.path()), recorder)),
             runs,
@@ -907,7 +938,7 @@ mod tests {
         }
 
         async fn run_all(&self, hooks: &CompiledHooks, event: Event) {
-            for job in self.shared.dispatch(hooks, &Arc::new(event)) {
+            for job in self.shared.dispatch(hooks, &Arc::new(event), false) {
                 self.shared.execute(job).await;
             }
         }
@@ -1004,7 +1035,9 @@ mod tests {
             .r#match
             .insert("pr.role".into(), MatchValue::One("reviewer".into()));
         let hooks = compiled(vec![author, reviewer, hook("run-only", "run.*")]);
-        let jobs = fx.shared.dispatch(&hooks, &Arc::new(event("pr.created")));
+        let jobs = fx
+            .shared
+            .dispatch(&hooks, &Arc::new(event("pr.created")), false);
         assert_eq!(names(&jobs), ["author"]);
     }
 
@@ -1019,18 +1052,18 @@ mod tests {
 
         let mut caught_up = event("pr.created");
         caught_up.catch_up = true;
-        let jobs = fx.shared.dispatch(&hooks, &Arc::new(caught_up));
+        let jobs = fx.shared.dispatch(&hooks, &Arc::new(caught_up), false);
         assert_eq!(names(&jobs), ["opted-in"]);
         drop(jobs);
 
         let mut test = event("pr.created");
         test.test = true;
-        let jobs = fx.shared.dispatch(&hooks, &Arc::new(test));
+        let jobs = fx.shared.dispatch(&hooks, &Arc::new(test), false);
         assert_eq!(names(&jobs), ["plain", "opted-in"]);
     }
 
-    #[test]
-    fn snooze_only_stops_hooks_that_respect_it() {
+    #[tokio::test]
+    async fn snooze_only_stops_hooks_that_respect_it() {
         let fx = fixture();
         let mut respects = hook("respects", "pr.*");
         respects.respect_snooze = true;
@@ -1039,13 +1072,17 @@ mod tests {
         let store = &fx.shared.store;
 
         let future = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
-        store.set_ui_state(SNOOZE_KEY, &future).unwrap();
-        assert_eq!(names(&fx.shared.dispatch(&hooks, &e)), ["ignores"]);
+        store.set_ui_state(SNOOZE_KEY, &future).await.unwrap();
+        let snoozed = fx.shared.snoozed().await;
+        assert!(snoozed);
+        assert_eq!(names(&fx.shared.dispatch(&hooks, &e, snoozed)), ["ignores"]);
 
         let past = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
-        store.set_ui_state(SNOOZE_KEY, &past).unwrap();
+        store.set_ui_state(SNOOZE_KEY, &past).await.unwrap();
+        let snoozed = fx.shared.snoozed().await;
+        assert!(!snoozed);
         assert_eq!(
-            names(&fx.shared.dispatch(&hooks, &e)),
+            names(&fx.shared.dispatch(&hooks, &e, snoozed)),
             ["respects", "ignores"]
         );
     }
@@ -1059,19 +1096,19 @@ mod tests {
         let hooks = compiled(vec![debounced, hook("busy", "pr.*")]);
         let e = Arc::new(event("pr.created"));
 
-        let first = fx.shared.dispatch(&hooks, &e);
+        let first = fx.shared.dispatch(&hooks, &e, false);
         assert_eq!(names(&first), ["debounced", "busy"]);
         // "busy" is still running and "debounced" ran just now.
-        assert!(fx.shared.dispatch(&hooks, &e).is_empty());
+        assert!(fx.shared.dispatch(&hooks, &e, false).is_empty());
 
         let mut other = event("pr.created");
         other.subject_key = "c1:pr:r1:8".into();
-        let jobs = fx.shared.dispatch(&hooks, &Arc::new(other));
+        let jobs = fx.shared.dispatch(&hooks, &Arc::new(other), false);
         assert_eq!(names(&jobs), ["debounced", "busy"]);
 
         drop(first);
         // The first run ended, so "busy" may run again; "debounced" is inside its window.
-        assert_eq!(names(&fx.shared.dispatch(&hooks, &e)), ["busy"]);
+        assert_eq!(names(&fx.shared.dispatch(&hooks, &e, false)), ["busy"]);
     }
 
     #[test]
@@ -1083,9 +1120,16 @@ mod tests {
         h.debounce_secs = 60;
         let hooks = compiled(vec![h]);
         let mut e = event("pr.created");
-        assert!(fx.shared.dispatch(&hooks, &Arc::new(e.clone())).is_empty());
+        assert!(
+            fx.shared
+                .dispatch(&hooks, &Arc::new(e.clone()), false)
+                .is_empty()
+        );
         e.url = Some("https://example.com/pr/7".into());
-        assert_eq!(names(&fx.shared.dispatch(&hooks, &Arc::new(e))), ["open"]);
+        assert_eq!(
+            names(&fx.shared.dispatch(&hooks, &Arc::new(e), false)),
+            ["open"]
+        );
     }
 
     #[test]
@@ -1230,13 +1274,13 @@ mod tests {
         h.debounce_secs = 0;
         let mut config = Config::default();
         config.hooks.push(h);
-        let store = Arc::new(Store::open_in_memory().unwrap());
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let classifier = Classifier::new(&config, &Default::default());
         let bus = Bus::new(store.clone(), classifier, LocalIndex::empty());
         let (_tx, rx) = watch::channel(Arc::new(config));
         let runner = HookRunner::start(&bus, store, paths_in(dir.path()), rx);
 
-        bus.publish(event("pr.created")).unwrap();
+        bus.publish(event("pr.created")).await.unwrap();
         let mut seen = false;
         for _ in 0..100 {
             if marker.exists() {
@@ -1696,7 +1740,10 @@ mod tests {
         h.debounce_secs = 60;
         let hooks = compiled(vec![h]);
         assert_eq!(
-            names(&fx.shared.dispatch(&hooks, &Arc::new(event("pr.created")))),
+            names(
+                &fx.shared
+                    .dispatch(&hooks, &Arc::new(event("pr.created")), false)
+            ),
             ["fresh"]
         );
         let state = fx.shared.state();
@@ -1714,7 +1761,9 @@ mod tests {
         })
         .join();
         let hooks = compiled(vec![hook("a", "pr.*")]);
-        let jobs = fx.shared.dispatch(&hooks, &Arc::new(event("pr.created")));
+        let jobs = fx
+            .shared
+            .dispatch(&hooks, &Arc::new(event("pr.created")), false);
         assert_eq!(names(&jobs), ["a"]);
     }
 
@@ -1779,7 +1828,9 @@ mod tests {
         );
         h.timeout_secs = 60;
         let hooks = compiled(vec![h]);
-        let jobs = fx.shared.dispatch(&hooks, &Arc::new(event("pr.created")));
+        let jobs = fx
+            .shared
+            .dispatch(&hooks, &Arc::new(event("pr.created")), false);
         let shared = fx.shared.clone();
         let mut set = tokio::task::JoinSet::new();
         for job in jobs {
@@ -1815,7 +1866,7 @@ mod tests {
         let new_marker = dir.path().join("new.json");
         let mut config = Config::default();
         config.hooks.push(copy_hook("old", &old_marker));
-        let store = Arc::new(Store::open_in_memory().unwrap());
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let classifier = Classifier::new(&config, &Default::default());
         let bus = Bus::new(store.clone(), classifier, LocalIndex::empty());
         let (tx, rx) = watch::channel(Arc::new(config.clone()));
@@ -1824,7 +1875,7 @@ mod tests {
         config.hooks = vec![copy_hook("new", &new_marker)];
         tx.send(Arc::new(config)).unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
-        bus.publish(event("pr.created")).unwrap();
+        bus.publish(event("pr.created")).await.unwrap();
         for _ in 0..100 {
             if new_marker.exists() {
                 break;

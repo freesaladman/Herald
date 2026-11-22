@@ -603,7 +603,7 @@ fn source_period(config: &Config, name: &str, tier: Tier) -> Duration {
 
 struct Shared {
     bus: Arc<Bus>,
-    store: Arc<Store>,
+    store: Arc<dyn Store>,
     registry: Arc<ProviderRegistry>,
     secrets: Arc<dyn SecretStore>,
     config: watch::Receiver<Arc<Config>>,
@@ -616,6 +616,9 @@ struct Shared {
     status_gate: Mutex<()>,
     /// While non-zero, status publishes are skipped (see `StatusHold`).
     status_holds: AtomicUsize,
+    /// Runs once between `join_stale`'s watermark reads and its join.
+    #[cfg(test)]
+    after_reads: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Shared {
@@ -675,30 +678,40 @@ impl Shared {
         e
     }
 
-    fn finish_source(&self, conn: &ConnState, source: &str) {
+    async fn finish_source(&self, conn: &ConnState, source: &str) {
         let done = self.cycle().finish(conn, source);
-        self.publish_summary(done);
+        self.publish_summary(done).await;
     }
 
-    fn forget_connection(&self, conn: &ConnState) {
+    async fn forget_connection(&self, conn: &ConnState) {
         let done = self.cycle().forget(conn);
-        self.publish_summary(done);
+        self.publish_summary(done).await;
     }
 
-    /// Removes every trace of a state that never launched.
-    fn discard(&self, state: &Arc<ConnState>) {
+    /// Removes every trace of a state that never launched. Runs from `Drop`, so the
+    /// summary (if any) is published on a spawned task.
+    fn discard(self: &Arc<Self>, state: &Arc<ConnState>) {
         {
             let mut conns = self.conns();
             if conns.get(state.id()).is_some_and(|c| Arc::ptr_eq(c, state)) {
                 conns.remove(state.id());
             }
         }
-        self.forget_connection(state);
+        let done = self.cycle().forget(state);
+        if done.is_some() {
+            match tokio::runtime::Handle::try_current() {
+                Ok(rt) => {
+                    let shared = self.clone();
+                    rt.spawn(async move { shared.publish_summary(done).await });
+                }
+                Err(_) => tracing::warn!("no runtime to publish a catch-up summary"),
+            }
+        }
         self.publish_statuses();
     }
 
     /// Summarises and resets a cycle that has stayed open past its deadline.
-    fn expire_cycle(&self) {
+    async fn expire_cycle(&self) {
         let done = {
             let mut cycle = self.cycle();
             if !cycle.expired() {
@@ -715,7 +728,7 @@ impl Shared {
             );
             cycle.take_done()
         };
-        self.publish_summary(Some(done));
+        self.publish_summary(Some(done)).await;
     }
 
     async fn run_cycle_watchdog(self: Arc<Self>) {
@@ -723,11 +736,11 @@ impl Shared {
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            self.expire_cycle();
+            self.expire_cycle().await;
         }
     }
 
-    fn publish_summary(&self, done: Option<CycleDone>) {
+    async fn publish_summary(&self, done: Option<CycleDone>) {
         let Some(done) = done else { return };
         let now = {
             let mut last = self
@@ -739,7 +752,7 @@ impl Shared {
             DateTime::from_timestamp_millis(ms).unwrap_or_else(Utc::now)
         };
         if let Some(summary) = summary_event(done, now) {
-            self.bus.publish(summary);
+            self.bus.publish(summary).await;
         }
     }
 
@@ -747,41 +760,62 @@ impl Shared {
     /// with none this run, whose watermark) is older than three of its own tier intervals
     /// at `t0` into the current cycle, then wakes
     /// the tiers that gained a source. `caller` is polling already, so its tier is not woken.
-    fn join_stale(&self, t0: DateTime<Utc>, caller: (&str, Tier)) {
+    async fn join_stale(&self, t0: DateTime<Utc>, caller: (&str, Tier)) {
         let cfg = self.config();
+        let candidates: Vec<(Arc<ConnState>, String, Tier)> = self
+            .conns()
+            .values()
+            .flat_map(|conn| {
+                conn.sources
+                    .iter()
+                    .map(|(name, tier)| (conn.clone(), name.clone(), *tier))
+            })
+            .collect();
+        // Watermarks are read before the locks below, which must not be held across an await.
+        let mut stored = Vec::new();
+        for (conn, name, tier) in candidates {
+            // A hung poll would be re-joined every pass; its own finish closes its slot.
+            if conn.is_disabled(&name) || conn.polling(&name) {
+                continue;
+            }
+            let key = format!("{}:{name}", conn.id());
+            match self.store.get_watermark(&key).await {
+                Ok(Some(w)) => stored.push((conn, name, tier, w)),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(key, error = %e, "watermark read failed"),
+            }
+        }
+        #[cfg(test)]
+        if let Some(hook) = self
+            .after_reads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            hook();
+        }
         let mut woken: Vec<(Arc<ConnState>, Vec<Tier>)> = Vec::new();
         {
             // Held throughout so a concurrent stop + forget can't leave slots for dead
             // tasks. Lock order: conns, then ConnState inner, then cycle.
             let conns = self.conns();
-            for conn in conns.values() {
-                let mut tiers: Vec<Tier> = Vec::new();
-                for (name, tier) in &conn.sources {
-                    // A hung poll would be re-joined every pass; its own finish closes its slot.
-                    if conn.is_disabled(name) || conn.polling(name) {
-                        continue;
-                    }
-                    let key = format!("{}:{name}", conn.id());
-                    match self.store.get_watermark(&key) {
-                        Ok(Some(w))
-                            if attempt_stale(
-                                conn.last_attempt(name),
-                                w.last_success_utc,
-                                t0,
-                                source_period(&cfg, name, *tier),
-                            ) =>
-                        {
-                            let added = self.cycle().join(conn, name, Some(w.last_success_utc));
-                            if added && !tiers.contains(tier) {
-                                tiers.push(*tier);
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(key, error = %e, "watermark read failed"),
-                    }
+            for (conn, name, tier, w) in stored {
+                let registered = conns.get(conn.id()).is_some_and(|c| Arc::ptr_eq(c, &conn));
+                if !registered || conn.is_disabled(&name) || conn.polling(&name) {
+                    continue;
                 }
-                if !tiers.is_empty() {
-                    woken.push((conn.clone(), tiers));
+                if attempt_stale(
+                    conn.last_attempt(&name),
+                    w.last_success_utc,
+                    t0,
+                    source_period(&cfg, &name, tier),
+                ) && self.cycle().join(&conn, &name, Some(w.last_success_utc))
+                {
+                    match woken.iter_mut().find(|(c, _)| Arc::ptr_eq(c, &conn)) {
+                        Some((_, tiers)) if !tiers.contains(&tier) => tiers.push(tier),
+                        Some(_) => {}
+                        None => woken.push((conn, vec![tier])),
+                    }
                 }
             }
         }
@@ -828,7 +862,7 @@ impl Shared {
                         format!("Authentication failed for {id}"),
                     );
                     e.data = serde_json::json!({ "reason": "unauthorized" });
-                    self.bus.publish(e);
+                    self.bus.publish(e).await;
                 }
             }
             ProviderError::MissingCredentials => {
@@ -852,7 +886,7 @@ impl Shared {
                             format!("Source {name} disabled for {id}"),
                         );
                         e.data = serde_json::json!({ "source": name, "reason": reason });
-                        self.bus.publish(e);
+                        self.bus.publish(e).await;
                     }
                 }
                 None => tracing::warn!(connection = id, error = %reason, "forbidden"),
@@ -912,7 +946,7 @@ impl Shared {
 
     /// Connects without any network call. A start-up prepare registers every source
     /// with a stored watermark in the start-up cycle, since its first poll is catch-up.
-    fn prepare(self: &Arc<Self>, config: ConnectionConfig, startup: bool) -> Prepared {
+    async fn prepare(self: &Arc<Self>, config: ConnectionConfig, startup: bool) -> Prepared {
         let factory = self.registry.get(&config.provider);
         let label = factory
             .as_ref()
@@ -936,6 +970,15 @@ impl Shared {
             .iter()
             .map(|s| (s.name().to_string(), s.tier()))
             .collect();
+        // A stored watermark means the first poll is catch-up, so the start-up cycle must wait
+        // for the source. Read before registering: a cancelled start must not leave state behind.
+        let mut marks = Vec::new();
+        if startup {
+            let names: Vec<String> = sources.iter().map(|s| s.name().to_string()).collect();
+            for name in names {
+                marks.push(self.watermark(&config.id, &name).await);
+            }
+        }
         let state = Arc::new(
             ConnState::new(config, label, connection, listed).with_shared(Arc::downgrade(self)),
         );
@@ -953,10 +996,11 @@ impl Shared {
         }
         self.publish_statuses();
         let mut slots: Vec<(Tier, Vec<SourceSlot>)> = Vec::new();
+        let mut marks = marks.into_iter();
         for source in sources {
             let tier = source.tier();
-            if startup {
-                self.preregister(&state, source.name());
+            if let Some(Some(w)) = marks.next() {
+                self.cycle().join(&state, source.name(), Some(w));
             }
             let slot = SourceSlot {
                 source,
@@ -975,16 +1019,15 @@ impl Shared {
         }
     }
 
-    /// A stored watermark means the first poll is catch-up, so the start-up cycle
-    /// must wait for this source.
-    fn preregister(&self, conn: &ConnState, source: &str) {
-        let key = format!("{}:{source}", conn.id());
-        match self.store.get_watermark(&key) {
-            Ok(Some(w)) => {
-                self.cycle().join(conn, source, Some(w.last_success_utc));
+    /// The stored success time for a source, if any.
+    async fn watermark(&self, conn_id: &str, source: &str) -> Option<DateTime<Utc>> {
+        let key = format!("{conn_id}:{source}");
+        match self.store.get_watermark(&key).await {
+            Ok(w) => w.map(|w| w.last_success_utc),
+            Err(e) => {
+                tracing::warn!(key, error = %e, "watermark read failed");
+                None
             }
-            Ok(None) => {}
-            Err(e) => tracing::warn!(key, error = %e, "watermark read failed"),
         }
     }
 
@@ -1074,14 +1117,20 @@ impl Shared {
                         guarded(&cref.id, name, poll).await;
                         conn.end_poll(name);
                     }
-                    self.finish_source(&conn, name);
+                    self.finish_source(&conn, name).await;
                 }
                 if refresh && !identified && conn.gate_open() {
                     guarded(&cref.id, "identify", self.identify(&conn, &connection)).await;
                 }
             } else {
-                for (slot, _) in slots.iter().zip(&due).filter(|(_, d)| **d) {
-                    self.finish_source(&conn, slot.source.name());
+                let names: Vec<String> = slots
+                    .iter()
+                    .zip(&due)
+                    .filter(|(_, d)| **d)
+                    .map(|(slot, _)| slot.source.name().to_string())
+                    .collect();
+                for name in names {
+                    self.finish_source(&conn, &name).await;
                 }
             }
             // A wake-driven pass restarts every period from its end, so the tick that
@@ -1116,7 +1165,7 @@ impl Shared {
             }
         };
         let key = format!("{}:{name}", cref.id);
-        let stored = match self.store.get_watermark(&key) {
+        let stored = match self.store.get_watermark(&key).await {
             Ok(w) => w,
             Err(e) => {
                 tracing::warn!(key, error = %e, "watermark read failed");
@@ -1129,7 +1178,8 @@ impl Shared {
                 // Judged by attempts, not successes, so failing sources can't wake each other forever.
                 if attempt_stale(conn.last_attempt(name), w.last_success_utc, t0, period) {
                     // A wake: the other sources are just as stale and share one summary.
-                    self.join_stale(t0, (cref.id.as_str(), slot.source.tier()));
+                    self.join_stale(t0, (cref.id.as_str(), slot.source.tier()))
+                        .await;
                 }
                 let gap = gap_exceeds(t0 - w.last_success_utc, period);
                 (Some(w.last_success_utc), slot.first_poll || gap)
@@ -1155,7 +1205,7 @@ impl Shared {
                 conn.mark_ok(epoch);
                 let mut store_failed = false;
                 for event in outcome.events {
-                    match self.bus.try_publish(event) {
+                    match self.bus.try_publish(event).await {
                         Ok(Some(published)) => self.cycle().record(conn, name, published),
                         Ok(None) => {}
                         Err(_) => store_failed = true,
@@ -1166,7 +1216,7 @@ impl Shared {
                     tracing::warn!(key, "event persist failed; watermark not advanced");
                     return;
                 }
-                if let Err(e) = self.store.set_watermark(&key, t0, t0) {
+                if let Err(e) = self.store.set_watermark(&key, t0, t0).await {
                     tracing::warn!(key, error = %e, "watermark write failed");
                 }
                 slot.first_poll = false;
@@ -1203,11 +1253,9 @@ impl Shared {
                 Err(e) => tracing::error!(error = %e, "local index rebuild failed"),
             }
             if last_prune.is_none_or(|t| t.elapsed() >= PRUNE_EVERY) {
-                let store = self.store.clone();
-                match tokio::task::spawn_blocking(move || store.prune(PRUNE_DAYS)).await {
-                    Ok(Ok(())) => last_prune = Some(Instant::now()),
-                    Ok(Err(e)) => tracing::warn!(error = %e, "prune failed"),
-                    Err(e) => tracing::error!(error = %e, "prune task failed"),
+                match self.store.prune(PRUNE_DAYS).await {
+                    Ok(()) => last_prune = Some(Instant::now()),
+                    Err(e) => tracing::warn!(error = %e, "prune failed"),
                 }
             }
         }
@@ -1244,9 +1292,9 @@ impl Drop for Scheduler {
 impl Scheduler {
     /// Connects every enabled connection and starts polling; identifying happens lazily
     /// in the tier tasks, so this never waits on the provider.
-    pub fn start(
+    pub async fn start(
         bus: Arc<Bus>,
-        store: Arc<Store>,
+        store: Arc<dyn Store>,
         registry: Arc<ProviderRegistry>,
         secrets: Arc<dyn SecretStore>,
         config: watch::Receiver<Arc<Config>>,
@@ -1263,6 +1311,8 @@ impl Scheduler {
             status_tx: watch::channel(Vec::new()).0,
             status_gate: Mutex::new(()),
             status_holds: AtomicUsize::new(0),
+            #[cfg(test)]
+            after_reads: Mutex::new(None),
         });
         let scheduler = Scheduler {
             shared: shared.clone(),
@@ -1270,12 +1320,10 @@ impl Scheduler {
         };
         let cfg = shared.config();
         // Every connection registers its catch-up sources before any tier polls.
-        let prepared: Vec<Prepared> = cfg
-            .connections
-            .iter()
-            .filter(|c| c.enabled)
-            .map(|c| shared.prepare(c.clone(), true))
-            .collect();
+        let mut prepared: Vec<Prepared> = Vec::new();
+        for c in cfg.connections.iter().filter(|c| c.enabled) {
+            prepared.push(shared.prepare(c.clone(), true).await);
+        }
         for p in prepared {
             scheduler.launch(p);
         }
@@ -1289,8 +1337,8 @@ impl Scheduler {
 
     /// Connects one connection without polling it (see `launch`). Only a `startup`
     /// prepare makes the first poll catch-up; a reload's first poll is a normal one.
-    pub fn prepare(&self, config: ConnectionConfig, startup: bool) -> Prepared {
-        self.shared.prepare(config, startup)
+    pub async fn prepare(&self, config: ConnectionConfig, startup: bool) -> Prepared {
+        self.shared.prepare(config, startup).await
     }
 
     /// Spawns the tier tasks of a prepared connection. A halted connection gets none.
@@ -1344,7 +1392,7 @@ impl Scheduler {
         }
         let removed = self.shared.conns().remove(id);
         if let Some(state) = removed {
-            self.shared.forget_connection(&state);
+            self.shared.forget_connection(&state).await;
         }
         self.shared.rebuild_classifier();
         self.shared.publish_statuses();
@@ -1421,6 +1469,7 @@ mod tests {
     use super::*;
     use crate::provider::{PollOutcome, ProviderFactory};
     use crate::secrets::MemorySecretStore;
+    use crate::store::SqliteStore;
     use crate::testing::{FakeProvider, FakeProviderFactory};
     use futures_util::future::BoxFuture;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1460,27 +1509,30 @@ mod tests {
     }
 
     struct Harness {
-        store: Arc<Store>,
+        store: Arc<dyn Store>,
         sched: Scheduler,
         rx: broadcast::Receiver<Arc<Event>>,
         _config_tx: watch::Sender<Arc<Config>>,
     }
 
     impl Harness {
-        fn start(fake: &FakeProvider) -> Harness {
-            Self::start_with(Arc::new(FakeProviderFactory::new(fake.clone())), None)
+        async fn start(fake: &FakeProvider) -> Harness {
+            Self::start_with(Arc::new(FakeProviderFactory::new(fake.clone())), None).await
         }
 
-        fn start_with(factory: Arc<dyn ProviderFactory>, store: Option<Arc<Store>>) -> Harness {
-            Self::build(vec![factory], store, config())
+        async fn start_with(
+            factory: Arc<dyn ProviderFactory>,
+            store: Option<Arc<dyn Store>>,
+        ) -> Harness {
+            Self::build(vec![factory], store, config()).await
         }
 
-        fn build(
+        async fn build(
             factories: Vec<Arc<dyn ProviderFactory>>,
-            store: Option<Arc<Store>>,
+            store: Option<Arc<dyn Store>>,
             cfg: Config,
         ) -> Harness {
-            let store = store.unwrap_or_else(|| Arc::new(Store::open_in_memory().unwrap()));
+            let store = store.unwrap_or_else(|| Arc::new(SqliteStore::open_in_memory().unwrap()));
             let bus = Arc::new(Bus::new(
                 store.clone(),
                 Classifier::new(&cfg, &BTreeMap::new()),
@@ -1494,7 +1546,8 @@ mod tests {
                 Arc::new(ProviderRegistry::new(factories)),
                 Arc::new(MemorySecretStore::new()),
                 config_rx,
-            );
+            )
+            .await;
             Harness {
                 store,
                 sched,
@@ -1521,14 +1574,14 @@ mod tests {
         fake
     }
 
-    fn store_with_watermark(key: &str, at: DateTime<Utc>) -> Arc<Store> {
-        store_with_watermarks(&[key], at)
+    async fn store_with_watermark(key: &str, at: DateTime<Utc>) -> Arc<dyn Store> {
+        store_with_watermarks(&[key], at).await
     }
 
-    fn store_with_watermarks(keys: &[&str], at: DateTime<Utc>) -> Arc<Store> {
-        let store = Arc::new(Store::open_in_memory().unwrap());
+    async fn store_with_watermarks(keys: &[&str], at: DateTime<Utc>) -> Arc<dyn Store> {
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
         for key in keys {
-            store.set_watermark(key, at, at).unwrap();
+            store.set_watermark(key, at, at).await.unwrap();
         }
         store
     }
@@ -1561,7 +1614,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn first_run_seeds_then_polls_normally() {
         let fake = fake_with(&[("s", Tier::Fast)]);
-        let mut h = Harness::start(&fake);
+        let mut h = Harness::start(&fake).await;
         pass(1).await;
 
         let calls = fake.poll_calls("s");
@@ -1570,7 +1623,7 @@ mod tests {
         assert!(!calls[0].catch_up);
         assert_eq!(calls[0].server_now, t0());
         assert!(h.drain().is_empty());
-        let wm = h.store.get_watermark("c1:s").unwrap().unwrap();
+        let wm = h.store.get_watermark("c1:s").await.unwrap().unwrap();
         assert_eq!((wm.last_synced_utc, wm.last_success_utc), (t0(), t0()));
 
         fake.set_server_time(t0() + secs(10));
@@ -1585,7 +1638,7 @@ mod tests {
         assert_eq!(calls[1].watermark, Some(t0()));
         assert!(!calls[1].catch_up);
         assert_eq!(h.drain().len(), 1);
-        let wm = h.store.get_watermark("c1:s").unwrap().unwrap();
+        let wm = h.store.get_watermark("c1:s").await.unwrap().unwrap();
         assert_eq!(wm.last_success_utc, t0() + secs(10));
     }
 
@@ -1602,8 +1655,9 @@ mod tests {
         );
         let mut h = Harness::start_with(
             Arc::new(FakeProviderFactory::new(fake.clone())),
-            Some(store_with_watermark("c1:s", since)),
-        );
+            Some(store_with_watermark("c1:s", since).await),
+        )
+        .await;
         pass(60).await;
 
         let calls = fake.poll_calls("s");
@@ -1635,8 +1689,9 @@ mod tests {
         let fake = fake_with(&[("s", Tier::Fast)]);
         let mut h = Harness::start_with(
             Arc::new(FakeProviderFactory::new(fake.clone())),
-            Some(store_with_watermark("c1:s", t0() - secs(3600))),
-        );
+            Some(store_with_watermark("c1:s", t0() - secs(3600)).await),
+        )
+        .await;
         pass(1).await;
 
         assert!(fake.poll_calls("s")[0].catch_up);
@@ -1646,7 +1701,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn gap_over_three_intervals_is_catch_up() {
         let fake = fake_with(&[("s", Tier::Fast)]);
-        let _h = Harness::start(&fake);
+        let _h = Harness::start(&fake).await;
         pass(1).await;
         fake.set_server_time(t0() + secs(31));
         pass(10).await;
@@ -1663,7 +1718,7 @@ mod tests {
     async fn unauthorized_pauses_connection_and_publishes_one_auth_failed() {
         let fake = fake_with(&[("a", Tier::Fast), ("b", Tier::Pr)]);
         fake.push_poll("a", Err(ProviderError::Unauthorized));
-        let mut h = Harness::start(&fake);
+        let mut h = Harness::start(&fake).await;
         pass(5).await;
 
         let events = h.drain();
@@ -1688,7 +1743,7 @@ mod tests {
     async fn forbidden_disables_only_that_source() {
         let fake = fake_with(&[("a", Tier::Fast), ("b", Tier::Fast)]);
         fake.push_poll("a", Err(ProviderError::Forbidden("no access".into())));
-        let mut h = Harness::start(&fake);
+        let mut h = Harness::start(&fake).await;
         pass(50).await;
 
         assert_eq!(fake.poll_count("a"), 1);
@@ -1713,7 +1768,7 @@ mod tests {
                 retry_after: Duration::from_secs(25),
             }),
         );
-        let _h = Harness::start(&fake);
+        let _h = Harness::start(&fake).await;
         pass(12).await;
         assert_eq!(fake.poll_count("s"), 1);
         pass(15).await;
@@ -1724,7 +1779,7 @@ mod tests {
     async fn missing_credentials_idles_until_resume() {
         let fake = fake_with(&[("s", Tier::Fast)]);
         fake.set_identify_error(Some(ProviderError::MissingCredentials));
-        let h = Harness::start(&fake);
+        let h = Harness::start(&fake).await;
         pass(100).await;
         assert_eq!(fake.poll_count("s"), 0);
         assert_eq!(h.sched.statuses()[0].auth_state, AuthState::Missing);
@@ -1878,19 +1933,22 @@ mod tests {
         }
     }
 
-    fn chaos_harness(fake: &FakeProvider, store: Option<Arc<Store>>) -> (Harness, Arc<Chaos>) {
+    async fn chaos_harness(
+        fake: &FakeProvider,
+        store: Option<Arc<dyn Store>>,
+    ) -> (Harness, Arc<Chaos>) {
         let chaos = Arc::new(Chaos::default());
         let factory = ChaosFactory {
             inner: FakeProviderFactory::new(fake.clone()),
             chaos: chaos.clone(),
         };
-        (Harness::start_with(Arc::new(factory), store), chaos)
+        (Harness::start_with(Arc::new(factory), store).await, chaos)
     }
 
     #[tokio::test(start_paused = true)]
     async fn panicking_poll_does_not_stop_the_tier_or_move_the_watermark() {
         let fake = fake_with(&[("s", Tier::Fast)]);
-        let (h, chaos) = chaos_harness(&fake, None);
+        let (h, chaos) = chaos_harness(&fake, None).await;
         pass(1).await;
         assert_eq!(fake.poll_count("s"), 1);
 
@@ -1901,7 +1959,7 @@ mod tests {
         pass(10).await;
         assert_eq!(chaos.panics.load(Ordering::SeqCst), 2);
         assert_eq!(fake.poll_count("s"), 1);
-        let wm = h.store.get_watermark("c1:s").unwrap().unwrap();
+        let wm = h.store.get_watermark("c1:s").await.unwrap().unwrap();
         assert_eq!(wm.last_success_utc, t0());
 
         chaos.panic_poll.store(false, Ordering::SeqCst);
@@ -1910,34 +1968,34 @@ mod tests {
         let calls = fake.poll_calls("s");
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1].watermark, Some(t0()));
-        let wm = h.store.get_watermark("c1:s").unwrap().unwrap();
+        let wm = h.store.get_watermark("c1:s").await.unwrap().unwrap();
         assert_eq!(wm.last_success_utc, t0() + secs(30));
     }
 
     #[tokio::test(start_paused = true)]
     async fn transient_error_keeps_the_watermark() {
         let fake = fake_with(&[("s", Tier::Fast)]);
-        let h = Harness::start(&fake);
+        let h = Harness::start(&fake).await;
         pass(1).await;
 
         fake.push_poll("s", Err(ProviderError::Transient("blip".into())));
         fake.set_server_time(t0() + secs(10));
         pass(10).await;
         assert_eq!(fake.poll_count("s"), 2);
-        let wm = h.store.get_watermark("c1:s").unwrap().unwrap();
+        let wm = h.store.get_watermark("c1:s").await.unwrap().unwrap();
         assert_eq!(wm.last_success_utc, t0());
 
         fake.set_server_time(t0() + secs(20));
         pass(10).await;
         assert_eq!(fake.poll_calls("s")[2].watermark, Some(t0()));
-        let wm = h.store.get_watermark("c1:s").unwrap().unwrap();
+        let wm = h.store.get_watermark("c1:s").await.unwrap().unwrap();
         assert_eq!(wm.last_success_utc, t0() + secs(20));
     }
 
     #[tokio::test(start_paused = true)]
     async fn panicking_server_time_does_not_stop_the_tier() {
         let fake = fake_with(&[("s", Tier::Fast)]);
-        let (_h, chaos) = chaos_harness(&fake, None);
+        let (_h, chaos) = chaos_harness(&fake, None).await;
         chaos.panic_server_time.store(true, Ordering::SeqCst);
         pass(35).await;
         assert_eq!(chaos.panics.load(Ordering::SeqCst), 4);
@@ -1957,15 +2015,15 @@ mod tests {
             inner: FakeProviderFactory::new(fake.clone()),
             chaos,
         };
-        // Harness::start_with is sync: reaching the next line is the assertion.
-        let h = Harness::start_with(Arc::new(factory), None);
+        // Reaching the next line, without the provider's identify call finishing, is the assertion.
+        let h = Harness::start_with(Arc::new(factory), None).await;
         pass(100).await;
 
         assert_eq!(fake.poll_count("s"), 0);
         assert_eq!(h.sched.statuses()[0].auth_state, AuthState::Unknown);
     }
 
-    fn held_identify_harness(fake: &FakeProvider) -> (Harness, watch::Sender<bool>) {
+    async fn held_identify_harness(fake: &FakeProvider) -> (Harness, watch::Sender<bool>) {
         let hold = watch::channel(true).0;
         let chaos = Arc::new(Chaos {
             identify_hold: Some(hold.clone()),
@@ -1975,7 +2033,7 @@ mod tests {
             inner: FakeProviderFactory::new(fake.clone()),
             chaos,
         };
-        (Harness::start_with(Arc::new(factory), None), hold)
+        (Harness::start_with(Arc::new(factory), None).await, hold)
     }
 
     fn named(id: &str) -> Identity {
@@ -1991,7 +2049,7 @@ mod tests {
     async fn identify_finishing_after_a_credential_change_is_discarded() {
         let fake = fake_with(&[("s", Tier::Fast)]);
         fake.push_identify(Ok(named("old")));
-        let (h, hold) = held_identify_harness(&fake);
+        let (h, hold) = held_identify_harness(&fake).await;
         pass(1).await;
         assert_eq!(fake.identify_calls(), 1);
 
@@ -2009,7 +2067,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn tiers_starting_together_identify_once() {
         let fake = fake_with(&[("a", Tier::Fast), ("b", Tier::Pr)]);
-        let (h, hold) = held_identify_harness(&fake);
+        let (h, hold) = held_identify_harness(&fake).await;
         pass(1).await;
         // Fast, Pr and Slow all want an identity; only one call is in flight.
         assert_eq!(fake.identify_calls(), 1);
@@ -2042,11 +2100,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn prepare_does_not_displace_a_launched_state() {
         let fake = fake_with(&[("s", Tier::Fast)]);
-        let h = Harness::start(&fake);
+        let h = Harness::start(&fake).await;
         let live = h.sched.connection("c1").unwrap();
         let config = live.config.clone();
 
-        let second = h.sched.prepare(config, false);
+        let second = h.sched.prepare(config, false).await;
         assert!(Arc::ptr_eq(&h.sched.connection("c1").unwrap(), &live));
         h.sched.launch(second);
         assert!(Arc::ptr_eq(&h.sched.connection("c1").unwrap(), &live));
@@ -2069,7 +2127,8 @@ mod tests {
             vec![Arc::new(FakeProviderFactory::new(fake.clone()))],
             None,
             cfg,
-        );
+        )
+        .await;
         // Fast tier is 10s: plain polls at 0, 10, 20; quick at 0, 4, ..., 20.
         pass(21).await;
         assert_eq!(fake.poll_count("quick"), 6);
@@ -2084,7 +2143,8 @@ mod tests {
             vec![Arc::new(FakeProviderFactory::new(fake.clone()))],
             None,
             cfg,
-        );
+        )
+        .await;
         pass(1).await;
         // 20s is over three of quick's 4s periods but under three of the tier's 10s.
         fake.set_server_time(t0() + secs(20));
@@ -2117,7 +2177,8 @@ mod tests {
             vec![Arc::new(FakeProviderFactory::new(fake.clone()))],
             None,
             cfg,
-        );
+        )
+        .await;
         pass(1).await;
         fake.set_server_time_error(Some(ProviderError::Transient("down".into())));
         pass(25).await;
@@ -2141,7 +2202,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn reload_retimes_a_running_source_without_extra_polls() {
         let fake = fake_with(&[("s", Tier::Fast)]);
-        let h = Harness::start(&fake);
+        let h = Harness::start(&fake).await;
         pass(12).await;
         assert_eq!(fake.poll_count("s"), 2);
 
@@ -2171,7 +2232,8 @@ mod tests {
             vec![Arc::new(FakeProviderFactory::new(fake.clone()))],
             None,
             cfg,
-        );
+        )
+        .await;
         pass(1).await;
         h.sched.poll_now();
         pass(1).await;
@@ -2183,7 +2245,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn wake_poll_restarts_the_interval() {
         let fake = fake_with(&[("s", Tier::Fast)]);
-        let h = Harness::start(&fake);
+        let h = Harness::start(&fake).await;
         // Fast period is 10s in the test config.
         pass(1).await;
         assert_eq!(fake.poll_count("s"), 1);
@@ -2205,23 +2267,65 @@ mod tests {
         let fake = fake_with(&[("s", Tier::Fast)]);
         let mut cfg = config();
         let conn = cfg.connections.remove(0);
-        let store = store_with_watermark("c1:s", t0() - secs(3600));
+        let store = store_with_watermark("c1:s", t0() - secs(3600)).await;
         let h = Harness::build(
             vec![Arc::new(FakeProviderFactory::new(fake.clone()))],
             Some(store),
             cfg,
-        );
-        let prepared = h.sched.prepare(conn, false);
+        )
+        .await;
+        let prepared = h.sched.prepare(conn, false).await;
         let state = prepared.state().clone();
         let late = t0() + secs(10_000);
 
         state.begin_poll("s");
-        h.sched.shared.join_stale(late, ("other", Tier::Fast));
+        h.sched.shared.join_stale(late, ("other", Tier::Fast)).await;
         assert!(h.sched.shared.cycle().pending.is_empty());
 
         state.end_poll("s");
-        h.sched.shared.join_stale(late, ("other", Tier::Fast));
+        h.sched.shared.join_stale(late, ("other", Tier::Fast)).await;
         assert_eq!(h.sched.shared.cycle().pending.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn join_stale_rechecks_after_the_watermark_reads() {
+        for case in ["stopped", "replaced", "disabled", "polling"] {
+            let fake = fake_with(&[("s", Tier::Fast)]);
+            let mut cfg = config();
+            let conn = cfg.connections.remove(0);
+            let store = store_with_watermark("c1:s", t0() - secs(3600)).await;
+            let h = Harness::build(
+                vec![Arc::new(FakeProviderFactory::new(fake.clone()))],
+                Some(store),
+                cfg,
+            )
+            .await;
+            // Prepared last, so it is the registered state join_stale reads.
+            let replacement = h.sched.prepare(conn.clone(), false).await;
+            let prepared = h.sched.prepare(conn, false).await;
+            let state = prepared.state().clone();
+            let shared = h.sched.shared.clone();
+            let swap = replacement.state().clone();
+            let hook_state = state.clone();
+            *h.sched.shared.after_reads.lock().unwrap() = Some(Box::new(move || match case {
+                "stopped" => {
+                    shared.conns().remove("c1");
+                }
+                "replaced" => {
+                    shared.conns().insert("c1".into(), swap);
+                }
+                "disabled" => {
+                    hook_state.disable_source("s");
+                }
+                _ => hook_state.begin_poll("s"),
+            }));
+
+            h.sched
+                .shared
+                .join_stale(t0() + secs(10_000), ("other", Tier::Fast))
+                .await;
+            assert!(h.sched.shared.cycle().pending.is_empty(), "{case}");
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -2236,7 +2340,8 @@ mod tests {
             vec![Arc::new(FakeProviderFactory::new(fake.clone()))],
             None,
             cfg,
-        );
+        )
+        .await;
         pass(5).await;
         assert_eq!(fake.poll_count("a"), 1);
         assert_eq!(of_type(&h.drain(), "auth.failed").len(), 1);
@@ -2257,10 +2362,10 @@ mod tests {
         assert!(of_type(&h.drain(), "auth.failed").is_empty());
     }
 
-    fn two_connection_harness(
+    async fn two_connection_harness(
         fake1: &FakeProvider,
         fake2: &FakeProvider,
-        store: Arc<Store>,
+        store: Arc<dyn Store>,
     ) -> Harness {
         let cfg = config_with(&[("c1", "fake"), ("c2", "fake2")]);
         Harness::build(
@@ -2271,6 +2376,7 @@ mod tests {
             Some(store),
             cfg,
         )
+        .await
     }
 
     #[tokio::test(start_paused = true)]
@@ -2296,8 +2402,9 @@ mod tests {
             }
         }
         let store =
-            store_with_watermarks(&["c1:a", "c1:b", "c1:c", "c2:d", "c2:e"], t0() - secs(3600));
-        let mut h = two_connection_harness(&fake1, &fake2, store);
+            store_with_watermarks(&["c1:a", "c1:b", "c1:c", "c2:d", "c2:e"], t0() - secs(3600))
+                .await;
+        let mut h = two_connection_harness(&fake1, &fake2, store).await;
         pass(1).await;
 
         let events = h.drain();
@@ -2335,12 +2442,13 @@ mod tests {
         }
         let mut cfg = config();
         cfg.polling.slow_secs = 100_000;
-        let store = store_with_watermarks(&["c1:a", "c1:b", "c1:c"], t0());
+        let store = store_with_watermarks(&["c1:a", "c1:b", "c1:c"], t0()).await;
         let mut h = Harness::build(
             vec![Arc::new(FakeProviderFactory::new(fake.clone()))],
             Some(store),
             cfg,
-        );
+        )
+        .await;
         pass(1).await;
         assert!(h.drain().is_empty());
 
@@ -2373,25 +2481,27 @@ mod tests {
         let fake = fake_with(&[("s", Tier::Fast)]);
         let mut cfg = config();
         let conn = cfg.connections.remove(0);
-        let store = store_with_watermark("c1:s", t0() - secs(3600));
+        let store = store_with_watermark("c1:s", t0() - secs(3600)).await;
         let h = Harness::build(
             vec![Arc::new(FakeProviderFactory::new(fake.clone()))],
             Some(store),
             cfg,
-        );
-        let prepared = h.sched.prepare(conn.clone(), true);
+        )
+        .await;
+        let prepared = h.sched.prepare(conn.clone(), true).await;
         assert_eq!(h.sched.shared.cycle().pending.len(), 1);
         assert!(h.sched.connection("c1").is_some());
         drop(prepared);
         assert!(h.sched.shared.cycle().pending.is_empty());
         assert!(h.sched.connection("c1").is_none());
 
-        let prepared = h.sched.prepare(conn, false);
+        let prepared = h.sched.prepare(conn, false).await;
         drop(prepared);
         assert!(h.sched.connection("c1").is_none());
         h.sched
             .shared
-            .join_stale(t0() + secs(10_000), ("other", Tier::Fast));
+            .join_stale(t0() + secs(10_000), ("other", Tier::Fast))
+            .await;
         assert!(h.sched.shared.cycle().pending.is_empty());
     }
 
@@ -2400,14 +2510,15 @@ mod tests {
         let fake = fake_with(&[("s", Tier::Fast)]);
         let mut cfg = config();
         let conn = cfg.connections.remove(0);
-        let store = store_with_watermark("c1:s", t0() - secs(3600));
+        let store = store_with_watermark("c1:s", t0() - secs(3600)).await;
         let h = Harness::build(
             vec![Arc::new(FakeProviderFactory::new(fake.clone()))],
             Some(store),
             cfg,
-        );
-        let stale = h.sched.prepare(conn.clone(), true);
-        let live = h.sched.prepare(conn, true);
+        )
+        .await;
+        let stale = h.sched.prepare(conn.clone(), true).await;
+        let live = h.sched.prepare(conn, true).await;
         assert_eq!(h.sched.shared.cycle().pending.len(), 2);
         drop(stale);
         assert_eq!(h.sched.shared.cycle().pending.len(), 1);
@@ -2424,8 +2535,8 @@ mod tests {
             fake.push_poll("a", Err(ProviderError::Transient("down".into())));
             fake.push_poll("b", Err(ProviderError::Transient("down".into())));
         }
-        let store = store_with_watermarks(&["c1:a", "c1:b"], t0() - secs(3600));
-        let (_h, chaos) = chaos_harness(&fake, Some(store));
+        let store = store_with_watermarks(&["c1:a", "c1:b"], t0() - secs(3600)).await;
+        let (_h, chaos) = chaos_harness(&fake, Some(store)).await;
         // A spin would exceed the cap and hang the poll, failing the counts below.
         chaos.poll_cap.store(100, Ordering::SeqCst);
         pass(30).await;
@@ -2439,11 +2550,12 @@ mod tests {
         let fake = fake_with(&[("a", Tier::Slow), ("d", Tier::Fast)]);
         fake.hold_polls("a");
         fake.push_poll("d", ok(vec![ev("c1:d:start", "run.completed", true)]));
-        let store = store_with_watermarks(&["c1:a", "c1:d"], t0() - secs(3600));
+        let store = store_with_watermarks(&["c1:a", "c1:d"], t0() - secs(3600)).await;
         let mut h = Harness::start_with(
             Arc::new(FakeProviderFactory::new(fake.clone())),
             Some(store),
-        );
+        )
+        .await;
         pass(100).await;
         assert!(of_type(&h.drain(), "catchup.summary").is_empty());
 
@@ -2474,8 +2586,8 @@ mod tests {
         let fake2 = fake_with(&[("d", Tier::Fast)]);
         fake1.hold_polls("a");
         fake2.push_poll("d", ok(vec![ev("c2:d:start", "run.completed", true)]));
-        let store = store_with_watermarks(&["c1:a", "c2:d"], t0() - secs(3600));
-        let mut h = two_connection_harness(&fake1, &fake2, store);
+        let store = store_with_watermarks(&["c1:a", "c2:d"], t0() - secs(3600)).await;
+        let mut h = two_connection_harness(&fake1, &fake2, store).await;
         pass(1).await;
         assert!(of_type(&h.drain(), "catchup.summary").is_empty());
 
@@ -2503,8 +2615,9 @@ mod tests {
         fake.push_poll("s", ok(vec![bot]));
         let mut h = Harness::start_with(
             Arc::new(FakeProviderFactory::new(fake.clone())),
-            Some(store_with_watermark("c1:s", t0() - secs(3600))),
-        );
+            Some(store_with_watermark("c1:s", t0() - secs(3600)).await),
+        )
+        .await;
         pass(1).await;
 
         assert_eq!(fake.poll_count("s"), 1);
@@ -2514,15 +2627,16 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn reload_prepare_polls_normally_but_startup_prepare_catches_up() {
         let fake = fake_with(&[("s", Tier::Fast)]);
-        let store = store_with_watermark("c1:s", t0() - secs(5));
+        let store = store_with_watermark("c1:s", t0() - secs(5)).await;
         let mut cfg = config();
         let conn = cfg.connections.remove(0);
         let mut h = Harness::build(
             vec![Arc::new(FakeProviderFactory::new(fake.clone()))],
             Some(store),
             cfg,
-        );
-        let prepared = h.sched.prepare(conn.clone(), false);
+        )
+        .await;
+        let prepared = h.sched.prepare(conn.clone(), false).await;
         h.sched.launch(prepared);
         pass(1).await;
         assert!(!fake.poll_calls("s")[0].catch_up);
@@ -2531,8 +2645,9 @@ mod tests {
         fake.set_server_time(t0() + secs(5));
         h.store
             .set_watermark("c1:s", t0() + secs(1), t0() + secs(1))
+            .await
             .unwrap();
-        let prepared = h.sched.prepare(conn, true);
+        let prepared = h.sched.prepare(conn, true).await;
         h.sched.launch(prepared);
         pass(1).await;
         assert!(fake.poll_calls("s")[1].catch_up);
@@ -2542,7 +2657,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn shutdown_stops_all_tasks() {
         let fake = fake_with(&[("s", Tier::Fast)]);
-        let h = Harness::start(&fake);
+        let h = Harness::start(&fake).await;
         pass(25).await;
         let before = fake.poll_count("s");
         assert!(before >= 3);

@@ -14,11 +14,10 @@ use tokio::time::Instant;
 use crate::EngineHandle;
 use crate::commands::{self, ToastHover};
 use crate::sound::SoundPlayer;
+use crate::ui_state::{SNOOZE_KEY, UiStateCache};
 
 pub const EVENT_TOASTS: &str = "herald://toasts";
 const BATCH_WINDOW: Duration = Duration::from_millis(500);
-const MUTED_KEY: &str = "muted";
-const SNOOZE_KEY: &str = "snoozed_until_utc";
 const DEFAULT_MAX_VISIBLE: usize = 4;
 /// A hover reported longer than this is treated as stuck (the toast window can miss the leave event).
 const HOVER_MAX: Duration = Duration::from_secs(45);
@@ -245,12 +244,13 @@ fn flush_batch(
     queue: &mut ToastQueue,
     seq: &mut u64,
 ) -> bool {
-    let Some(engine) = app.state::<EngineHandle>().get() else {
+    let (Some(engine), Some(cache)) = (
+        app.state::<EngineHandle>().get(),
+        app.try_state::<UiStateCache>(),
+    ) else {
         return false;
     };
-    let store = engine.store();
-    let ui = |key: &str| store.get_ui_state(key).ok().flatten();
-    if is_snoozed(ui(SNOOZE_KEY).as_deref(), Utc::now()) || os_suppressed() {
+    if is_snoozed(cache.get(SNOOZE_KEY).as_deref(), Utc::now()) || os_suppressed() {
         return false;
     }
     let config = engine.config();
@@ -259,7 +259,7 @@ fn flush_batch(
         return false;
     }
     queue.push(cards);
-    if ui(MUTED_KEY).as_deref() != Some("true")
+    if !cache.muted()
         && let Some(player) = app.try_state::<SoundPlayer>()
     {
         let file = sound_path(&config.sound.file, &engine.paths().home);

@@ -83,9 +83,14 @@ impl PrDiscoverySource {
     async fn poll_inner(&self, ctx: &SyncContext) -> Result<PollOutcome, ProviderError> {
         let old: TrackedThreads = ctx
             .snapshots
-            .get(SNAPSHOT_TRACKED_THREADS)?
+            .get(SNAPSHOT_TRACKED_THREADS)
+            .await?
             .unwrap_or_default();
-        let tracked: TrackedPrs = ctx.snapshots.get(SNAPSHOT_TRACKED_PRS)?.unwrap_or_default();
+        let tracked: TrackedPrs = ctx
+            .snapshots
+            .get(SNAPSHOT_TRACKED_PRS)
+            .await?
+            .unwrap_or_default();
         let roles: HashMap<String, PrRole> = tracked
             .prs
             .iter()
@@ -133,7 +138,8 @@ impl PrDiscoverySource {
                 .filter(|t| failed.contains(&pr_key(&t.repo_id, t.pr_id))),
         );
         ctx.snapshots
-            .put(SNAPSHOT_TRACKED_THREADS, &TrackedThreads { threads })?;
+            .put(SNAPSHOT_TRACKED_THREADS, &TrackedThreads { threads })
+            .await?;
 
         if ctx.watermark.is_none() {
             return Ok(PollOutcome::default());
@@ -440,10 +446,11 @@ mod tests {
         src.poll(&c).await.map(|o| o.events)
     }
 
-    fn snapshot(ctx: &SyncContext) -> Vec<TrackedThread> {
+    async fn snapshot(ctx: &SyncContext) -> Vec<TrackedThread> {
         let s: TrackedThreads = ctx
             .snapshots
             .get(SNAPSHOT_TRACKED_THREADS)
+            .await
             .unwrap()
             .unwrap();
         s.threads
@@ -470,7 +477,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let t = snapshot(&ctx);
+        let t = snapshot(&ctx).await;
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].thread_id, 5);
         assert_eq!(t[0].repo_name, "widgets");
@@ -502,7 +509,7 @@ mod tests {
             .await
             .unwrap();
         assert!(events.is_empty());
-        let t = snapshot(&ctx);
+        let t = snapshot(&ctx).await;
         assert_eq!(t[0].reason, ThreadReason::Commenter);
         assert_eq!(t[0].since_utc, at(10, 2));
     }
@@ -542,6 +549,7 @@ mod tests {
                     }],
                 },
             )
+            .await
             .unwrap();
         let mut src = source(&server);
         let events = run(&mut src, &ctx, Some(at(10, 0)), at(10, 5))
@@ -567,7 +575,7 @@ mod tests {
                 .ends_with("/pullrequest/1?discussionId=5")
         );
 
-        let t = snapshot(&ctx);
+        let t = snapshot(&ctx).await;
         let by_id: HashMap<i64, &TrackedThread> = t.iter().map(|t| (t.thread_id, t)).collect();
         assert_eq!(by_id[&5].reason, ThreadReason::Mentioned);
         assert_eq!(by_id[&5].since_utc, at(10, 3));
@@ -587,7 +595,7 @@ mod tests {
         let (ctx, _s) = sync_context(cfg(), me(), at(10, 5), None, false);
         let mut src = source(&server);
         run(&mut src, &ctx, None, at(10, 5)).await.unwrap();
-        assert_eq!(snapshot(&ctx).len(), 2);
+        assert_eq!(snapshot(&ctx).await.len(), 2);
 
         serve_active(&server, vec![pr(1), second]).await;
         serve_threads(&server, 1, ok(vec![])).await;
@@ -595,7 +603,7 @@ mod tests {
         run(&mut src, &ctx, Some(at(10, 5)), at(10, 6))
             .await
             .unwrap();
-        let ids: Vec<i64> = snapshot(&ctx).iter().map(|t| t.thread_id).collect();
+        let ids: Vec<i64> = snapshot(&ctx).await.iter().map(|t| t.thread_id).collect();
         assert_eq!(ids, [6]);
 
         // PR 2 no longer active: its threads are dropped.
@@ -604,7 +612,7 @@ mod tests {
         run(&mut src, &ctx, Some(at(10, 6)), at(10, 7))
             .await
             .unwrap();
-        assert!(snapshot(&ctx).is_empty());
+        assert!(snapshot(&ctx).await.is_empty());
     }
 
     #[tokio::test]
@@ -621,6 +629,7 @@ mod tests {
         assert!(
             ctx.snapshots
                 .get::<TrackedThreads>(SNAPSHOT_TRACKED_THREADS)
+                .await
                 .unwrap()
                 .is_none()
         );
@@ -645,7 +654,7 @@ mod tests {
         let (ctx, _s) = sync_context(cfg(), me(), at(10, 5), None, false);
         let mut src = source(&server);
         run(&mut src, &ctx, None, at(10, 5)).await.unwrap();
-        let t = snapshot(&ctx);
+        let t = snapshot(&ctx).await;
         assert_eq!(t[0].reason, ThreadReason::Commenter);
         assert_eq!(t[0].since_utc, at(10, 1));
     }

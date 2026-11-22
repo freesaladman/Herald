@@ -24,6 +24,7 @@ use crate::bus::Bus;
 use crate::config::{MatchTable, Paths};
 use crate::event::{ConnectionRef, Event};
 use crate::hooks::CompiledHookFilter;
+use crate::store::{Store, StoreError};
 
 pub const MAX_CLIENTS: usize = 16;
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
@@ -35,6 +36,22 @@ const MAX_PENDING: usize = 32;
 /// Consecutive pings without a pong before a client is dropped.
 const MAX_UNANSWERED_PINGS: u32 = 2;
 const STREAM_FILE: &str = "stream.json";
+/// Matched events replayed per subscribe before the client is told to fetch the rest itself.
+#[cfg(not(test))]
+const REPLAY_CAP: usize = 5000;
+#[cfg(test)]
+const REPLAY_CAP: usize = 10;
+/// Stored events scanned per subscribe, matched or not, so a filter that never matches cannot
+/// walk the whole store on every subscribe.
+#[cfg(not(test))]
+const REPLAY_SCAN_CAP: usize = 50_000;
+#[cfg(test)]
+const REPLAY_SCAN_CAP: usize = 30;
+/// Stored events read per replay step; one step runs per connection loop iteration.
+#[cfg(not(test))]
+const REPLAY_PAGE: u32 = 200;
+#[cfg(test)]
+const REPLAY_PAGE: u32 = 4;
 
 /// Receives the connection id of every `credentials-changed` request. A channel rather
 /// than an engine handle, so the server and the engine never reference each other.
@@ -251,14 +268,7 @@ fn check_request(req: &Request, peer: SocketAddr, token: &str) -> Result<(), Rej
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 enum Inbound {
-    Subscribe {
-        #[serde(default)]
-        types: Vec<String>,
-        #[serde(default, rename = "match")]
-        match_table: MatchTable,
-        #[serde(default = "yes", rename = "includeCatchUp")]
-        include_catch_up: bool,
-    },
+    Subscribe(SubscribeRequest),
     Emit {
         event: Value,
     },
@@ -266,6 +276,18 @@ enum Inbound {
         #[serde(rename = "connectionId")]
         connection_id: String,
     },
+}
+
+#[derive(Deserialize)]
+struct SubscribeRequest {
+    #[serde(default)]
+    types: Vec<String>,
+    #[serde(default, rename = "match")]
+    match_table: MatchTable,
+    #[serde(default = "yes", rename = "includeCatchUp")]
+    include_catch_up: bool,
+    #[serde(default, rename = "afterSeq")]
+    after_seq: Option<u64>,
 }
 
 fn yes() -> bool {
@@ -289,6 +311,162 @@ impl Subscription {
             }
         }
     }
+}
+
+/// Per-connection state. `seq` is `Some` once a subscribe carried `afterSeq`.
+struct Conn {
+    sub: Subscription,
+    seq: Option<SeqState>,
+}
+
+struct SeqState {
+    /// Highest seq already forwarded, scanned or deliberately covered (reset, overflow). Live events
+    /// at or below it are dropped, which dedupes events seen in both the replay and the receiver.
+    gate: u64,
+    replay: Option<Replay>,
+}
+
+struct Replay {
+    /// Last stored seq scanned; the next page starts after it.
+    cursor: u64,
+    /// Last seq sent by this replay, or where it started.
+    sent_through: u64,
+    matched: usize,
+    scanned: usize,
+}
+
+impl Conn {
+    fn new() -> Conn {
+        Conn {
+            sub: Subscription {
+                filter: None,
+                include_catch_up: true,
+            },
+            seq: None,
+        }
+    }
+
+    fn replay_cursor(&self) -> Option<u64> {
+        self.seq.as_ref()?.replay.as_ref().map(|r| r.cursor)
+    }
+
+    fn live(&mut self, event: &Event) -> Vec<Message> {
+        if let (Some(state), Some(seq)) = (self.seq.as_mut(), event.seq) {
+            if seq <= state.gate {
+                return Vec::new();
+            }
+            // Live events arrive in seq order, so everything below is already accounted for
+            // even when this event does not match.
+            state.gate = seq;
+        }
+        if self.sub.wants(event) {
+            vec![event_message(event)]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn lagged(&mut self, missed: u64) -> Vec<Message> {
+        match self.seq.as_mut() {
+            None => vec![text(&error_reply(format!("lagged {missed} events")))],
+            Some(state) => {
+                state.replay = Some(Replay {
+                    cursor: state.gate,
+                    sent_through: state.gate,
+                    matched: 0,
+                    scanned: 0,
+                });
+                Vec::new()
+            }
+        }
+    }
+
+    /// Handles one page of stored events and returns what to send.
+    async fn replay_page(
+        &mut self,
+        page: Result<Vec<Event>, StoreError>,
+        store: &dyn Store,
+    ) -> Vec<Message> {
+        let Some(state) = self.seq.as_mut() else {
+            return Vec::new();
+        };
+        let Some(replay) = state.replay.as_mut() else {
+            return Vec::new();
+        };
+        let events = match page {
+            Ok(events) => events,
+            Err(e) => {
+                state.replay = None;
+                return vec![text(&store_error_reply(&e))];
+            }
+        };
+        let full_page = events.len() >= REPLAY_PAGE as usize;
+        let mut out = Vec::new();
+        for event in &events {
+            let Some(seq) = event.seq else { continue };
+            if replay.scanned >= REPLAY_SCAN_CAP {
+                let replayed_through = replay.cursor;
+                out.extend(self.overflow(replayed_through, store).await);
+                return out;
+            }
+            replay.scanned += 1;
+            replay.cursor = seq;
+            // Scanned counts as covered, like non-matching live events.
+            state.gate = state.gate.max(seq);
+            if !self.sub.wants(event) {
+                continue;
+            }
+            if replay.matched >= REPLAY_CAP {
+                let replayed_through = replay.sent_through;
+                out.extend(self.overflow(replayed_through, store).await);
+                return out;
+            }
+            replay.matched += 1;
+            replay.sent_through = seq;
+            out.push(event_message(event));
+        }
+        if !full_page {
+            state.replay = None;
+        }
+        out
+    }
+
+    /// Ends the replay and tells the client to fetch the rest itself; live resumes past latest.
+    async fn overflow(&mut self, replayed_through: u64, store: &dyn Store) -> Vec<Message> {
+        let Some(state) = self.seq.as_mut() else {
+            return Vec::new();
+        };
+        state.replay = None;
+        match store.latest_seq().await {
+            Ok(latest) => {
+                state.gate = state.gate.max(latest);
+                vec![text(&json!({
+                    "type": "overflow",
+                    "replayedThrough": replayed_through,
+                    "latestSeq": latest,
+                }))]
+            }
+            Err(e) => vec![text(&store_error_reply(&e))],
+        }
+    }
+}
+
+fn event_message(event: &Event) -> Message {
+    text(&json!({ "type": "event", "event": event }))
+}
+
+fn store_error_reply(e: &StoreError) -> Value {
+    match e {
+        StoreError::NeedsUpgrade => error_reply(e.to_string()),
+        _ => {
+            tracing::warn!(error = %e, "stream store read failed");
+            error_reply("event store is unavailable")
+        }
+    }
+}
+
+async fn fetch_page(store: &dyn Store, after: u64) -> Result<Vec<Event>, StoreError> {
+    store.events_after_seq(after, REPLAY_PAGE).await
 }
 
 fn text(v: &Value) -> Message {
@@ -339,15 +517,15 @@ async fn serve_client(
     drop(pending);
     let _client_slot = slot.lock().ok().and_then(|mut held| held.take());
 
-    let mut sub = Subscription {
-        filter: None,
-        include_catch_up: true,
-    };
+    let store = shared.bus.store();
+    let mut conn = Conn::new();
     let mut ping = tokio::time::interval(PING_EVERY);
     ping.tick().await;
     let mut unanswered_pings = 0u32;
     loop {
-        let outgoing: Option<Message> = tokio::select! {
+        // Live events wait in the receiver while a replay runs, so they stay ordered after it.
+        let replay_cursor = conn.replay_cursor();
+        let outgoing: Vec<Message> = tokio::select! {
             _ = stop.changed() => {
                 let _ = ws.close(None).await;
                 return;
@@ -358,40 +536,43 @@ async fn serve_client(
                     return;
                 }
                 unanswered_pings += 1;
-                Some(Message::Ping(Vec::new().into()))
+                vec![Message::Ping(Vec::new().into())]
             }
-            received = events.recv() => match received {
-                Ok(event) => sub
-                    .wants(&event)
-                    .then(|| text(&json!({ "type": "event", "event": &*event }))),
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    Some(text(&error_reply(format!("lagged {n} events"))))
-                }
+            received = events.recv(), if replay_cursor.is_none() => match received {
+                Ok(event) => conn.live(&event),
+                Err(broadcast::error::RecvError::Lagged(n)) => conn.lagged(n),
                 Err(broadcast::error::RecvError::Closed) => return,
             },
+            page = fetch_page(&*store, replay_cursor.unwrap_or(0)), if replay_cursor.is_some() => {
+                conn.replay_page(page, &*store).await
+            }
             incoming = ws.next() => match incoming {
                 Some(Ok(Message::Text(body))) => {
-                    Some(text(&handle_text(body.as_str(), &shared, &mut sub)))
+                    handle_text(body.as_str(), &shared, &*store, &mut conn)
+                        .await
+                        .iter()
+                        .map(text)
+                        .collect()
                 }
                 Some(Ok(Message::Binary(_))) => {
-                    Some(text(&error_reply("binary messages are not supported")))
+                    vec![text(&error_reply("binary messages are not supported"))]
                 }
                 Some(Ok(Message::Pong(_))) => {
                     unanswered_pings = 0;
-                    None
+                    Vec::new()
                 }
                 Some(Ok(Message::Close(_))) | None => return,
-                Some(Ok(_)) => None,
+                Some(Ok(_)) => Vec::new(),
                 Some(Err(e)) => {
                     tracing::debug!(%peer, error = %e, "stream client read failed");
                     return;
                 }
             },
         };
-        if let Some(message) = outgoing
-            && ws.send(message).await.is_err()
-        {
-            return;
+        for message in outgoing {
+            if ws.send(message).await.is_err() {
+                return;
+            }
         }
     }
 }
@@ -400,43 +581,112 @@ fn error_reply(message: impl Into<String>) -> Value {
     json!({ "type": "error", "message": message.into() })
 }
 
-fn handle_text(body: &str, shared: &Shared, sub: &mut Subscription) -> Value {
+async fn handle_text(
+    body: &str,
+    shared: &Shared,
+    store: &dyn Store,
+    conn: &mut Conn,
+) -> Vec<Value> {
     let message: Inbound = match serde_json::from_str(body) {
         Ok(m) => m,
-        Err(e) => return error_reply(format!("invalid message: {e}")),
+        Err(e) => return vec![error_reply(format!("invalid message: {e}"))],
     };
     match message {
-        Inbound::Subscribe {
-            types,
-            match_table,
-            include_catch_up,
-        } => {
-            let types = if types.is_empty() {
-                vec!["*".to_string()]
-            } else {
-                types
-            };
-            sub.filter = Some(CompiledHookFilter::new(&types, &match_table));
-            sub.include_catch_up = include_catch_up;
-            json!({ "type": "ok" })
-        }
-        Inbound::Emit { event } => match build_test_event(event) {
+        Inbound::Subscribe(request) => subscribe(conn, store, request).await,
+        Inbound::Emit { event } => vec![match build_test_event(event) {
             Err(message) => error_reply(message),
             Ok(event) => {
                 let id = event.id.clone();
-                match shared.bus.publish(event) {
+                match shared.bus.publish(event).await {
                     Some(_) => json!({ "type": "ok", "id": id }),
                     None => error_reply("event was not published"),
                 }
             }
-        },
+        }],
         Inbound::CredentialsChanged { connection_id } => {
             if shared.control.send(connection_id).is_err() {
-                return error_reply("engine is not accepting credential changes");
+                return vec![error_reply("engine is not accepting credential changes")];
             }
-            json!({ "type": "ok" })
+            vec![json!({ "type": "ok" })]
         }
     }
+}
+
+struct StoreMeta {
+    latest_seq: u64,
+    oldest_seq: Option<u64>,
+    store_id: String,
+}
+
+async fn store_meta(store: &dyn Store) -> Result<StoreMeta, StoreError> {
+    Ok(StoreMeta {
+        latest_seq: store.latest_seq().await?,
+        oldest_seq: store.oldest_seq().await?,
+        store_id: store.store_id().await?,
+    })
+}
+
+/// Replies `ok` first, then (with `afterSeq`) arms a replay that the connection loop runs in
+/// pages. A subscribe replaces any replay in progress and resumes after the last seq it sent, so
+/// it never re-sends a seq already forwarded. Unfiltered events a client got before its first
+/// `ok` are not tracked and may be replayed.
+async fn subscribe(conn: &mut Conn, store: &dyn Store, request: SubscribeRequest) -> Vec<Value> {
+    let meta = match (store_meta(store).await, request.after_seq) {
+        (Ok(meta), _) => Some(meta),
+        (Err(e), Some(_)) => return vec![store_error_reply(&e)],
+        (Err(e), None) => {
+            tracing::warn!(error = %e, "stream subscribe could not read store positions");
+            None
+        }
+    };
+    let types = if request.types.is_empty() {
+        vec!["*".to_string()]
+    } else {
+        request.types
+    };
+    conn.sub.filter = Some(CompiledHookFilter::new(&types, &request.match_table));
+    conn.sub.include_catch_up = request.include_catch_up;
+
+    let mut ok = json!({ "type": "ok" });
+    if let Some(meta) = &meta {
+        ok["latestSeq"] = json!(meta.latest_seq);
+        ok["oldestSeq"] = json!(meta.oldest_seq);
+        ok["storeId"] = json!(meta.store_id);
+    }
+    let mut replies = vec![ok];
+    let (Some(after), Some(meta)) = (request.after_seq, &meta) else {
+        conn.seq = None;
+        return replies;
+    };
+    if after > meta.latest_seq {
+        conn.seq = Some(SeqState {
+            gate: meta.latest_seq,
+            replay: None,
+        });
+        replies.push(json!({
+            "type": "reset",
+            "latestSeq": meta.latest_seq,
+            "storeId": meta.store_id,
+        }));
+        return replies;
+    }
+    // Mid-replay the gate may be past what was sent (scanned, unmatched), so resume from the
+    // last sent seq; the new filter may match what the old one skipped.
+    let forwarded = conn.seq.as_ref().map_or(0, |s| match &s.replay {
+        Some(replay) => replay.sent_through,
+        None => s.gate,
+    });
+    let start = after.max(forwarded);
+    conn.seq = Some(SeqState {
+        gate: start,
+        replay: (start < meta.latest_seq).then_some(Replay {
+            cursor: start,
+            sent_through: start,
+            matched: 0,
+            scanned: 0,
+        }),
+    });
+    replies
 }
 
 /// Recursive for objects so a partial `actor` or `connection` keeps the other defaults.
@@ -491,7 +741,7 @@ mod tests {
     use crate::classify::Classifier;
     use crate::config::Config;
     use crate::local_repos::LocalIndex;
-    use crate::store::Store;
+    use crate::store::SqliteStore;
     use std::collections::BTreeMap;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::http::Request as HttpRequest;
@@ -510,7 +760,7 @@ mod tests {
     async fn harness() -> Harness {
         let config = Config::from_toml_str(Config::default_toml()).unwrap();
         let bus = Arc::new(Bus::new(
-            Arc::new(Store::open_in_memory().unwrap()),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
             Classifier::new(&config, &BTreeMap::new()),
             LocalIndex::empty(),
         ));
@@ -636,7 +886,7 @@ mod tests {
     async fn client_receives_published_events() {
         let h = harness().await;
         let mut c = connect(&h).await;
-        h.bus.publish(event("a", "pr.created")).unwrap();
+        h.bus.publish(event("a", "pr.created")).await.unwrap();
         let m = recv(&mut c).await;
         assert_eq!(m["type"], "event");
         assert_eq!(m["event"]["id"], "a");
@@ -651,11 +901,14 @@ mod tests {
             json!({"type":"subscribe","types":["pr.*"],"match":{"connection.id":"c1"}}),
         )
         .await;
-        h.bus.publish(event("branch", "branch.pushed")).unwrap();
+        h.bus
+            .publish(event("branch", "branch.pushed"))
+            .await
+            .unwrap();
         let mut other = event("other-conn", "pr.created");
         other.connection.id = "c2".into();
-        h.bus.publish(other).unwrap();
-        h.bus.publish(event("hit", "pr.created")).unwrap();
+        h.bus.publish(other).await.unwrap();
+        h.bus.publish(event("hit", "pr.created")).await.unwrap();
         assert_eq!(recv(&mut c).await["event"]["id"], "hit");
     }
 
@@ -666,8 +919,8 @@ mod tests {
         subscribe(&mut c, json!({"type":"subscribe","includeCatchUp":false})).await;
         let mut old = event("old", "pr.created");
         old.catch_up = true;
-        h.bus.publish(old).unwrap();
-        h.bus.publish(event("new", "pr.created")).unwrap();
+        h.bus.publish(old).await.unwrap();
+        h.bus.publish(event("new", "pr.created")).await.unwrap();
         assert_eq!(recv(&mut c).await["event"]["id"], "new");
     }
 
@@ -790,5 +1043,316 @@ mod tests {
         send(&mut c, json!({"type":"emit","event":{}})).await;
         assert_eq!(recv(&mut c).await["type"], "error");
         subscribe(&mut c, json!({"type":"subscribe"})).await;
+    }
+
+    async fn seed(h: &Harness, n: usize) {
+        seed_range(h, 1, n).await;
+    }
+
+    async fn seed_range(h: &Harness, from: usize, to: usize) {
+        for i in from..=to {
+            h.bus
+                .publish(event(&format!("e{i}"), "pr.created"))
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn recv_seqs(c: &mut Client, n: usize) -> Vec<u64> {
+        let mut seqs = Vec::new();
+        for _ in 0..n {
+            let m = recv(c).await;
+            assert_eq!(m["type"], "event", "{m}");
+            seqs.push(m["event"]["seq"].as_u64().unwrap());
+        }
+        seqs
+    }
+
+    async fn assert_quiet(c: &mut Client) {
+        let next = tokio::time::timeout(Duration::from_millis(300), c.next()).await;
+        assert!(next.is_err(), "unexpected message: {next:?}");
+    }
+
+    fn replay_request(after: u64) -> SubscribeRequest {
+        SubscribeRequest {
+            types: Vec::new(),
+            match_table: MatchTable::new(),
+            include_catch_up: true,
+            after_seq: Some(after),
+        }
+    }
+
+    #[tokio::test]
+    async fn ok_reports_positions_and_precedes_replayed_events() {
+        let h = harness().await;
+        let mut c = connect(&h).await;
+        send(&mut c, json!({"type":"subscribe"})).await;
+        let empty = recv(&mut c).await;
+        assert_eq!(empty["type"], "ok");
+        assert_eq!(empty["latestSeq"], 0);
+        assert!(empty["oldestSeq"].is_null());
+        assert!(!empty["storeId"].as_str().unwrap().is_empty());
+
+        // Seeded after the first subscribe: live copies are already forwarded, so
+        // consume them, then replay from 0 on a fresh connection.
+        seed(&h, 3).await;
+        let mut c = connect(&h).await;
+        send(&mut c, json!({"type":"subscribe","afterSeq":0})).await;
+        let ok = recv(&mut c).await;
+        assert_eq!(ok["type"], "ok");
+        assert_eq!(ok["latestSeq"], 3);
+        assert_eq!(ok["oldestSeq"], 1);
+        assert_eq!(ok["storeId"], empty["storeId"]);
+        assert_eq!(recv_seqs(&mut c, 3).await, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn replay_then_live_has_no_gap_or_duplicate() {
+        let h = harness().await;
+        seed(&h, 8).await;
+        let mut c = connect(&h).await;
+        send(&mut c, json!({"type":"subscribe","afterSeq":2})).await;
+        seed_range(&h, 9, 11).await;
+        // Frames before the `ok` may include live copies; the contract starts after it.
+        while recv(&mut c).await["type"] != "ok" {}
+        let mut seqs = Vec::new();
+        while let Ok(Some(Ok(Message::Text(body)))) =
+            tokio::time::timeout(Duration::from_millis(300), c.next()).await
+        {
+            let m: Value = serde_json::from_str(body.as_str()).unwrap();
+            seqs.push(m["event"]["seq"].as_u64().unwrap());
+        }
+        assert_eq!(seqs, (3..=11).collect::<Vec<u64>>());
+    }
+
+    #[tokio::test]
+    async fn replay_includes_events_published_before_the_subscribe_was_acked() {
+        let h = harness().await;
+        let mut c = connect(&h).await;
+        seed(&h, 3).await;
+        // Let the live copies go out ahead of the subscribe, as they do for the CLI.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        send(&mut c, json!({"type":"subscribe","afterSeq":0})).await;
+        // The CLI discards every event frame that arrives before `ok`.
+        while recv(&mut c).await["type"] != "ok" {}
+        assert_eq!(recv_seqs(&mut c, 3).await, vec![1, 2, 3]);
+        assert_quiet(&mut c).await;
+    }
+
+    #[tokio::test]
+    async fn filters_apply_to_replay() {
+        let h = harness().await;
+        for (i, t) in [
+            "pr.created",
+            "branch.pushed",
+            "pr.completed",
+            "run.completed",
+        ]
+        .iter()
+        .enumerate()
+        {
+            h.bus.publish(event(&format!("e{i}"), t)).await.unwrap();
+        }
+        let mut old = event("old", "pr.created");
+        old.catch_up = true;
+        h.bus.publish(old).await.unwrap();
+        let mut c = connect(&h).await;
+        subscribe(
+            &mut c,
+            json!({"type":"subscribe","afterSeq":0,"types":["pr.*"],"includeCatchUp":false}),
+        )
+        .await;
+        assert_eq!(recv_seqs(&mut c, 2).await, vec![1, 3]);
+        assert_quiet(&mut c).await;
+    }
+
+    #[tokio::test]
+    async fn overflow_at_the_cap_then_live_past_latest() {
+        let h = harness().await;
+        seed(&h, REPLAY_CAP + 5).await;
+        let mut c = connect(&h).await;
+        subscribe(&mut c, json!({"type":"subscribe","afterSeq":0})).await;
+        let expected: Vec<u64> = (1..=REPLAY_CAP as u64).collect();
+        assert_eq!(recv_seqs(&mut c, REPLAY_CAP).await, expected);
+        let overflow = recv(&mut c).await;
+        assert_eq!(overflow["type"], "overflow");
+        assert_eq!(overflow["replayedThrough"], REPLAY_CAP);
+        assert_eq!(overflow["latestSeq"], REPLAY_CAP + 5);
+        assert_quiet(&mut c).await;
+
+        h.bus.publish(event("next", "pr.created")).await.unwrap();
+        assert_eq!(recv_seqs(&mut c, 1).await, vec![REPLAY_CAP as u64 + 6]);
+    }
+
+    fn never_matching(after: u64) -> SubscribeRequest {
+        SubscribeRequest {
+            types: vec!["nothing.*".to_string()],
+            ..replay_request(after)
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_cap_overflows_on_a_filter_that_never_matches() {
+        let h = harness().await;
+        let store = h.bus.store();
+        seed(&h, REPLAY_SCAN_CAP + 5).await;
+        let mut conn = Conn::new();
+        super::subscribe(&mut conn, &*store, never_matching(0)).await;
+        let mut notices = Vec::new();
+        while let Some(cursor) = conn.replay_cursor() {
+            let page = fetch_page(&*store, cursor).await;
+            for m in conn.replay_page(page, &*store).await {
+                let Message::Text(body) = m else { continue };
+                notices.push(serde_json::from_str::<Value>(body.as_str()).unwrap());
+            }
+        }
+        let [overflow] = notices.as_slice() else {
+            panic!("expected one overflow: {notices:?}");
+        };
+        assert_eq!(overflow["type"], "overflow");
+        assert_eq!(overflow["replayedThrough"], REPLAY_SCAN_CAP);
+        assert_eq!(overflow["latestSeq"], REPLAY_SCAN_CAP + 5);
+    }
+
+    #[tokio::test]
+    async fn unmatched_events_advance_the_gate_so_they_are_not_rescanned() {
+        let h = harness().await;
+        let store = h.bus.store();
+        seed(&h, 6).await;
+        let mut conn = Conn::new();
+        super::subscribe(&mut conn, &*store, never_matching(0)).await;
+        assert!(drain_replay(&mut conn, &*store).await.is_empty());
+        super::subscribe(&mut conn, &*store, never_matching(0)).await;
+        assert!(conn.replay_cursor().is_none());
+    }
+
+    #[tokio::test]
+    async fn after_seq_beyond_latest_resets_and_goes_live() {
+        let h = harness().await;
+        seed(&h, 2).await;
+        let mut c = connect(&h).await;
+        send(&mut c, json!({"type":"subscribe","afterSeq":99})).await;
+        let ok = recv(&mut c).await;
+        let reset = recv(&mut c).await;
+        assert_eq!(reset["type"], "reset");
+        assert_eq!(reset["latestSeq"], 2);
+        assert_eq!(reset["storeId"], ok["storeId"]);
+        assert_quiet(&mut c).await;
+        h.bus.publish(event("e3", "pr.created")).await.unwrap();
+        assert_eq!(recv_seqs(&mut c, 1).await, vec![3]);
+    }
+
+    #[tokio::test]
+    async fn repeat_subscribe_does_not_resend_forwarded_seqs() {
+        let h = harness().await;
+        seed(&h, 3).await;
+        let mut c = connect(&h).await;
+        subscribe(&mut c, json!({"type":"subscribe","afterSeq":0})).await;
+        assert_eq!(recv_seqs(&mut c, 3).await, vec![1, 2, 3]);
+        subscribe(&mut c, json!({"type":"subscribe","afterSeq":0})).await;
+        assert_quiet(&mut c).await;
+        h.bus.publish(event("e4", "pr.created")).await.unwrap();
+        assert_eq!(recv_seqs(&mut c, 1).await, vec![4]);
+    }
+
+    #[tokio::test]
+    async fn transient_events_are_forwarded_in_seq_mode() {
+        let h = harness().await;
+        let mut c = connect(&h).await;
+        subscribe(&mut c, json!({"type":"subscribe","afterSeq":0})).await;
+        h.bus.publish_transient(event("ui", "record.activated"));
+        let m = recv(&mut c).await;
+        assert_eq!(m["event"]["id"], "ui");
+        assert!(m["event"].get("seq").is_none());
+        h.bus.publish(event("a", "pr.created")).await.unwrap();
+        assert_eq!(recv_seqs(&mut c, 1).await, vec![1]);
+    }
+
+    async fn drain_replay(conn: &mut Conn, store: &dyn Store) -> Vec<u64> {
+        let mut seqs = Vec::new();
+        while let Some(cursor) = conn.replay_cursor() {
+            let page = fetch_page(store, cursor).await;
+            for m in conn.replay_page(page, store).await {
+                let Message::Text(body) = m else { continue };
+                let v: Value = serde_json::from_str(body.as_str()).unwrap();
+                seqs.extend(v["event"]["seq"].as_u64());
+            }
+        }
+        seqs
+    }
+
+    #[tokio::test]
+    async fn lagged_in_seq_mode_replays_from_the_last_forwarded_seq() {
+        let h = harness().await;
+        let store = h.bus.store();
+        seed(&h, 7).await;
+        let mut conn = Conn::new();
+        super::subscribe(&mut conn, &*store, replay_request(5)).await;
+        assert_eq!(drain_replay(&mut conn, &*store).await, vec![6, 7]);
+
+        seed_range(&h, 8, 10).await;
+        assert!(conn.lagged(40).is_empty());
+        assert_eq!(drain_replay(&mut conn, &*store).await, vec![8, 9, 10]);
+        // Events the receiver still delivers after the lag are deduped by the gate.
+        let stale = store.get_event("e9").await.unwrap().unwrap();
+        assert!(conn.live(&stale).is_empty());
+    }
+
+    #[tokio::test]
+    async fn lagged_outside_seq_mode_only_reports_the_lag() {
+        let mut conn = Conn::new();
+        let msgs = conn.lagged(3);
+        let [Message::Text(body)] = msgs.as_slice() else {
+            panic!("expected one message");
+        };
+        let v: Value = serde_json::from_str(body.as_str()).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["message"], "lagged 3 events");
+        assert!(conn.replay_cursor().is_none());
+    }
+
+    #[tokio::test]
+    async fn subscribe_mid_replay_restarts_after_what_was_already_sent() {
+        let h = harness().await;
+        let store = h.bus.store();
+        seed(&h, 9).await;
+        let mut conn = Conn::new();
+        // Sent live before the first subscribe; the replay still covers them.
+        for seq in 5..=7 {
+            let live = store.get_event(&format!("e{seq}")).await.unwrap().unwrap();
+            assert_eq!(conn.live(&live).len(), 1);
+        }
+        super::subscribe(&mut conn, &*store, replay_request(0)).await;
+        let cursor = conn.replay_cursor().unwrap();
+        let page = fetch_page(&*store, cursor).await;
+        assert_eq!(conn.replay_page(page, &*store).await.len(), 4);
+
+        super::subscribe(&mut conn, &*store, replay_request(0)).await;
+        assert_eq!(drain_replay(&mut conn, &*store).await, vec![5, 6, 7, 8, 9]);
+    }
+
+    #[tokio::test]
+    async fn resubscribe_mid_replay_restarts_from_the_last_sent_not_the_scanned_seq() {
+        let h = harness().await;
+        let store = h.bus.store();
+        seed(&h, 9).await;
+        let mut conn = Conn::new();
+        super::subscribe(&mut conn, &*store, never_matching(0)).await;
+        let cursor = conn.replay_cursor().unwrap();
+        let page = fetch_page(&*store, cursor).await;
+        assert!(conn.replay_page(page, &*store).await.is_empty());
+
+        super::subscribe(&mut conn, &*store, replay_request(0)).await;
+        assert_eq!(
+            drain_replay(&mut conn, &*store).await,
+            (1..=9).collect::<Vec<u64>>()
+        );
+    }
+
+    #[test]
+    fn needs_upgrade_maps_to_an_error_reply() {
+        let reply = store_error_reply(&StoreError::NeedsUpgrade);
+        assert_eq!(reply["type"], "error");
+        assert!(reply["message"].as_str().unwrap().contains("upgrade"));
     }
 }

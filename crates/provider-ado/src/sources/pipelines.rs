@@ -133,11 +133,26 @@ impl PipelinesSource {
     }
 
     async fn poll_inner(&self, ctx: &SyncContext) -> Result<PollOutcome, ProviderError> {
-        let branches: MyBranches = ctx.snapshots.get(SNAPSHOT_MY_BRANCHES)?.unwrap_or_default();
-        let prs: TrackedPrs = ctx.snapshots.get(SNAPSHOT_TRACKED_PRS)?.unwrap_or_default();
-        let prev_stages: StageSnapshot = ctx.snapshots.get(SNAPSHOT_STAGES)?.unwrap_or_default();
-        let prev_approvals: ApprovalSnapshot =
-            ctx.snapshots.get(SNAPSHOT_APPROVALS)?.unwrap_or_default();
+        let branches: MyBranches = ctx
+            .snapshots
+            .get(SNAPSHOT_MY_BRANCHES)
+            .await?
+            .unwrap_or_default();
+        let prs: TrackedPrs = ctx
+            .snapshots
+            .get(SNAPSHOT_TRACKED_PRS)
+            .await?
+            .unwrap_or_default();
+        let prev_stages: StageSnapshot = ctx
+            .snapshots
+            .get(SNAPSHOT_STAGES)
+            .await?
+            .unwrap_or_default();
+        let prev_approvals: ApprovalSnapshot = ctx
+            .snapshots
+            .get(SNAPSHOT_APPROVALS)
+            .await?
+            .unwrap_or_default();
         let mine = Mine {
             me: &ctx.me,
             branches: &branches,
@@ -163,7 +178,11 @@ impl PipelinesSource {
         results.sort_by_key(|(i, _)| *i);
 
         let mut events = Vec::new();
-        let mut builds: MyBuilds = ctx.snapshots.get(SNAPSHOT_MY_BUILDS)?.unwrap_or_default();
+        let mut builds: MyBuilds = ctx
+            .snapshots
+            .get(SNAPSHOT_MY_BUILDS)
+            .await?
+            .unwrap_or_default();
         let mut stages = StageSnapshot::default();
         let mut approvals = ApprovalSnapshot::default();
         for (_, out) in results {
@@ -175,9 +194,9 @@ impl PipelinesSource {
             approvals.pending.extend(out.approvals);
         }
         builds.prune_older_than(ctx.server_now - Duration::days(BUILD_RETENTION_DAYS));
-        ctx.snapshots.put(SNAPSHOT_MY_BUILDS, &builds)?;
-        ctx.snapshots.put(SNAPSHOT_STAGES, &stages)?;
-        ctx.snapshots.put(SNAPSHOT_APPROVALS, &approvals)?;
+        ctx.snapshots.put(SNAPSHOT_MY_BUILDS, &builds).await?;
+        ctx.snapshots.put(SNAPSHOT_STAGES, &stages).await?;
+        ctx.snapshots.put(SNAPSHOT_APPROVALS, &approvals).await?;
         Ok(PollOutcome { events })
     }
 
@@ -674,8 +693,12 @@ mod tests {
         src.poll(&c).await.map(|o| o.events)
     }
 
-    fn my_builds(ctx: &SyncContext) -> MyBuilds {
-        ctx.snapshots.get(SNAPSHOT_MY_BUILDS).unwrap().unwrap()
+    async fn my_builds(ctx: &SyncContext) -> MyBuilds {
+        ctx.snapshots
+            .get(SNAPSHOT_MY_BUILDS)
+            .await
+            .unwrap()
+            .unwrap()
     }
 
     fn tracked(pr_id: i64, role: PrRole) -> TrackedPr {
@@ -706,8 +729,13 @@ mod tests {
         let ctx = live_ctx();
         let events = run(&mut source(&server), &ctx, None).await.unwrap();
         assert!(events.is_empty());
-        assert!(my_builds(&ctx).contains(1));
-        let a: ApprovalSnapshot = ctx.snapshots.get(SNAPSHOT_APPROVALS).unwrap().unwrap();
+        assert!(my_builds(&ctx).await.contains(1));
+        let a: ApprovalSnapshot = ctx
+            .snapshots
+            .get(SNAPSHOT_APPROVALS)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(a.pending.len(), 1);
         // The seeded stage failure stays quiet on the next poll.
         let again = run(&mut source(&server), &ctx, Some(at(20, 11)))
@@ -746,6 +774,7 @@ mod tests {
                     }],
                 },
             )
+            .await
             .unwrap();
         let events = run(&mut source(&server), &ctx, Some(at(20, 11)))
             .await
@@ -760,7 +789,7 @@ mod tests {
         assert_eq!(e.url.as_deref(), Some("https://example.test/build/1"));
         assert_eq!(e.run.as_ref().unwrap().result, "failed");
         assert!(e.pr.is_none());
-        let mine = my_builds(&ctx);
+        let mine = my_builds(&ctx).await;
         assert!(mine.contains(1) && mine.contains(3) && !mine.contains(2));
     }
 
@@ -785,6 +814,7 @@ mod tests {
                     prs: vec![tracked(7, PrRole::Author), tracked(8, PrRole::Reviewer)],
                 },
             )
+            .await
             .unwrap();
         let events = run(&mut source(&server), &ctx, Some(at(20, 11)))
             .await
@@ -892,7 +922,12 @@ mod tests {
             .await
             .unwrap();
         assert!(events.is_empty());
-        let a: ApprovalSnapshot = ctx.snapshots.get(SNAPSHOT_APPROVALS).unwrap().unwrap();
+        let a: ApprovalSnapshot = ctx
+            .snapshots
+            .get(SNAPSHOT_APPROVALS)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(a.pending.len(), 1);
     }
 
@@ -904,11 +939,14 @@ mod tests {
         let mut seeded = MyBuilds::default();
         seeded.insert(98, ctx.server_now - Duration::days(10));
         seeded.insert(99, ctx.server_now - Duration::days(31));
-        ctx.snapshots.put(SNAPSHOT_MY_BUILDS, &seeded).unwrap();
+        ctx.snapshots
+            .put(SNAPSHOT_MY_BUILDS, &seeded)
+            .await
+            .unwrap();
         run(&mut source(&server), &ctx, Some(at(20, 11)))
             .await
             .unwrap();
-        let mine = my_builds(&ctx);
+        let mine = my_builds(&ctx).await;
         assert!(mine.contains(98) && !mine.contains(99));
     }
 

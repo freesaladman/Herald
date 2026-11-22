@@ -122,8 +122,16 @@ impl PrLifecycleSource {
     }
 
     async fn poll_inner(&self, ctx: &SyncContext) -> Result<PollOutcome, ProviderError> {
-        let old: TrackedPrs = ctx.snapshots.get(SNAPSHOT_TRACKED_PRS)?.unwrap_or_default();
-        let mut state: Lifecycle = ctx.snapshots.get(SNAPSHOT_LIFECYCLE)?.unwrap_or_default();
+        let old: TrackedPrs = ctx
+            .snapshots
+            .get(SNAPSHOT_TRACKED_PRS)
+            .await?
+            .unwrap_or_default();
+        let mut state: Lifecycle = ctx
+            .snapshots
+            .get(SNAPSHOT_LIFECYCLE)
+            .await?
+            .unwrap_or_default();
         let active = active_prs(&self.shared).await?;
         let org = &self.shared.organization;
 
@@ -220,10 +228,11 @@ impl PrLifecycleSource {
 
         if ctx.watermark.is_none() {
             ctx.snapshots
-                .put(SNAPSHOT_TRACKED_PRS, &TrackedPrs { prs: tracked })?;
+                .put(SNAPSHOT_TRACKED_PRS, &TrackedPrs { prs: tracked })
+                .await?;
             descriptions.retain(|_, d| d.seen_utc >= ctx.server_now - CLOSED_KEEP);
             state.descriptions = descriptions;
-            ctx.snapshots.put(SNAPSHOT_LIFECYCLE, &state)?;
+            ctx.snapshots.put(SNAPSHOT_LIFECYCLE, &state).await?;
             return Ok(PollOutcome::default());
         }
 
@@ -421,8 +430,9 @@ impl PrLifecycleSource {
         state.forbidden_since = forbidden_since;
 
         ctx.snapshots
-            .put(SNAPSHOT_TRACKED_PRS, &TrackedPrs { prs: tracked })?;
-        ctx.snapshots.put(SNAPSHOT_LIFECYCLE, &state)?;
+            .put(SNAPSHOT_TRACKED_PRS, &TrackedPrs { prs: tracked })
+            .await?;
+        ctx.snapshots.put(SNAPSHOT_LIFECYCLE, &state).await?;
         Ok(PollOutcome { events })
     }
 }
@@ -675,7 +685,12 @@ mod tests {
         let (ctx, _store) = sync_context(cfg(), me(), at(10, 1), None, false);
         let mut src = source(&server);
         assert!(run(&mut src, &ctx, None, at(10, 1), false).await.is_empty());
-        let snap: TrackedPrs = ctx.snapshots.get(SNAPSHOT_TRACKED_PRS).unwrap().unwrap();
+        let snap: TrackedPrs = ctx
+            .snapshots
+            .get(SNAPSHOT_TRACKED_PRS)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(snap.prs.len(), 1);
         assert_eq!(snap.prs[0].pr_id, 1);
         assert_eq!(snap.prs[0].status, "active");
@@ -705,7 +720,12 @@ mod tests {
         let (ctx, _store) = sync_context(cfg(), me(), at(10, 1), None, false);
         let mut src = source(&server);
         run(&mut src, &ctx, None, at(10, 1), false).await;
-        let snap: TrackedPrs = ctx.snapshots.get(SNAPSHOT_TRACKED_PRS).unwrap().unwrap();
+        let snap: TrackedPrs = ctx
+            .snapshots
+            .get(SNAPSHOT_TRACKED_PRS)
+            .await
+            .unwrap()
+            .unwrap();
         let roles: Vec<(i64, PrRole)> = snap.prs.iter().map(|p| (p.pr_id, p.role)).collect();
         assert_eq!(
             roles,
@@ -877,7 +897,12 @@ mod tests {
                 .await
                 .is_empty()
         );
-        let snap: TrackedPrs = ctx.snapshots.get(SNAPSHOT_TRACKED_PRS).unwrap().unwrap();
+        let snap: TrackedPrs = ctx
+            .snapshots
+            .get(SNAPSHOT_TRACKED_PRS)
+            .await
+            .unwrap()
+            .unwrap();
         let titles: Vec<&str> = snap.prs.iter().map(|p| p.title.as_str()).collect();
         assert_eq!(titles, ["renamed", "change 2"]);
 
@@ -952,7 +977,12 @@ mod tests {
         serve_pr(&server, 2, ResponseTemplate::new(200).set_body_json(closed)).await;
         let events = run(&mut src, &ctx, Some(at(10, 2)), at(10, 4), false).await;
         assert_eq!(types(&events), ["pr.abandoned"]);
-        let snap: TrackedPrs = ctx.snapshots.get(SNAPSHOT_TRACKED_PRS).unwrap().unwrap();
+        let snap: TrackedPrs = ctx
+            .snapshots
+            .get(SNAPSHOT_TRACKED_PRS)
+            .await
+            .unwrap()
+            .unwrap();
         let ids: Vec<i64> = snap.prs.iter().map(|p| p.pr_id).collect();
         assert_eq!(ids, [1]);
     }
@@ -974,7 +1004,12 @@ mod tests {
                 .await
                 .is_empty()
         );
-        let snap: TrackedPrs = ctx.snapshots.get(SNAPSHOT_TRACKED_PRS).unwrap().unwrap();
+        let snap: TrackedPrs = ctx
+            .snapshots
+            .get(SNAPSHOT_TRACKED_PRS)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(snap.prs.len(), 1);
 
         serve_active(&server, vec![review]).await;
@@ -997,13 +1032,23 @@ mod tests {
         (src, ctx)
     }
 
-    fn tracked_ids(ctx: &SyncContext) -> Vec<i64> {
-        let snap: TrackedPrs = ctx.snapshots.get(SNAPSHOT_TRACKED_PRS).unwrap().unwrap();
+    async fn tracked_ids(ctx: &SyncContext) -> Vec<i64> {
+        let snap: TrackedPrs = ctx
+            .snapshots
+            .get(SNAPSHOT_TRACKED_PRS)
+            .await
+            .unwrap()
+            .unwrap();
         snap.prs.iter().map(|p| p.pr_id).collect()
     }
 
-    fn forbidden_count(ctx: &SyncContext) -> usize {
-        let state: Lifecycle = ctx.snapshots.get(SNAPSHOT_LIFECYCLE).unwrap().unwrap();
+    async fn forbidden_count(ctx: &SyncContext) -> usize {
+        let state: Lifecycle = ctx
+            .snapshots
+            .get(SNAPSHOT_LIFECYCLE)
+            .await
+            .unwrap()
+            .unwrap();
         state.forbidden_since.len()
     }
 
@@ -1023,16 +1068,16 @@ mod tests {
                 .await
                 .is_empty()
         );
-        assert_eq!(tracked_ids(&ctx), [2]);
-        assert_eq!(forbidden_count(&ctx), 1);
+        assert_eq!(tracked_ids(&ctx).await, [2]);
+        assert_eq!(forbidden_count(&ctx).await, 1);
 
         assert!(
             run(&mut src, &ctx, Some(at(11, 2)), at(11, 3), false)
                 .await
                 .is_empty()
         );
-        assert!(tracked_ids(&ctx).is_empty());
-        assert_eq!(forbidden_count(&ctx), 0);
+        assert!(tracked_ids(&ctx).await.is_empty());
+        assert_eq!(forbidden_count(&ctx).await, 0);
     }
 
     #[tokio::test]
@@ -1041,7 +1086,7 @@ mod tests {
         let (mut src, ctx) = tracked_pr_missing_from_list(&server).await;
         serve_pr(&server, 2, ResponseTemplate::new(403)).await;
         run(&mut src, &ctx, Some(at(10, 1)), at(10, 2), false).await;
-        assert_eq!(forbidden_count(&ctx), 1);
+        assert_eq!(forbidden_count(&ctx).await, 1);
 
         let mut review = pr(2, "other", at(1, 0));
         review["reviewers"] = json!([{ "id": ME, "isContainer": false }]);
@@ -1052,12 +1097,12 @@ mod tests {
                 .await
                 .is_empty()
         );
-        assert_eq!(forbidden_count(&ctx), 0);
+        assert_eq!(forbidden_count(&ctx).await, 0);
 
         serve_active(&server, vec![]).await;
         serve_pr(&server, 2, ResponseTemplate::new(403)).await;
         run(&mut src, &ctx, Some(at(11, 1)), at(11, 2), false).await;
-        assert_eq!(tracked_ids(&ctx), [2]);
+        assert_eq!(tracked_ids(&ctx).await, [2]);
     }
 
     #[tokio::test]
@@ -1070,8 +1115,8 @@ mod tests {
         c.watermark = Some(at(10, 1));
         c.server_now = at(14, 0);
         assert!(src.poll(&c).await.is_err());
-        assert_eq!(tracked_ids(&ctx), [2]);
-        assert_eq!(forbidden_count(&ctx), 0);
+        assert_eq!(tracked_ids(&ctx).await, [2]);
+        assert_eq!(forbidden_count(&ctx).await, 0);
     }
 
     #[tokio::test]

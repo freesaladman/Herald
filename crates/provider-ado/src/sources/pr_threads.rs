@@ -96,8 +96,8 @@ impl PrThreadsSource {
     }
 
     async fn poll_inner(&self, ctx: &SyncContext) -> Result<PollOutcome, ProviderError> {
-        let involved = involved_prs(ctx)?;
-        let old: SeenState = ctx.snapshots.get(SNAPSHOT_SEEN)?.unwrap_or_default();
+        let involved = involved_prs(ctx).await?;
+        let old: SeenState = ctx.snapshots.get(SNAPSHOT_SEEN).await?.unwrap_or_default();
 
         let fetches: Vec<BoxFuture<'_, Result<Fetched, ProviderError>>> = involved
             .iter()
@@ -166,7 +166,7 @@ impl PrThreadsSource {
                 state.threads.insert(key, seen);
             }
         }
-        ctx.snapshots.put(SNAPSHOT_SEEN, &state)?;
+        ctx.snapshots.put(SNAPSHOT_SEEN, &state).await?;
         Ok(PollOutcome { events })
     }
 }
@@ -189,11 +189,16 @@ impl Source for PrThreadsSource {
 }
 
 /// Tracked PRs (all threads), plus tracked threads on PRs not otherwise tracked.
-fn involved_prs(ctx: &SyncContext) -> Result<Vec<Involved>, ProviderError> {
-    let tracked: TrackedPrs = ctx.snapshots.get(SNAPSHOT_TRACKED_PRS)?.unwrap_or_default();
+async fn involved_prs(ctx: &SyncContext) -> Result<Vec<Involved>, ProviderError> {
+    let tracked: TrackedPrs = ctx
+        .snapshots
+        .get(SNAPSHOT_TRACKED_PRS)
+        .await?
+        .unwrap_or_default();
     let threads: TrackedThreads = ctx
         .snapshots
-        .get(SNAPSHOT_TRACKED_THREADS)?
+        .get(SNAPSHOT_TRACKED_THREADS)
+        .await?
         .unwrap_or_default();
     let mut map: BTreeMap<String, Involved> = BTreeMap::new();
     for p in tracked.prs {
@@ -522,7 +527,7 @@ mod tests {
         ResponseTemplate::new(200).set_body_json(json!({ "value": threads }))
     }
 
-    fn track_pr(ctx: &SyncContext, pr_id: i64) {
+    async fn track_pr(ctx: &SyncContext, pr_id: i64) {
         ctx.snapshots
             .put(
                 SNAPSHOT_TRACKED_PRS,
@@ -539,6 +544,7 @@ mod tests {
                     }],
                 },
             )
+            .await
             .unwrap();
     }
 
@@ -580,7 +586,7 @@ mod tests {
     async fn seed_emits_nothing() {
         let server = MockServer::start().await;
         let (ctx, _s) = sync_context(cfg(), me(), at(10, 2), None, false);
-        track_pr(&ctx, 1);
+        track_pr(&ctx, 1).await;
         serve(&server, 1, ok(base_threads())).await;
         let mut src = source(&server);
         assert!(
@@ -589,7 +595,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let s: SeenState = ctx.snapshots.get(SNAPSHOT_SEEN).unwrap().unwrap();
+        let s: SeenState = ctx.snapshots.get(SNAPSHOT_SEEN).await.unwrap().unwrap();
         assert_eq!(s.threads["repo-1:1:5"].comment_ids, vec![1]);
     }
 
@@ -597,7 +603,7 @@ mod tests {
     async fn reply_new_thread_and_my_comment() {
         let server = MockServer::start().await;
         let (ctx, _s) = sync_context(cfg(), me(), at(10, 2), None, false);
-        track_pr(&ctx, 1);
+        track_pr(&ctx, 1).await;
         let mut src = source(&server);
         let next = vec![
             thread(
@@ -647,7 +653,7 @@ mod tests {
     async fn mention_emits_only_shared_mention_event() {
         let server = MockServer::start().await;
         let (ctx, _s) = sync_context(cfg(), me(), at(10, 2), None, false);
-        track_pr(&ctx, 1);
+        track_pr(&ctx, 1).await;
         let mut src = source(&server);
         let next = vec![thread(
             5,
@@ -669,7 +675,7 @@ mod tests {
     async fn status_change_emits_inferred_event_with_data() {
         let server = MockServer::start().await;
         let (ctx, _s) = sync_context(cfg(), me(), at(10, 2), None, false);
-        track_pr(&ctx, 1);
+        track_pr(&ctx, 1).await;
         let mut src = source(&server);
         let next = vec![thread(
             5,
@@ -718,6 +724,7 @@ mod tests {
                     }],
                 },
             )
+            .await
             .unwrap();
         serve(
             &server,
@@ -753,12 +760,12 @@ mod tests {
             (pr.role, pr.title.as_str()),
             (PrRole::Commenter, "elsewhere")
         );
-        let s: SeenState = ctx.snapshots.get(SNAPSHOT_SEEN).unwrap().unwrap();
+        let s: SeenState = ctx.snapshots.get(SNAPSHOT_SEEN).await.unwrap().unwrap();
         assert_eq!(s.threads.len(), 1);
         assert_eq!(s.threads["repo-1:1:5"].comment_ids, vec![1, 2]);
     }
 
-    fn track_thread_only(ctx: &SyncContext, since_utc: DateTime<Utc>) {
+    async fn track_thread_only(ctx: &SyncContext, since_utc: DateTime<Utc>) {
         ctx.snapshots
             .put(
                 SNAPSHOT_TRACKED_THREADS,
@@ -780,6 +787,7 @@ mod tests {
                     }],
                 },
             )
+            .await
             .unwrap();
     }
 
@@ -788,7 +796,7 @@ mod tests {
         let server = MockServer::start().await;
         let t0 = at(10, 1);
         let (ctx, _s) = sync_context(cfg(), me(), t0, None, false);
-        track_thread_only(&ctx, t0);
+        track_thread_only(&ctx, t0).await;
         let reply = t0 + Duration::minutes(5);
         serve(
             &server,
@@ -825,7 +833,7 @@ mod tests {
     async fn seen_thread_diffs_by_comment_id_beyond_the_window() {
         let server = MockServer::start().await;
         let (ctx, _s) = sync_context(cfg(), me(), at(10, 2), None, false);
-        track_pr(&ctx, 1);
+        track_pr(&ctx, 1).await;
         let mut src = source(&server);
         // The reply predates the poll window (watermark - 2m) but was not seen before.
         let late = thread(
@@ -851,7 +859,7 @@ mod tests {
     async fn non_fatal_fetch_failure_keeps_seen_state_for_the_next_status_change() {
         let server = MockServer::start().await;
         let (ctx, _s) = sync_context(cfg(), me(), at(10, 2), None, false);
-        track_pr(&ctx, 1);
+        track_pr(&ctx, 1).await;
         let mut src = source(&server);
         serve(&server, 1, ok(base_threads())).await;
         run(&mut src, &ctx, None, at(10, 2)).await.unwrap();
@@ -861,7 +869,7 @@ mod tests {
             .await
             .unwrap();
         assert!(events.is_empty());
-        let s: SeenState = ctx.snapshots.get(SNAPSHOT_SEEN).unwrap().unwrap();
+        let s: SeenState = ctx.snapshots.get(SNAPSHOT_SEEN).await.unwrap().unwrap();
         assert_eq!(s.threads["repo-1:1:5"].status, "active");
 
         let fixed = thread(
@@ -889,7 +897,7 @@ mod tests {
         let mut conn = cfg();
         conn.bots = bots.iter().map(|b| (*b).to_string()).collect();
         let (ctx, _s) = sync_context(conn, me(), at(10, 2), None, false);
-        track_pr(&ctx, 1);
+        track_pr(&ctx, 1).await;
         ctx.snapshots
             .put(
                 SNAPSHOT_TRACKED_PRS,
@@ -903,6 +911,7 @@ mod tests {
                     }],
                 },
             )
+            .await
             .unwrap();
         let mut src = source(&server);
         let next = vec![thread(5, "fixed", at(10, 4), comments)];
@@ -966,7 +975,7 @@ mod tests {
     async fn transient_aborts_without_writing() {
         let server = MockServer::start().await;
         let (ctx, _s) = sync_context(cfg(), me(), at(10, 2), None, false);
-        track_pr(&ctx, 1);
+        track_pr(&ctx, 1).await;
         serve(&server, 1, ResponseTemplate::new(500)).await;
         let mut src = source(&server);
         let err = run(&mut src, &ctx, Some(at(10, 1)), at(10, 2))
@@ -976,6 +985,7 @@ mod tests {
         assert!(
             ctx.snapshots
                 .get::<SeenState>(SNAPSHOT_SEEN)
+                .await
                 .unwrap()
                 .is_none()
         );

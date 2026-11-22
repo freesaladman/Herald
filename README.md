@@ -278,11 +278,32 @@ Client to server (JSON text frames):
 
 | Message | Reply |
 | --- | --- |
-| `{"type":"subscribe","types":["pr.*"],"match":{"pr.role":"author"},"includeCatchUp":true}` (all fields optional; no `types` = everything; `includeCatchUp` defaults to true) | `{"type":"ok"}`, then events |
+| `{"type":"subscribe","types":["pr.*"],"match":{"pr.role":"author"},"includeCatchUp":true,"afterSeq":120}` (all fields optional; no `types` = everything; `includeCatchUp` defaults to true; `afterSeq` replays stored events, see Replay) | `{"type":"ok","latestSeq":130,"oldestSeq":1,"storeId":"..."}`, then events |
 | `{"type":"emit","event":{"type":"pr.created","title":"..."}}` publishes a test event (id `test:<uuid>`, `test = true`; connection `test`, actor kind `human` unless given); `type` is required | `{"type":"ok","id":"test:..."}` |
 | `{"type":"credentials-changed","connectionId":"work"}` | `{"type":"ok"}` |
 
-Server to client: `{"type":"event","event":{...}}`, `{"type":"ok"}`, `{"type":"error","message":"..."}` (for example `lagged N events` when a slow client misses events).
+Server to client: `{"type":"event","event":{...}}`, `{"type":"ok"}`, `{"type":"error","message":"..."}` (for example `lagged N events` when a slow client misses events and did not subscribe with `afterSeq`), and the replay messages below.
+
+### Replay
+
+Every stored event has a `seq`: strictly increasing, never reused (also after pruning), but with possible gaps, so do not assume it is dense. Events are sent live in seq order. Transient events (for example `record.activated`) are not stored, have no `seq` and are always forwarded live.
+
+The `ok` reply to every `subscribe` carries `latestSeq` (0 when the store is empty), `oldestSeq` (`null` when empty) and `storeId` (identifies the database; it changes if the database is recreated). Remember the highest `seq` you processed and the `storeId`; after a reconnect, send `afterSeq` with that value:
+
+- Herald sends the `ok` first, then every stored event with `seq > afterSeq` that matches your filters, oldest first, then continues live. Events published while the replay runs are not missed, and after the `ok` nothing is sent twice: live events with a `seq` at or below the last one sent or scanned are dropped. Unfiltered events a client receives before its first `ok` are not part of the replay contract; it may see them again in the replay.
+- At most 5000 matching events are replayed, and at most 50000 stored events are scanned, per subscribe. If more remain, Herald sends `{"type":"overflow","replayedThrough":X,"latestSeq":L}` (`X` is the last event sent, or the last one scanned when the scan cap was hit) and continues live from `L`. Fetch `X+1` through `L` yourself (for example with `herald events --after X`).
+- If `afterSeq` is greater than `latestSeq` (the database was recreated, or it is a different store), Herald sends `{"type":"reset","latestSeq":L,"storeId":S}` after the `ok` and continues live from `L`. Discard your saved position.
+- The replay runs alongside ping, pong and your other messages. A new `subscribe` cancels a replay in progress and restarts after the last `seq` that replay sent. In seq mode, after the `ok`, a `seq` already sent on the connection is not sent again (open a new connection to replay with a different filter from an earlier point).
+- A client that falls behind the live feed (`lagged`) is caught up automatically by replaying from the last `seq` sent, instead of receiving a `lagged` error.
+- A subscribe without `afterSeq` behaves as before: live events only, no dedupe.
+- If the database predates sequence numbers (opened read-only), a subscribe with `afterSeq` gets an `error` reply; open the Herald app once to upgrade it.
+
+### Event sequence numbers and the database upgrade
+
+Sequence numbers need a newer database schema. The first start of a build with this feature upgrades the database in place. Before it does, Herald copies the old file to `<db>.v1.bak`, or to `<db>.v1.<UTC yyyymmddThhmmss>.bak` if that name is taken; a failed attempt may leave another timestamped backup.
+
+- Older builds refuse an upgraded database (its schema version is newer than they know). To roll back, stop Herald, restore the backup over the database file and start the older build.
+- A read-only CLI on a database that has not been upgraded cannot serve `--after` or a subscribe with `afterSeq`; it reports "open the Herald app once to upgrade".
 
 Limits: 16 authenticated clients, 64 KiB per message, 3 s to complete the handshake, keep-alive pings every 30 s.
 
@@ -292,9 +313,9 @@ Limits: 16 authenticated clients, 64 KiB per message, 3 s to complete the handsh
 
 | Command | What it does |
 | --- | --- |
-| `herald tail [--type GLOB]... [--match path=glob]... [--no-catch-up] [--json]` | stream live events, one line each (`HH:MM:SS  type  title  url`, local time); `--json` prints raw event JSON, one per line. Repeating `--match` for one key means any-of. Exits 1 when the app is not running or stops; rerun to reconnect. Ctrl+C exits 0 |
+| `herald tail [--type GLOB]... [--match path=glob]... [--no-catch-up] [--after SEQ] [--json]` | stream live events, one line each (`[seq  ]HH:MM:SS  type  title  url`, local time); `--json` prints raw event JSON, one per line, and nothing else on stdout. `--after SEQ` first replays stored events with a higher seq (see Replay), then continues live; the replay `ok`, `overflow` and `reset` notices are printed to stderr as short lines. Repeating `--match` for one key means any-of. Exits 1 when the app is not running or stops; rerun to reconnect. Ctrl+C exits 0 |
 | `herald emit-test <type> [--title T] [--pr-id N] [--repo R] [--branch B] [--url U] [--connection ID] [--set key=value]...` | publish a test event through the running app; prints its id. `--set` overrides any dotted path (JSON value or plain string) |
-| `herald events --since <when> [--limit N] [--json]` | list stored events, oldest first. `<when>` is RFC3339, a date `YYYY-MM-DD` (UTC midnight) or a duration `30m`, `2h`, `7d`, `1w`. Default limit 200; no app needed |
+| `herald events (--since <when> \| --after <seq>) [--limit N] [--json]` | list stored events, oldest first; exactly one of `--since` and `--after` is required. `<when>` is RFC3339, a date `YYYY-MM-DD` (UTC midnight) or a duration `30m`, `2h`, `7d`, `1w`; `--after` lists events with a higher `seq`. Each event shows its `seq` (leading column in text, `seq` field in JSON). Default limit 200; no app needed. A database that predates sequence numbers makes `--after` fail with a message; open the app once to upgrade it |
 | `herald auth set\|test\|clear [--connection ID]` | manage a connection's secret (see First run) |
 | `herald config path` | print the config file path |
 

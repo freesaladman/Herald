@@ -9,7 +9,7 @@ use herald_core::config::{Config, ConfigError, DB_FILE, Paths};
 use herald_core::engine::Engine;
 use herald_core::provider::ProviderRegistry;
 use herald_core::secrets::{KeyringSecretStore, SecretStore};
-use herald_core::store::Store;
+use herald_core::store::{SqliteStore, Store};
 use herald_provider_ado::AdoProviderFactory;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::{AppHandle, Manager, RunEvent};
@@ -17,12 +17,14 @@ use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use ui_state::{AUTOSTART_KEY, UiStateCache};
 
 mod alerts;
 mod commands;
 mod sound;
 mod theme;
 mod tray;
+mod ui_state;
 mod windows;
 
 const CONFIG_FILE: &str = "config.toml";
@@ -32,7 +34,6 @@ const DEFAULT_LOG_FILTER: &str =
     "info,herald_core=debug,herald_provider_ado=debug,herald_app_lib=debug";
 /// Appended last so `RUST_LOG` can't enable TRACE here: the handshake logs the Authorization header.
 const LOG_CLAMP: [&str; 2] = ["tungstenite=debug", "tokio_tungstenite=debug"];
-const AUTOSTART_KEY: &str = "autostart_initialized";
 
 /// Config problems and secret-store status shown by the UI. Managed as `Mutex<UiErrors>`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -278,9 +279,9 @@ fn init_tracing(home: &Path) -> anyhow::Result<LogGuard> {
     Ok(LogGuard(Mutex::new(Some(guard))))
 }
 
-fn enable_autostart_once(app: &AppHandle, store: &Store) {
+fn enable_autostart_once(app: &AppHandle, cache: &UiStateCache) {
     let disabled = std::env::var("HERALD_NO_AUTOSTART").is_ok_and(|v| !v.is_empty());
-    let initialized = store.get_ui_state(AUTOSTART_KEY).ok().flatten();
+    let initialized = cache.get(AUTOSTART_KEY);
     if !should_enable_autostart(initialized.as_deref(), disabled) {
         return;
     }
@@ -291,9 +292,7 @@ fn enable_autostart_once(app: &AppHandle, store: &Store) {
             false
         }
     };
-    if let Err(e) = store.set_ui_state(AUTOSTART_KEY, if ok { "true" } else { "false" }) {
-        tracing::warn!(error = %e, "saving autostart state failed");
-    }
+    cache.set_flag(AUTOSTART_KEY, ok);
 }
 
 fn bootstrap(app: &AppHandle, paths: &Paths) -> anyhow::Result<()> {
@@ -307,7 +306,8 @@ fn bootstrap(app: &AppHandle, paths: &Paths) -> anyhow::Result<()> {
         tracing::warn!(?config_errors, "config invalid; running with defaults");
     }
 
-    let store = Arc::new(Store::open(&paths.home.join(DB_FILE)).context("open store")?);
+    let store: Arc<dyn Store> =
+        Arc::new(SqliteStore::open(&paths.home.join(DB_FILE)).context("open store")?);
     let secrets = Arc::new(KeyringSecretStore::new());
     let secrets_native = secrets.is_native();
     if !secrets_native {
@@ -319,17 +319,23 @@ fn bootstrap(app: &AppHandle, paths: &Paths) -> anyhow::Result<()> {
     }));
 
     let secrets: Arc<dyn SecretStore> = secrets;
-    let engine = tauri::async_runtime::block_on(Engine::start(
-        config,
-        store.clone(),
-        registry.clone(),
-        secrets,
-        paths.clone(),
-    ))
-    .context("start engine")?;
+    // The only startup block_on: the cache is loaded here so later reads never touch the store.
+    let (engine, cache) = tauri::async_runtime::block_on(async {
+        let cache = UiStateCache::load(store.clone()).await;
+        let engine = Engine::start(
+            config,
+            store.clone(),
+            registry.clone(),
+            secrets,
+            paths.clone(),
+        )
+        .await
+        .context("start engine")?;
+        anyhow::Ok((engine, cache))
+    })?;
     app.manage(EngineHandle(Mutex::new(Some(Arc::new(engine)))));
-
-    enable_autostart_once(app, &store);
+    enable_autostart_once(app, &cache);
+    app.manage(cache);
 
     let watcher = watch_config(app.clone(), paths.home.clone(), registry)?;
     app.manage(ConfigWatcher(Mutex::new(Some(watcher))));
@@ -340,12 +346,19 @@ fn shutdown_engine(app: &AppHandle) {
     let Some(engine) = app.try_state::<EngineHandle>().and_then(|h| h.take()) else {
         return;
     };
+    let cache = app.try_state::<UiStateCache>();
     // In-flight commands hold clones; give them a moment to finish.
     for _ in 0..40 {
         if Arc::strong_count(&engine) == 1 {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+    // Queued ui_state writes land before the store goes away, whoever still holds the engine.
+    if let Some(cache) = cache {
+        tauri::async_runtime::block_on(async {
+            let _ = tokio::time::timeout(Duration::from_secs(2), cache.flush()).await;
+        });
     }
     match Arc::try_unwrap(engine) {
         Ok(engine) => tauri::async_runtime::block_on(engine.shutdown()),
@@ -403,6 +416,8 @@ pub fn run() {
             app.manage(commands::StatusWatcher::spawn(app.handle()));
             windows::register(app.handle());
             tray::setup(app.handle())?;
+            // After the tray listens, so the initial count reaches it.
+            app.manage(commands::UnviewedRefresher::spawn(app.handle()));
             app.manage(sound::SoundPlayer::new());
             app.manage(alerts::Alerts::spawn(app.handle()));
             Ok(())
@@ -423,6 +438,9 @@ pub fn run() {
             }
             if let Some(w) = app.try_state::<commands::StatusWatcher>() {
                 w.abort();
+            }
+            if let Some(r) = app.try_state::<commands::UnviewedRefresher>() {
+                r.abort();
             }
             shutdown_engine(app);
             if let Some(guard) = app.try_state::<LogGuard>() {

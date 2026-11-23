@@ -412,6 +412,9 @@ pub fn run() {
             commands::remove_connection,
         ])
         .setup(move |app| {
+            // A tray app: no Dock icon or app menu on macOS.
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             bootstrap(app.handle(), &paths)?;
             app.manage(commands::StatusWatcher::spawn(app.handle()));
             windows::register(app.handle());

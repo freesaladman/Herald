@@ -2,26 +2,61 @@
 
 A tray app that watches your Azure DevOps activity (pull requests, branches, pipeline runs, releases, approvals) and tells you when something needs you: a small toast, a sound, and an inbox pane of unviewed records. Every event is also available to command hooks, a local WebSocket stream and the `herald` CLI, so you can automate on it.
 
-- Windows is the verified platform. macOS and Linux code paths exist but are untested.
+- Windows is the verified platform. macOS builds are published but not yet verified on a Mac; Linux is untested and not packaged.
 - The core (`herald-core`) is provider-neutral. Azure DevOps is the only provider built (`herald-provider-ado`); a connection block in the config picks the provider.
 - Read-only against the provider (GET only). No webhooks or service hooks; Herald polls.
 
 ## Install
 
-Build from source. Prerequisites: Rust (stable), MSVC Build Tools with the "Desktop development with C++" workload, Node and npm, and the WebView2 runtime (ships with Windows 11).
+Installers are published on the [releases page](https://github.com/freesaladman/Herald/releases). They are not code-signed yet.
 
-```text
-cd app
-npm install
-npm run tauri build -- --config src-tauri/tauri.bundle.conf.json
+### Windows
+
+In PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/freesaladman/Herald/main/scripts/install.ps1 | iex
 ```
 
-The NSIS installer lands in `target/release/bundle/nsis/` (for example `Herald_0.1.0_x64-setup.exe`). It installs per user and puts:
+The script downloads the latest installer, checks its SHA-256, installs silently and starts Herald. Run it again to update. Set `$env:HERALD_VERSION = "v0.1.0"` first to pick a release.
+
+Or download `Herald_<version>_x64-setup.exe` from the releases page and run it. Because it is unsigned, SmartScreen may say "Windows protected your PC": choose **More info**, then **Run anyway**.
+
+The installer is per user (no admin) and puts:
 
 - the tray app (`herald-app`), and
 - the `herald` CLI next to it, with the install folder added to your user `PATH`.
 
-The PATH edit is done with PowerShell, so a long existing PATH is not truncated by the installer. If it fails the installer says so; add the install folder yourself. Uninstall removes the entry. Open a new terminal to pick up the change.
+The PATH edit is done with PowerShell, so a long existing PATH is not truncated by the installer. If it fails the installer says so; add the install folder yourself. Uninstall (Settings > Apps) removes the entry. Open a new terminal to pick up the change.
+
+### macOS (not verified)
+
+The macOS builds are produced by CI but have not been tested on a Mac yet. Reports welcome.
+
+In Terminal:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/freesaladman/Herald/main/scripts/install.sh | sh
+```
+
+The script picks the Apple Silicon or Intel build, checks its SHA-256, installs `Herald.app` into `/Applications` (or `~/Applications`), links the `herald` CLI into `~/.local/bin` and starts Herald. Run it again to update. `HERALD_VERSION`, `HERALD_APP_DIR` and `HERALD_BIN_DIR` override the release and locations.
+
+Or download the `.dmg` for your Mac (`aarch64` for Apple Silicon, `x64` for Intel). The app is ad-hoc signed but not notarized, so macOS blocks a downloaded copy on first open: go to **System Settings > Privacy & Security** and choose **Open Anyway**, or run `xattr -dr com.apple.quarantine /Applications/Herald.app`. The CLI is at `Herald.app/Contents/MacOS/herald`.
+
+To uninstall, quit Herald from its menu and delete `Herald.app` and the `~/.local/bin/herald` link.
+
+### Build from source
+
+Prerequisites: Rust (stable), Node and npm. On Windows also MSVC Build Tools with the "Desktop development with C++" workload and the WebView2 runtime (ships with Windows 11); on macOS the Xcode command line tools.
+
+```text
+cd app
+npm install
+npm run tauri build -- --config src-tauri/tauri.bundle.conf.json          # Windows: NSIS installer
+npm run tauri build -- --config src-tauri/tauri.bundle.macos.conf.json    # macOS: .app and .dmg
+```
+
+Output lands under `target/release/bundle/` (`nsis/`, or `macos/` and `dmg/`).
 
 The app identifier is `com.freesaladman.herald`.
 
@@ -360,9 +395,18 @@ HERALD_HOME=/path/to/scratch HERALD_NO_AUTOSTART=1 npm run tauri dev
 
 Logs are in `$HERALD_HOME/logs/herald.<UTC date>.log`; set `RUST_LOG` for more app detail (the CLI uses `-v`). Secrets and tokens are never logged.
 
+Releasing:
+
+1. Set the same version in `app/src-tauri/tauri.conf.json`, `app/package.json` and the crate manifests, and commit.
+2. Tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
+3. The `release` workflow builds the Windows installer and both macOS builds, then creates a draft release with them, their `.sha256` files and generated notes. It fails if the tag does not match `tauri.conf.json`.
+4. Review the draft and publish it. The install scripts only see published, non-prerelease releases.
+
+Running the workflow by hand (Actions > release > Run workflow) builds the same files as workflow artifacts without creating a release.
+
 Known limitations:
 
-- macOS and Linux are untested (code-complete behind `cfg` gates; no do-not-disturb detection there).
+- macOS is unverified and Linux is untested (code-complete behind `cfg` gates; no do-not-disturb detection there). Installers are unsigned.
 - The PAT scope for YAML pipeline approvals is unconfirmed (see First run).
 - The exact property names ADO uses for a removed reviewer (`CodeReviewReviewersUpdatedRemovedIdentity`) and for reset-all-votes system threads are unconfirmed; those events may be missing or partial.
 - Windows Job Object assignment happens just after a child starts, so a grandchild spawned in that instant can escape it.

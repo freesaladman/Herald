@@ -1,0 +1,18 @@
+{
+  "build": {
+    "beforeBuildCommand": "npm run build && node scripts/sidecar.mjs"
+  },
+  "bundle": {
+    "targets": [
+      "app",
+      "dmg"
+    ],
+    "externalBin": [
+      "binaries/herald"
+    ],
+    "macOS": {
+      "signingIdentity": "-",
+      "minimumSystemVersion": "11.0"
+    }
+  }
+}

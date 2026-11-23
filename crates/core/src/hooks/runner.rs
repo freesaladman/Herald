@@ -404,8 +404,10 @@ impl Shared {
             }
         };
         let started = Utc::now();
-        let mut cmd = tokio::process::Command::new(&spec.argv[0]);
+        let cwd = hook_cwd(&self.paths.home, spec.cwd.as_deref());
+        let mut cmd = tokio::process::Command::new(hook_program(&spec.argv[0], &cwd));
         cmd.args(&spec.argv[1..])
+            .current_dir(&cwd)
             .envs(base_env(&job.event, &event_file))
             .envs(spec.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::piped())
@@ -416,9 +418,6 @@ impl Shared {
                 Stdio::piped()
             })
             .kill_on_drop(!detached);
-        if let Some(cwd) = &spec.cwd {
-            cmd.current_dir(cwd);
-        }
         #[cfg(windows)]
         {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -575,6 +574,23 @@ struct CommandSpec {
     argv: Vec<String>,
     cwd: Option<String>,
     env: Vec<(String, String)>,
+}
+
+/// Hooks run in `HERALD_HOME` unless `cwd` says otherwise; a relative `cwd` is under it.
+fn hook_cwd(home: &Path, cwd: Option<&str>) -> PathBuf {
+    cwd.map_or_else(|| home.to_path_buf(), |c| home.join(c))
+}
+
+/// A relative program path such as `hooks/notify` resolves against the working directory here,
+/// because platforms disagree on whether the parent or child directory applies. Bare names
+/// still go through the PATH search.
+fn hook_program(program: &str, cwd: &Path) -> PathBuf {
+    let p = Path::new(program);
+    if p.is_relative() && p.components().count() > 1 {
+        cwd.join(p)
+    } else {
+        p.to_path_buf()
+    }
 }
 
 fn build_spec(hook: &HookConfig, json: &Value, event: &Event) -> Result<CommandSpec, String> {
@@ -1187,6 +1203,41 @@ mod tests {
         assert_eq!(run.exit_code, Some(7));
         assert_eq!(run.error, None);
         assert!(run.finished_utc.is_some());
+    }
+
+    #[tokio::test]
+    async fn hooks_run_in_herald_home_and_a_relative_cwd_is_under_it() {
+        let fx = fixture();
+        let home = paths_in(fx.dir.path()).home;
+        std::fs::create_dir_all(home.join("sub")).unwrap();
+        let h = shell_hook(
+            "here",
+            &["echo", "hi>", "marker.txt"],
+            "echo hi > marker.txt",
+        );
+        assert_eq!(fx.run_one(h.clone()).await.exit_code, Some(0));
+        assert!(home.join("marker.txt").is_file());
+
+        let mut h = h;
+        h.cwd = Some("sub".into());
+        fx.run_all(&compiled(vec![h]), event("pr.created")).await;
+        assert!(home.join("sub").join("marker.txt").is_file());
+    }
+
+    #[test]
+    fn hook_cwd_and_program_resolve_against_home() {
+        let home = Path::new("base");
+        assert_eq!(hook_cwd(home, None), home);
+        assert_eq!(hook_cwd(home, Some("sub")), home.join("sub"));
+        let abs = std::env::temp_dir();
+        let abs_str = abs.to_str().unwrap();
+        assert_eq!(hook_cwd(home, Some(abs_str)), abs);
+
+        let cwd = Path::new("work");
+        assert_eq!(hook_program("pwsh", cwd), Path::new("pwsh"));
+        assert_eq!(hook_program("hooks/notify", cwd), cwd.join("hooks/notify"));
+        assert_eq!(hook_program("./notify", cwd), cwd.join("./notify"));
+        assert_eq!(hook_program(abs_str, cwd), abs);
     }
 
     #[tokio::test]

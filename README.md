@@ -255,7 +255,7 @@ run = { windows = ["cmd", "/C", "echo %HERALD_PR_ID% >> C:\\temp\\prs.txt"], def
 | `action` | none | `"open-url"`; use either `action` or `run` |
 | `run` | none | `{ default, windows, macos, linux }` argv lists |
 | `match` | `{}` | extra conditions: dotted event path = glob, or a list meaning any of. All keys must match; a missing path never matches; an empty list never matches |
-| `cwd` | none | working directory (placeholders allowed; see Hook safety) |
+| `cwd` | `HERALD_HOME` | working directory; a relative path is under `HERALD_HOME` (placeholders allowed; see Hook safety). A relative program path in `run`, such as `hooks/notify`, resolves against it too, so scripts can live in `$HERALD_HOME/hooks/` |
 | `env` | `{}` | extra environment variables (placeholders allowed) |
 | `catch_up` | false | also run for catch-up events |
 | `include_test` | true | also run for test events (`herald emit-test`) |

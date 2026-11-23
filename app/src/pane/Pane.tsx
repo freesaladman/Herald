@@ -85,12 +85,16 @@ function Banners({
               }}
               onClick={onConnections}
             >
-              Add a PAT for {c.id}
+              {c.authMethod === "azcli"
+                ? `Sign in to the Azure CLI (az login) for ${c.id}, then choose Poll now`
+                : `Add a PAT for ${c.id}`}
             </button>
           )}
           {c.authState === "invalid" && (
             <div style={{ ...banner, color: "var(--sev-critical)" }}>
-              PAT for {c.id} was rejected
+              {c.authMethod === "azcli"
+                ? `Sign-in for ${c.id} was rejected`
+                : `PAT for ${c.id} was rejected`}
             </div>
           )}
           {c.disabledSources.length > 0 && (

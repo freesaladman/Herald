@@ -75,6 +75,8 @@ struct ConnInner {
     epoch: u64,
     /// Sources whose poll is running now.
     in_flight: BTreeSet<String>,
+    /// A missing-credentials alert went out; cleared once auth is Ok again.
+    missing_alerted: bool,
 }
 
 /// Live state of one configured connection, shared by its tier tasks.
@@ -130,6 +132,7 @@ impl ConnState {
                 attempts: BTreeMap::new(),
                 epoch: 0,
                 in_flight: BTreeSet::new(),
+                missing_alerted: false,
             }),
             shared: Weak::new(),
         }
@@ -281,9 +284,26 @@ impl ConnState {
             return false;
         }
         inner.auth = auth;
+        if auth == AuthState::Ok {
+            inner.missing_alerted = false;
+        }
         drop(inner);
         self.notify_status();
         true
+    }
+
+    /// Sets auth to Missing. None when `epoch` is stale; else true only for the first time
+    /// since auth was last Ok, so one lapse alerts once.
+    fn mark_missing(&self, epoch: u64) -> Option<bool> {
+        let mut inner = self.lock();
+        if epoch < inner.epoch {
+            return None;
+        }
+        inner.auth = AuthState::Missing;
+        let first = !std::mem::replace(&mut inner.missing_alerted, true);
+        drop(inner);
+        self.notify_status();
+        Some(first)
     }
 
     /// Sets auth to Invalid. None when `epoch` is stale; else true only when it was not
@@ -308,6 +328,7 @@ impl ConnState {
         }
         inner.identity = Some(identity);
         inner.auth = AuthState::Ok;
+        inner.missing_alerted = false;
         drop(inner);
         self.notify_status();
         true
@@ -866,9 +887,21 @@ impl Shared {
                 }
             }
             ProviderError::MissingCredentials => {
-                if conn.set_auth(AuthState::Missing, epoch) {
-                    conn.close_if(Gate::Credentials, Some(epoch));
-                    tracing::info!(connection = id, "no credentials; idle until they change");
+                let Some(first) = conn.mark_missing(epoch) else {
+                    return;
+                };
+                conn.close_if(Gate::Credentials, Some(epoch));
+                tracing::info!(connection = id, "no credentials; idle until they change");
+                if first {
+                    let mut e = Self::system_event(
+                        conn,
+                        event_types::AUTH_FAILED,
+                        ids::auth_failed(id, Utc::now()),
+                        format!("Sign-in needed for {id}"),
+                    );
+                    e.subtitle = Some("Sign in again, then choose Poll now from the tray".into());
+                    e.data = serde_json::json!({ "reason": "missing" });
+                    self.bus.publish(e).await;
                 }
             }
             ProviderError::Config(msg) => {
@@ -1791,6 +1824,38 @@ mod tests {
         let status = h.sched.statuses().remove(0);
         assert_eq!(status.auth_state, AuthState::Ok);
         assert_eq!(status.identity.unwrap().id, "me");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_credentials_alert_once_per_lapse() {
+        let fake = fake_with(&[("s", Tier::Fast)]);
+        fake.set_identify_error(Some(ProviderError::MissingCredentials));
+        let mut h = Harness::start(&fake).await;
+        pass(100).await;
+        let events = h.drain();
+        let failed = of_type(&events, "auth.failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].data["reason"], "missing");
+        assert_eq!(failed[0].title, "Sign-in needed for c1");
+        assert_eq!(failed[0].severity, Severity::Critical);
+
+        // Still missing after a resume: no second alert.
+        let conn = h.sched.connection("c1").unwrap();
+        conn.resume();
+        pass(10).await;
+        assert!(of_type(&h.drain(), "auth.failed").is_empty());
+
+        // Back to Ok, then lapsing again alerts again.
+        fake.set_identify_error(None);
+        conn.resume();
+        pass(1).await;
+        assert_eq!(h.sched.statuses()[0].auth_state, AuthState::Ok);
+        fake.set_identify_error(Some(ProviderError::MissingCredentials));
+        conn.reset_auth();
+        conn.resume();
+        pass(10).await;
+        assert_eq!(of_type(&h.drain(), "auth.failed").len(), 1);
+        assert_eq!(h.sched.statuses()[0].auth_state, AuthState::Missing);
     }
 
     /// Switches that make the wrapped provider misbehave.

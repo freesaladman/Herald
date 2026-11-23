@@ -120,7 +120,7 @@ The PAT is kept in the OS keychain (service `herald`, user = connection id). It 
 
 Alternative: `auth = { method = "azcli" }` uses `az account get-access-token` from your Azure CLI login; no PAT is stored.
 
-A 401 marks the connection invalid, raises one `auth.failed` alert and pauses that connection until you update the credentials (or 15 minutes pass).
+A 401 marks the connection invalid, raises one `auth.failed` alert and pauses that connection until you update the credentials (or 15 minutes pass). Missing credentials (no PAT stored, or an Azure CLI login that has lapsed so `az` asks you to run `az login`) raise one `auth.failed` alert with `data.reason = "missing"` per lapse and idle the connection; after signing in again choose **Poll now** from the tray.
 
 ## What is tracked and what alerts
 

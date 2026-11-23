@@ -122,6 +122,23 @@ describe("Pane", () => {
     );
   });
 
+  it("words auth banners for Azure CLI sign-in", async () => {
+    setup(
+      [],
+      makeUi({
+        connections: [
+          makeConnection({ id: "a", authMethod: "azcli", authState: "missing" }),
+          makeConnection({ id: "b", authMethod: "azcli", authState: "invalid" }),
+        ],
+      }),
+    );
+    render(<Pane />);
+    expect(
+      await screen.findByText("Sign in to the Azure CLI (az login) for a, then choose Poll now"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Sign-in for b was rejected")).toBeInTheDocument();
+  });
+
   it("renders auth, config error and no-connection banners", async () => {
     setup(
       [],

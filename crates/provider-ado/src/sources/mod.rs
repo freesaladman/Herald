@@ -1,10 +1,13 @@
 //! Shared helpers and snapshot types for the ADO sources.
 
 use chrono::{DateTime, Duration, Utc};
-use herald_core::event::{Actor, ActorKind, ConnectionRef, PrRole, RepoRef};
+use herald_core::event::{
+    Actor, ActorKind, ConnectionRef, Event, PrRole, RepoRef, event_types as t,
+};
 use herald_core::provider::{Identity, ProviderError, SyncContext};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::connection::AdoShared;
 use crate::dto_git::{GitPullRequest, IdentityRef};
@@ -246,6 +249,29 @@ pub fn is_fatal(e: &ProviderError) -> bool {
     )
 }
 
+/// On a PR I did not author, only review asks, mentions and thread activity are wanted.
+/// Thread events need no check here: `pr_threads` only watches my threads on such PRs.
+pub fn wanted_on_pr(e: &Event) -> bool {
+    let Some(pr) = &e.pr else {
+        return true;
+    };
+    if pr.role == PrRole::Author {
+        return true;
+    }
+    let flag = |k: &str| e.data.get(k).and_then(Value::as_bool).unwrap_or(false);
+    match e.event_type.as_str() {
+        t::PR_CREATED
+        | t::PR_PUBLISHED
+        | t::PR_MENTIONED
+        | t::PR_REREVIEW_NEEDED
+        | t::PR_COMMENT_ADDED
+        | t::PR_COMMENT_REPLIED
+        | t::PR_THREAD_STATUS_CHANGED => true,
+        t::PR_REVIEWER_ADDED | t::PR_REVIEWER_REMOVED => flag("isMe") || flag("isMyGroup"),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +307,67 @@ mod tests {
         assert_eq!(window_start(&ctx(now, None)), now - lookback);
         assert_eq!(window_start(&ctx(now, Some(at(20, 11, 0)))), at(20, 10, 58));
         assert_eq!(window_start(&ctx(now, Some(at(1, 0, 0)))), now - lookback);
+    }
+
+    #[test]
+    fn wanted_on_pr_keeps_review_asks_on_prs_i_did_not_author() {
+        use herald_core::event::PrRef;
+        let event = |ty: &str, role: PrRole, data: Value| {
+            let mut e = Event::new(
+                ConnectionRef {
+                    id: "c1".into(),
+                    provider: "ado".into(),
+                },
+                ty,
+                at(1, 0, 0),
+                at(1, 0, 0),
+                "t",
+                "c1:pr:r:1",
+            );
+            e.pr = Some(PrRef {
+                id: 1,
+                title: "p".into(),
+                source_branch: String::new(),
+                target_branch: String::new(),
+                is_draft: false,
+                role,
+            });
+            e.data = data;
+            e
+        };
+        let none = Value::Null;
+        for ty in [
+            t::PR_CONFLICTS_DETECTED,
+            t::PR_COMPLETED,
+            t::PR_VOTE_CHANGED,
+            t::PR_POLICY_CHANGED,
+        ] {
+            assert!(
+                wanted_on_pr(&event(ty, PrRole::Author, none.clone())),
+                "{ty}"
+            );
+            assert!(
+                !wanted_on_pr(&event(ty, PrRole::Reviewer, none.clone())),
+                "{ty}"
+            );
+        }
+        for ty in [
+            t::PR_CREATED,
+            t::PR_REREVIEW_NEEDED,
+            t::PR_MENTIONED,
+            t::PR_COMMENT_REPLIED,
+        ] {
+            assert!(
+                wanted_on_pr(&event(ty, PrRole::GroupReviewer, none.clone())),
+                "{ty}"
+            );
+        }
+        let added = |data| event(t::PR_REVIEWER_ADDED, PrRole::Reviewer, data);
+        assert!(wanted_on_pr(&added(serde_json::json!({ "isMe": true }))));
+        assert!(wanted_on_pr(&added(
+            serde_json::json!({ "isMyGroup": true })
+        )));
+        assert!(!wanted_on_pr(&added(serde_json::json!({ "isMe": false }))));
     }
 
     #[test]

@@ -109,6 +109,7 @@ Alert rules:
 - Bots (per-connection `bots` globs on unique or display name) are silent.
 - Humans and system outcomes alert, minus `alerts.mute_types`.
 - On groupReviewer PRs only `roles.group_reviewer.alert_types` alert.
+- On PRs you did not author, only review asks (`pr.created`, `pr.published`, `pr.rereview.needed`, `pr.reviewer.added`/`removed` for you or your group), `pr.mentioned`, and comment and status events on threads you commented in are emitted. Builds, policies, votes, pushes, conflicts and closes are emitted only for your own PRs.
 - Direct @mentions emit `pr.mentioned` (not also a comment event).
 - Catch-up: after downtime or sleep Herald queries since the last watermark (UTC server time, at most `max_lookback_days`). Catch-up events go to the pane only, with one `catchup.summary` toast and one sound. The first run seeds silently.
 - Snooze suppresses toast and sound only; the pane, tray and hooks still update (hooks stop only with `respect_snooze`). Mute skips the sound only. On Windows, toast and sound are also suppressed while the system reports a non-notifiable state (full-screen app, presentation mode, busy, quiet time).

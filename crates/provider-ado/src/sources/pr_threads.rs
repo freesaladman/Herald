@@ -188,7 +188,7 @@ impl Source for PrThreadsSource {
     }
 }
 
-/// Tracked PRs (all threads), plus tracked threads on PRs not otherwise tracked.
+/// Tracked PRs (all threads of my own, my threads of the rest), plus tracked threads.
 async fn involved_prs(ctx: &SyncContext) -> Result<Vec<Involved>, ProviderError> {
     let tracked: TrackedPrs = ctx
         .snapshots
@@ -216,8 +216,9 @@ async fn involved_prs(ctx: &SyncContext) -> Result<Vec<Involved>, ProviderError>
                 source_ref: p.source_ref,
                 target_ref: p.target_ref,
                 is_draft: p.is_draft,
+                // On PRs I did not author, only threads I am in (from discovery) are watched.
+                all_threads: p.role == PrRole::Author,
                 role: p.role,
-                all_threads: true,
                 since: HashMap::new(),
             },
         );
@@ -527,7 +528,38 @@ mod tests {
         ResponseTemplate::new(200).set_body_json(json!({ "value": threads }))
     }
 
+    /// Tracks one thread of PR 1 as discovery would after I commented on it.
+    async fn track_thread(ctx: &SyncContext, thread_id: i64, since: DateTime<Utc>) {
+        ctx.snapshots
+            .put(
+                SNAPSHOT_TRACKED_THREADS,
+                &TrackedThreads {
+                    threads: vec![TrackedThread {
+                        repo_id: "Repo-1".into(),
+                        repo_name: "widgets".into(),
+                        project: "Alpha".into(),
+                        project_id: "p1".into(),
+                        pr_id: 1,
+                        thread_id,
+                        since_utc: since,
+                        reason: ThreadReason::Commenter,
+                        title: "change".into(),
+                        source_ref: String::new(),
+                        target_ref: String::new(),
+                        is_draft: false,
+                        url: String::new(),
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+    }
+
     async fn track_pr(ctx: &SyncContext, pr_id: i64) {
+        track_pr_as(ctx, pr_id, PrRole::Author).await;
+    }
+
+    async fn track_pr_as(ctx: &SyncContext, pr_id: i64, role: PrRole) {
         ctx.snapshots
             .put(
                 SNAPSHOT_TRACKED_PRS,
@@ -538,7 +570,7 @@ mod tests {
                         project: "Alpha".into(),
                         project_id: "p1".into(),
                         pr_id,
-                        role: PrRole::Reviewer,
+                        role,
                         title: "change".into(),
                         ..Default::default()
                     }],
@@ -637,7 +669,7 @@ mod tests {
             ]
         );
         assert_eq!(events[0].occurred_utc, at(10, 3));
-        assert_eq!(events[0].pr.as_ref().unwrap().role, PrRole::Reviewer);
+        assert_eq!(events[0].pr.as_ref().unwrap().role, PrRole::Author);
         assert_eq!(events[0].comment.as_ref().unwrap().excerpt, "reply");
         assert!(
             events[0]
@@ -647,6 +679,36 @@ mod tests {
                 .ends_with("/pullrequest/1?discussionId=5")
         );
         assert_eq!(events[1].actor.kind, herald_core::event::ActorKind::Me);
+    }
+
+    #[tokio::test]
+    async fn on_a_pr_i_did_not_author_only_my_threads_are_watched() {
+        let server = MockServer::start().await;
+        let (ctx, _s) = sync_context(cfg(), me(), at(10, 2), None, false);
+        track_pr_as(&ctx, 1, PrRole::Reviewer).await;
+        track_thread(&ctx, 5, at(10, 1)).await;
+        let mut src = source(&server);
+        let next = vec![
+            thread(
+                5,
+                "active",
+                at(10, 3),
+                vec![
+                    comment(1, "other", "first", at(10, 1)),
+                    comment(2, "other", "reply", at(10, 3)),
+                ],
+            ),
+            thread(
+                6,
+                "active",
+                at(10, 4),
+                vec![comment(1, "other", "not mine", at(10, 4))],
+            ),
+        ];
+        let events = seed_then(&mut src, &server, &ctx, next).await;
+        let ids: Vec<&str> = events.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["c1:pr:Repo-1:1:thread:5:comment:2"]);
+        assert_eq!(events[0].pr.as_ref().unwrap().role, PrRole::Reviewer);
     }
 
     #[tokio::test]
@@ -913,6 +975,9 @@ mod tests {
             )
             .await
             .unwrap();
+        if role != PrRole::Author {
+            track_thread(&ctx, 5, at(10, 1)).await;
+        }
         let mut src = source(&server);
         let next = vec![thread(5, "fixed", at(10, 4), comments)];
         let events = seed_then(&mut src, &server, &ctx, next).await;

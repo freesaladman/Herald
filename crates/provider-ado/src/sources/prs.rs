@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     SNAPSHOT_TRACKED_PRS, TrackedPr, TrackedPrs, active_prs, actor_from, is_fatal, mentions,
-    pr_key, pr_web_url, project_ref, repo_ref, window_start,
+    pr_key, pr_web_url, project_ref, repo_ref, wanted_on_pr, window_start,
 };
 use crate::connection::AdoShared;
 use crate::dto_git::GitPullRequest;
@@ -433,6 +433,7 @@ impl PrLifecycleSource {
             .put(SNAPSHOT_TRACKED_PRS, &TrackedPrs { prs: tracked })
             .await?;
         ctx.snapshots.put(SNAPSHOT_LIFECYCLE, &state).await?;
+        events.retain(wanted_on_pr);
         Ok(PollOutcome { events })
     }
 }

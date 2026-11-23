@@ -15,7 +15,7 @@ use serde_json::json;
 
 use super::{
     SNAPSHOT_TRACKED_PRS, TrackedPr, TrackedPrs, actor_from, is_fatal, pr_key, pr_web_url,
-    project_ref, repo_ref, window_start,
+    project_ref, repo_ref, wanted_on_pr, window_start,
 };
 use crate::connection::AdoShared;
 use crate::dto_git::{GitPullRequestCommentThread, GitPullRequestIteration, IdentityRef};
@@ -136,7 +136,7 @@ impl PrReviewsSource {
             let mut seen = previous.cloned().unwrap_or_default();
             let found = review_events(ctx, org, pr, data, &mut seen, cut, previous.is_none());
             if !seeding {
-                events.extend(found);
+                events.extend(found.into_iter().filter(wanted_on_pr));
             }
             state.prs.insert(key, seen);
         }
@@ -731,7 +731,7 @@ mod tests {
     async fn seed_emits_nothing_and_first_sight_skips_old_history() {
         let server = MockServer::start().await;
         let (ctx, _store) = sync_context(cfg(), me(), at(20, 0), None, false);
-        track(&ctx, PrRole::Reviewer).await;
+        track(&ctx, PrRole::Author).await;
         let mut src = source(&server);
         let old = vec![
             vote_thread(5, at(2, 0), ("other", "Person 2"), "10"),
@@ -759,7 +759,7 @@ mod tests {
 
         // A PR first seen after the seed emits only what falls inside the window.
         let (ctx2, _s2) = sync_context(cfg(), me(), at(20, 2), Some(at(20, 0)), false);
-        track(&ctx2, PrRole::Reviewer).await;
+        track(&ctx2, PrRole::Author).await;
         let mut src2 = source(&server);
         let events = run(&mut src2, &ctx2, Some(at(20, 0)), at(20, 2))
             .await
@@ -812,7 +812,7 @@ mod tests {
                 ("4", "gone", "Person 4"),
             ],
         );
-        let events = seeded_poll(PrRole::Reviewer, vec![t], vec![iteration(1, at(1, 0))]).await;
+        let events = seeded_poll(PrRole::Author, vec![t], vec![iteration(1, at(1, 0))]).await;
         assert_eq!(
             types(&events),
             [
@@ -915,9 +915,10 @@ mod tests {
         let events = run(&mut src, &ctx, Some(at(10, 0)), at(10, 12))
             .await
             .unwrap();
-        assert_eq!(types(&events), ["pr.votes.reset", "pr.rereview.needed"]);
-        assert_eq!(events[1].id, "c1:pr:Repo-1:1:rereview:reset:21");
-        assert_eq!(events[1].actor.kind, ActorKind::System);
+        // The reset itself is not wanted on a PR I did not author; the re-review ask is.
+        assert_eq!(types(&events), ["pr.rereview.needed"]);
+        assert_eq!(events[0].id, "c1:pr:Repo-1:1:rereview:reset:21");
+        assert_eq!(events[0].actor.kind, ActorKind::System);
     }
 
     #[tokio::test]
@@ -940,14 +941,8 @@ mod tests {
         let events = run(&mut src, &ctx, Some(at(10, 0)), at(10, 12))
             .await
             .unwrap();
-        assert_eq!(
-            types(&events),
-            ["pr.iteration.pushed", "pr.rereview.needed"]
-        );
-        assert_eq!(events[0].id, "c1:pr:Repo-1:1:iteration:2");
-        assert_eq!(events[0].data, json!({ "reason": "push" }));
-        assert_eq!(events[0].actor.id, "pusher");
-        assert_eq!(events[1].id, "c1:pr:Repo-1:1:rereview:2");
+        assert_eq!(types(&events), ["pr.rereview.needed"]);
+        assert_eq!(events[0].id, "c1:pr:Repo-1:1:rereview:2");
         assert!(
             run(&mut src, &ctx, Some(at(10, 12)), at(10, 13))
                 .await
@@ -964,7 +959,41 @@ mod tests {
             vec![iteration(1, at(1, 0)), iteration(2, at(10, 4))],
         )
         .await;
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn push_to_my_pr_emits_iteration() {
+        let events = seeded_poll(
+            PrRole::Author,
+            vec![],
+            vec![iteration(1, at(1, 0)), iteration(2, at(10, 4))],
+        )
+        .await;
         assert_eq!(types(&events), ["pr.iteration.pushed"]);
+        assert_eq!(events[0].id, "c1:pr:Repo-1:1:iteration:2");
+        assert_eq!(events[0].data, json!({ "reason": "push" }));
+        assert_eq!(events[0].actor.id, "pusher");
+    }
+
+    #[tokio::test]
+    async fn on_a_pr_i_did_not_author_only_review_asks_are_kept() {
+        let t = reviewers_added(9, at(10, 3), &[(ME, "Me"), ("other", "Person 2")]);
+        let threads = vec![
+            t,
+            vote_thread(10, at(10, 4), ("other", "Person 2"), "10"),
+            sys(
+                11,
+                "AutoCompleteUpdate",
+                at(10, 5),
+                &[("CodeReviewAutoCompleteNowSet", "1")],
+                &[],
+            ),
+        ];
+        let its = vec![iteration(1, at(1, 0)), iteration(2, at(10, 6))];
+        let events = seeded_poll(PrRole::Reviewer, threads, its).await;
+        assert_eq!(types(&events), ["pr.reviewer.added"]);
+        assert_eq!(events[0].data["isMe"], true);
     }
 
     #[tokio::test]
@@ -1010,7 +1039,7 @@ mod tests {
     async fn first_sight_skips_my_reviewer_added_but_keeps_others() {
         let server = MockServer::start().await;
         let (ctx, _store) = sync_context(cfg(), me(), at(10, 12), Some(at(10, 0)), false);
-        track(&ctx, PrRole::Reviewer).await;
+        track(&ctx, PrRole::Author).await;
         let mut src = source(&server);
         let t = reviewers_added(
             9,
@@ -1068,7 +1097,8 @@ mod tests {
         let events = run(&mut src, &ctx, Some(at(10, 0)), at(10, 12))
             .await
             .unwrap();
-        assert_eq!(types(&events), ["pr.votes.reset", "pr.iteration.pushed"]);
+        // No re-review; the reset and push themselves are not wanted on a PR I did not author.
+        assert!(events.is_empty());
     }
 
     #[tokio::test]
@@ -1092,7 +1122,7 @@ mod tests {
         let first = run(&mut src, &ctx, Some(at(10, 0)), at(10, 5))
             .await
             .unwrap();
-        assert_eq!(types(&first), ["pr.iteration.pushed", "pr.rereview.needed"]);
+        assert_eq!(types(&first), ["pr.rereview.needed"]);
 
         let reset = sys(
             31,
@@ -1108,6 +1138,6 @@ mod tests {
         let second = run(&mut src, &ctx, Some(at(10, 5)), at(10, 6))
             .await
             .unwrap();
-        assert_eq!(types(&second), ["pr.votes.reset"]);
+        assert!(second.is_empty());
     }
 }

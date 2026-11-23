@@ -1,4 +1,4 @@
-//! Pr-tier source: policy evaluations and PR statuses of my own and reviewed PRs, as state changes.
+//! Pr-tier source: policy evaluations and PR statuses of my own PRs, as state changes.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -102,11 +102,11 @@ impl PrPoliciesSource {
             .unwrap_or_default();
         let old: SeenState = ctx.snapshots.get(SNAPSHOT_SEEN).await?.unwrap_or_default();
 
-        // Policy noise on PRs I only watch (group review, commenter, mention) is not wanted.
+        // Builds and checks on PRs I did not author are not wanted.
         let wanted: Vec<&TrackedPr> = tracked
             .prs
             .iter()
-            .filter(|p| matches!(p.role, PrRole::Author | PrRole::Reviewer))
+            .filter(|p| p.role == PrRole::Author)
             .collect();
         let fetches: Vec<BoxFuture<'_, Result<Fetched, ProviderError>>> = wanted
             .iter()
@@ -620,31 +620,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn group_reviewer_prs_are_not_polled() {
-        let server = MockServer::start().await;
-        let (ctx, _store) = sync_context(cfg(), me(), at(10, 0), Some(at(9, 0)), false);
-        track(&ctx, PrRole::GroupReviewer).await;
-        let mut src = source(&server);
-        serve(
-            &server,
-            ResponseTemplate::new(500),
-            ResponseTemplate::new(500),
-        )
-        .await;
-        assert!(
-            run(&mut src, &ctx, Some(at(9, 0)), at(10, 0))
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(server.received_requests().await.unwrap().is_empty());
+    async fn prs_i_did_not_author_are_not_polled() {
+        for role in [PrRole::Reviewer, PrRole::GroupReviewer] {
+            let server = MockServer::start().await;
+            let (ctx, _store) = sync_context(cfg(), me(), at(10, 0), Some(at(9, 0)), false);
+            track(&ctx, role).await;
+            let mut src = source(&server);
+            serve(
+                &server,
+                ResponseTemplate::new(500),
+                ResponseTemplate::new(500),
+            )
+            .await;
+            assert!(
+                run(&mut src, &ctx, Some(at(9, 0)), at(10, 0))
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(server.received_requests().await.unwrap().is_empty());
+        }
     }
 
     #[tokio::test]
     async fn transient_aborts_without_writing() {
         let server = MockServer::start().await;
         let (ctx, _store) = sync_context(cfg(), me(), at(10, 0), Some(at(9, 0)), false);
-        track(&ctx, PrRole::Reviewer).await;
+        track(&ctx, PrRole::Author).await;
         let mut src = source(&server);
         serve(&server, ResponseTemplate::new(500), ok(vec![])).await;
         let err = run(&mut src, &ctx, Some(at(9, 0)), at(10, 0))

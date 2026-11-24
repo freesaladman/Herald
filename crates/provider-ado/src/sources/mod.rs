@@ -272,6 +272,19 @@ pub fn wanted_on_pr(e: &Event) -> bool {
     }
 }
 
+/// True when a PR event reached me only through a group I belong to.
+pub fn via_group(e: &Event) -> bool {
+    let flag = |k: &str| e.data.get(k).and_then(Value::as_bool).unwrap_or(false);
+    match e.event_type.as_str() {
+        t::PR_CREATED | t::PR_PUBLISHED | t::PR_REREVIEW_NEEDED => {
+            e.pr.as_ref()
+                .is_some_and(|p| p.role == PrRole::GroupReviewer)
+        }
+        t::PR_REVIEWER_ADDED | t::PR_REVIEWER_REMOVED => flag("isMyGroup") && !flag("isMe"),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,6 +381,75 @@ mod tests {
             serde_json::json!({ "isMyGroup": true })
         )));
         assert!(!wanted_on_pr(&added(serde_json::json!({ "isMe": false }))));
+    }
+
+    #[test]
+    fn via_group_marks_events_that_reached_me_only_through_a_group() {
+        use herald_core::event::PrRef;
+        let event = |ty: &str, role: PrRole, data: Value| {
+            let mut e = Event::new(
+                ConnectionRef {
+                    id: "c1".into(),
+                    provider: "ado".into(),
+                },
+                ty,
+                at(1, 0, 0),
+                at(1, 0, 0),
+                "t",
+                "c1:pr:r:1",
+            );
+            e.pr = Some(PrRef {
+                id: 1,
+                title: "p".into(),
+                source_branch: String::new(),
+                target_branch: String::new(),
+                is_draft: false,
+                role,
+            });
+            e.data = data;
+            e
+        };
+        let none = Value::Null;
+        for ty in [t::PR_CREATED, t::PR_PUBLISHED, t::PR_REREVIEW_NEEDED] {
+            assert!(
+                via_group(&event(ty, PrRole::GroupReviewer, none.clone())),
+                "{ty}"
+            );
+            assert!(
+                !via_group(&event(ty, PrRole::Reviewer, none.clone())),
+                "{ty}"
+            );
+            assert!(!via_group(&event(ty, PrRole::Author, none.clone())), "{ty}");
+        }
+        for ty in [
+            t::PR_MENTIONED,
+            t::PR_COMMENT_ADDED,
+            t::PR_COMMENT_REPLIED,
+            t::PR_THREAD_STATUS_CHANGED,
+        ] {
+            assert!(
+                !via_group(&event(ty, PrRole::GroupReviewer, none.clone())),
+                "{ty}"
+            );
+        }
+        for ty in [t::PR_REVIEWER_ADDED, t::PR_REVIEWER_REMOVED] {
+            let with = |data| event(ty, PrRole::Reviewer, data);
+            assert!(
+                via_group(&with(serde_json::json!({ "isMyGroup": true }))),
+                "{ty}"
+            );
+            assert!(
+                !via_group(&with(
+                    serde_json::json!({ "isMe": true, "isMyGroup": true })
+                )),
+                "{ty}"
+            );
+            assert!(
+                !via_group(&with(serde_json::json!({ "isMe": true }))),
+                "{ty}"
+            );
+            assert!(!via_group(&with(none.clone())), "{ty}");
+        }
     }
 
     #[test]

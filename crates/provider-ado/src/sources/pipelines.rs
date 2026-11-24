@@ -58,6 +58,8 @@ struct PendingApproval {
     pipeline: String,
     run_id: Option<i64>,
     url: Option<String>,
+    #[serde(default)]
+    via_group: bool,
 }
 
 /// What decides whether a build is mine.
@@ -317,6 +319,7 @@ impl PipelinesSource {
                     .unwrap_or_default(),
                 run_id: a.run_id(),
                 url: a.web_url().map(str::to_string),
+                via_group: approval_via_group(a, &ctx.me),
             });
             if known.is_none() && !seeding {
                 out.events
@@ -373,6 +376,15 @@ fn approval_is_mine(a: &PipelineApproval, me: &Identity) -> bool {
         let id = &s.assigned_approver.id;
         id.eq_ignore_ascii_case(&me.id) || me.group_ids.iter().any(|g| g.eq_ignore_ascii_case(id))
     })
+}
+
+/// Mine only through a group: no step is assigned to me directly.
+fn approval_via_group(a: &PipelineApproval, me: &Identity) -> bool {
+    approval_is_mine(a, me)
+        && !a
+            .steps
+            .iter()
+            .any(|s| s.assigned_approver.id.eq_ignore_ascii_case(&me.id))
 }
 
 /// ADO reports approval states in assorted casing; map onto the pinned set.
@@ -506,6 +518,7 @@ fn approval_event(
     e.catch_up = ctx.catch_up;
     e.actor = system_actor();
     e.url = a.url.clone();
+    e.via_group = a.via_group;
     e.approval = Some(ApprovalRef {
         id: a.id.clone(),
         kind: KIND.into(),
@@ -548,6 +561,8 @@ mod tests {
     use super::*;
     use crate::auth::AdoAuth;
     use crate::client::AdoClient;
+    use crate::dto_git::IdentityRef;
+    use crate::pipelines::ApprovalStep;
     use chrono::TimeZone;
     use herald_core::config::{AuthConfig, ConnectionConfig};
     use herald_core::secrets::{MemorySecretStore, SecretStore};
@@ -895,9 +910,41 @@ mod tests {
         assert_eq!(p.approval.as_ref().unwrap().stage, "Deploy pipeline");
         assert_eq!(p.run.as_ref().unwrap().id, "77");
         assert_eq!(p.url.as_deref(), Some("https://example.test/run/77"));
+        assert!(p.via_group);
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].event_type, event_types::APPROVAL_COMPLETED);
+        assert!(second[0].via_group);
         assert_eq!(second[0].approval.as_ref().unwrap().status, "approved");
+    }
+
+    #[test]
+    fn approval_via_group_table() {
+        let step = |id: &str| ApprovalStep {
+            assigned_approver: IdentityRef {
+                id: id.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let case = |ids: &[&str]| PipelineApproval {
+            steps: ids.iter().map(|i| step(i)).collect(),
+            ..Default::default()
+        };
+        let me = me();
+        assert!(!approval_via_group(&case(&["AAAA-ME"]), &me));
+        assert!(approval_via_group(&case(&[GROUP]), &me));
+        assert!(!approval_via_group(&case(&[GROUP, ME]), &me));
+        assert!(!approval_via_group(&case(&["other"]), &me));
+        assert!(!approval_via_group(&case(&[]), &me));
+    }
+
+    #[test]
+    fn snapshot_without_via_group_defaults_false() {
+        let s: ApprovalSnapshot = serde_json::from_value(json!({
+            "pending": [{ "id": "ap1", "project": "Alpha", "pipeline": "P", "runId": 1, "url": null }],
+        }))
+        .unwrap();
+        assert!(!s.pending[0].via_group);
     }
 
     #[tokio::test]

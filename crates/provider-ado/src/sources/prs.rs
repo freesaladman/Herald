@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     SNAPSHOT_TRACKED_PRS, TrackedPr, TrackedPrs, active_prs, actor_from, is_fatal, mentions,
-    pr_key, pr_web_url, project_ref, repo_ref, wanted_on_pr, window_start,
+    pr_key, pr_web_url, project_ref, repo_ref, via_group, wanted_on_pr, window_start,
 };
 use crate::connection::AdoShared;
 use crate::dto_git::GitPullRequest;
@@ -434,6 +434,9 @@ impl PrLifecycleSource {
             .await?;
         ctx.snapshots.put(SNAPSHOT_LIFECYCLE, &state).await?;
         events.retain(wanted_on_pr);
+        for e in &mut events {
+            e.via_group = via_group(e);
+        }
         Ok(PollOutcome { events })
     }
 }
@@ -602,10 +605,10 @@ mod tests {
 
     fn cfg() -> ConnectionConfig {
         ConnectionConfig {
+            notify: Default::default(),
             id: "c1".into(),
             provider: "ado".into(),
             enabled: true,
-            notify: Default::default(),
             auth: AuthConfig {
                 method: "pat".into(),
             },
@@ -962,6 +965,24 @@ mod tests {
         assert_eq!(e.occurred_utc, at(10, 12));
         assert!(e.inferred);
         assert_eq!(e.title, "Review requested: change 2");
+        assert!(!e.via_group);
+    }
+
+    #[tokio::test]
+    async fn group_review_request_on_older_pr_is_flagged_via_group() {
+        let server = MockServer::start().await;
+        serve_active(&server, vec![]).await;
+        let (ctx, _store) = sync_context(cfg(), me(), at(10, 0), None, false);
+        let mut src = source(&server);
+        run(&mut src, &ctx, None, at(10, 0), false).await;
+
+        let mut p = pr(2, "other", at(1, 0));
+        p["reviewers"] = json!([{ "id": GROUP, "isContainer": true }]);
+        serve_active(&server, vec![p]).await;
+        let events = run(&mut src, &ctx, Some(at(10, 10)), at(10, 12), false).await;
+        assert_eq!(types(&events), ["pr.created"]);
+        assert_eq!(events[0].pr.as_ref().unwrap().role, PrRole::GroupReviewer);
+        assert!(events[0].via_group);
     }
 
     #[tokio::test]

@@ -56,6 +56,8 @@ struct PendingApproval {
     definition: String,
     environment: String,
     url: String,
+    #[serde(default)]
+    via_group: bool,
 }
 
 /// Per-project result; sections that failed non-fatally keep the previous state.
@@ -233,7 +235,7 @@ impl ReleasesSource {
             let known = previous.iter().find(|p| p.id == a.id);
             let entry = known
                 .cloned()
-                .unwrap_or_else(|| self.pending_entry(pname, a));
+                .unwrap_or_else(|| self.pending_entry(pname, a, &ctx.me));
             if known.is_none() && !seeding {
                 out.events
                     .push(approval_event(ctx, &entry, "pending", a.created_on));
@@ -276,7 +278,7 @@ impl ReleasesSource {
         )
     }
 
-    fn pending_entry(&self, project: &str, a: &ReleaseApproval) -> PendingApproval {
+    fn pending_entry(&self, project: &str, a: &ReleaseApproval, me: &Identity) -> PendingApproval {
         PendingApproval {
             id: a.id,
             project: project.to_string(),
@@ -285,6 +287,7 @@ impl ReleasesSource {
             definition: a.release_definition.name.clone(),
             environment: a.release_environment.name.clone(),
             url: self.release_url(project, a.release.id),
+            via_group: approval_via_group(a, me),
         }
     }
 
@@ -418,6 +421,13 @@ fn base_event(
     e
 }
 
+/// The query includes my groups' approvals, so a present approver that is not me is a group.
+fn approval_via_group(a: &ReleaseApproval, me: &Identity) -> bool {
+    a.approver
+        .as_ref()
+        .is_some_and(|ap| !ap.id.eq_ignore_ascii_case(&me.id))
+}
+
 fn approval_event(
     ctx: &SyncContext,
     a: &PendingApproval,
@@ -439,6 +449,7 @@ fn approval_event(
         ids::approval(&ctx.connection.id, KIND, &approval_id, status),
     );
     e.url = Some(a.url.clone());
+    e.via_group = a.via_group;
     e.approval = Some(ApprovalRef {
         id: approval_id,
         kind: KIND.into(),
@@ -478,6 +489,7 @@ mod tests {
     use super::*;
     use crate::auth::AdoAuth;
     use crate::client::AdoClient;
+    use crate::dto_git::IdentityRef;
     use chrono::TimeZone;
     use herald_core::config::{AuthConfig, ConnectionConfig};
     use herald_core::secrets::{MemorySecretStore, SecretStore};
@@ -655,6 +667,33 @@ mod tests {
         assert_eq!(a.pending.len(), 1);
     }
 
+    #[test]
+    fn approval_via_group_table() {
+        let case = |approver: Option<&str>| ReleaseApproval {
+            approver: approver.map(|id| IdentityRef {
+                id: id.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let me = me();
+        assert!(!approval_via_group(&case(Some("AAAA-ME")), &me));
+        assert!(approval_via_group(&case(Some(GROUP)), &me));
+        assert!(!approval_via_group(&case(None), &me));
+    }
+
+    #[test]
+    fn snapshot_without_via_group_defaults_false() {
+        let s: ApprovalSnapshot = serde_json::from_value(json!({
+            "pending": [{
+                "id": 50, "project": "Alpha", "releaseId": 1, "releaseName": "R-1",
+                "definition": "Def", "environment": "qa", "url": "https://example.test/r",
+            }],
+        }))
+        .unwrap();
+        assert!(!s.pending[0].via_group);
+    }
+
     #[tokio::test]
     async fn only_my_releases_emit_created() {
         let server = MockServer::start().await;
@@ -786,6 +825,7 @@ mod tests {
         assert_eq!((a.kind.as_str(), a.stage.as_str()), ("ado-classic", "qa"));
         assert_eq!(p.deployment.as_ref().unwrap().release_id, "1");
         assert!(p.url.as_deref().unwrap().contains("releaseId=1"));
+        assert!(p.via_group);
 
         let second_server = MockServer::start().await;
         serve(&second_server, vec![], vec![], vec![]).await;
@@ -801,6 +841,7 @@ mod tests {
         assert_eq!(second[0].event_type, event_types::APPROVAL_COMPLETED);
         assert_eq!(second[0].approval.as_ref().unwrap().status, "approved");
         assert_eq!(second[0].id, "c1:approval:ado-classic:50:approved");
+        assert!(second[0].via_group);
     }
 
     #[tokio::test]

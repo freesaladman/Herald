@@ -15,7 +15,7 @@ use serde_json::json;
 
 use super::{
     SNAPSHOT_TRACKED_PRS, TrackedPr, TrackedPrs, actor_from, is_fatal, pr_key, pr_web_url,
-    project_ref, repo_ref, wanted_on_pr, window_start,
+    project_ref, repo_ref, via_group, wanted_on_pr, window_start,
 };
 use crate::connection::AdoShared;
 use crate::dto_git::{GitPullRequestCommentThread, GitPullRequestIteration, IdentityRef};
@@ -136,7 +136,10 @@ impl PrReviewsSource {
             let mut seen = previous.cloned().unwrap_or_default();
             let found = review_events(ctx, org, pr, data, &mut seen, cut, previous.is_none());
             if !seeding {
-                events.extend(found.into_iter().filter(wanted_on_pr));
+                events.extend(found.into_iter().filter(wanted_on_pr).map(|mut e| {
+                    e.via_group = via_group(&e);
+                    e
+                }));
             }
             state.prs.insert(key, seen);
         }
@@ -567,10 +570,10 @@ mod tests {
 
     fn cfg() -> ConnectionConfig {
         ConnectionConfig {
+            notify: Default::default(),
             id: "c1".into(),
             provider: "ado".into(),
             enabled: true,
-            notify: Default::default(),
             auth: AuthConfig {
                 method: "pat".into(),
             },
@@ -1064,6 +1067,8 @@ mod tests {
         assert_eq!(events[0].data["isMe"], true);
         assert_eq!(events[0].pr.as_ref().unwrap().role, PrRole::Reviewer);
         assert_eq!(events[1].pr.as_ref().unwrap().role, PrRole::GroupReviewer);
+        assert!(!events[0].via_group);
+        assert!(events[1].via_group);
     }
 
     #[tokio::test]

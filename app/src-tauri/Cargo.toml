@@ -1,6 +1,6 @@
 [package]
 name = "herald-app"
-version = "0.1.1"
+version = "0.1.2"
 description = "Herald tray app"
 authors = ["freesaladman"]
 edition = "2024"

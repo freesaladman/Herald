@@ -30,6 +30,7 @@ fn client(server: &MockServer) -> AdoClient {
     let secrets = MemorySecretStore::new();
     secrets.set("conn", "pat").unwrap();
     let cfg = ConnectionConfig {
+        notify: Default::default(),
         id: "conn".into(),
         provider: "ado".into(),
         enabled: true,

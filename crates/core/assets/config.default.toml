@@ -12,13 +12,16 @@ max_lookback_days = 14  # how far back the first sync and catch-up look
 # pr_threads = 60
 # branches = 1800
 
-[alerts]
-# Event type globs that never raise a toast or sound, e.g. ["pr.iteration.*"].
-mute_types = []
-
-[roles.group_reviewer]
-# Alerting types for PRs where you are only a reviewer through a group.
-alert_types = ["pr.created", "pr.published", "pr.mentioned"]
+# Notification levels by category: pr, branch, run, release, deploy, approval.
+#   alert = toast, sound, pane, hooks, stream   pane = pane, hooks, stream (no toast)
+#   ignore = stored only (see herald events)
+# Your own actions never toast or show in the pane; bot actions never toast.
+# A [notify.group] entry applies to events that reach you only through a group.
+# Lookup: connection group, connection, global group, global, then alert.
+# [notify]
+# pr = "pane"
+# [notify.group]
+# approval = "ignore"
 
 [sound]
 # A relative file resolves against the config folder (HERALD_HOME).
@@ -48,6 +51,7 @@ port = 0  # 0 = pick a free port; the port and token are written to stream.json
 # enabled = true
 # auth = { method = "pat" }   # ado: "pat" (token stored in the OS keychain) or "azcli"
 # bots = ["svc-build@example.com", "Build\\*", "*Build Service*"]  # globs on unique or display name
+# notify = { pr = "pane", group = { approval = "ignore" } }  # overrides [notify] for this connection
 # organization = "my-org"
 # projects = []               # empty = all projects
 

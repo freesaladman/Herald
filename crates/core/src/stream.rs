@@ -22,7 +22,7 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::bus::Bus;
 use crate::config::{MatchTable, Paths};
-use crate::event::{ConnectionRef, Event};
+use crate::event::{ConnectionRef, Event, Level};
 use crate::hooks::CompiledHookFilter;
 use crate::store::{Store, StoreError};
 
@@ -301,6 +301,10 @@ struct Subscription {
 
 impl Subscription {
     fn wants(&self, event: &Event) -> bool {
+        // Stored ignore events are never streamed; the bus already withholds them live.
+        if event.level == Level::Ignore {
+            return false;
+        }
         if event.catch_up && !self.include_catch_up {
             return false;
         }
@@ -1162,6 +1166,29 @@ mod tests {
             json!({"type":"subscribe","afterSeq":0,"types":["pr.*"],"includeCatchUp":false}),
         )
         .await;
+        assert_eq!(recv_seqs(&mut c, 2).await, vec![1, 3]);
+        assert_quiet(&mut c).await;
+    }
+
+    #[tokio::test]
+    async fn replay_skips_stored_ignore_events_and_completes() {
+        let h = harness().await;
+        let mut ignored = event("e1", "pr.created");
+        ignored.level = Level::Ignore;
+        ignored.alert = false;
+        let mut pane = event("e2", "pr.created");
+        pane.level = Level::Pane;
+        pane.alert = false;
+        // Straight into the store: the bus would reclassify them.
+        let store = h.bus.store();
+        store
+            .insert_event_if_new(&event("e0", "pr.created"))
+            .await
+            .unwrap();
+        store.insert_event_if_new(&ignored).await.unwrap();
+        store.insert_event_if_new(&pane).await.unwrap();
+        let mut c = connect(&h).await;
+        subscribe(&mut c, json!({"type":"subscribe","afterSeq":0})).await;
         assert_eq!(recv_seqs(&mut c, 2).await, vec![1, 3]);
         assert_quiet(&mut c).await;
     }

@@ -365,6 +365,7 @@ mod tests {
             enabled: true,
             auth: Default::default(),
             bots: vec![],
+            notify: Default::default(),
             settings: toml::Table::new(),
         }
     }

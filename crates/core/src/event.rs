@@ -18,8 +18,15 @@ pub struct Event {
     pub test: bool,
     pub severity: Severity,
     pub actor: Actor,
-    /// Set by the classifier.
+    /// Set by the classifier; `Event::new` leaves it unclassified (false). After classify,
+    /// `alert == (level == Level::Alert)`.
     pub alert: bool,
+    /// Set by the classifier; `Event::new` leaves the default until it runs.
+    #[serde(default)]
+    pub level: Level,
+    /// Set by the provider: the event reached me only through a group.
+    #[serde(default)]
+    pub via_group: bool,
     pub title: String,
     pub subtitle: Option<String>,
     pub url: Option<String>,
@@ -69,6 +76,8 @@ impl Event {
                 unique_name: None,
             },
             alert: false,
+            level: Level::Alert,
+            via_group: false,
             title: title.into(),
             subtitle: None,
             url: None,
@@ -89,6 +98,96 @@ impl Event {
     pub fn with_id(mut self, id: impl Into<String>) -> Self {
         self.id = id.into();
         self
+    }
+
+    /// Listed in the pane; meaningful after classify.
+    pub fn in_pane(&self) -> bool {
+        self.level != Level::Ignore
+            && self.actor.kind != ActorKind::Me
+            && self.event_type != event_types::RECORD_ACTIVATED
+    }
+}
+
+/// Notification level stamped on each event by the classifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Level {
+    #[default]
+    Alert,
+    Pane,
+    Ignore,
+}
+
+impl Level {
+    pub const ALL: [Level; 3] = [Level::Alert, Level::Pane, Level::Ignore];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Level::Alert => "alert",
+            Level::Pane => "pane",
+            Level::Ignore => "ignore",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Level> {
+        Self::ALL.into_iter().find(|l| l.as_str() == s)
+    }
+
+    /// The quieter of self and cap (order: Alert > Pane > Ignore).
+    pub fn at_most(self, cap: Level) -> Level {
+        fn loudness(l: Level) -> u8 {
+            match l {
+                Level::Alert => 2,
+                Level::Pane => 1,
+                Level::Ignore => 0,
+            }
+        }
+        if loudness(self) <= loudness(cap) {
+            self
+        } else {
+            cap
+        }
+    }
+}
+
+/// Configurable event category: the event type prefix before the first '.'.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Category {
+    Pr,
+    Branch,
+    Run,
+    Release,
+    Deploy,
+    Approval,
+}
+
+impl Category {
+    pub const ALL: [Category; 6] = [
+        Category::Pr,
+        Category::Branch,
+        Category::Run,
+        Category::Release,
+        Category::Deploy,
+        Category::Approval,
+    ];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Category::Pr => "pr",
+            Category::Branch => "branch",
+            Category::Run => "run",
+            Category::Release => "release",
+            Category::Deploy => "deploy",
+            Category::Approval => "approval",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Option<Category> {
+        Self::ALL.into_iter().find(|c| c.key() == s)
+    }
+
+    pub fn of(event_type: &str) -> Option<Category> {
+        Self::from_key(event_type.split('.').next()?)
     }
 }
 
@@ -534,6 +633,102 @@ mod tests {
         assert_eq!(v["local"]["worktreePath"], "/w");
         let back: Event = serde_json::from_value(v).unwrap();
         assert_eq!(back, e);
+    }
+
+    #[test]
+    fn level_and_via_group_round_trip_and_default() {
+        let mut e = full_event();
+        e.level = Level::Pane;
+        e.via_group = true;
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["level"], "pane");
+        assert_eq!(v["viaGroup"], true);
+        let back: Event = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(back, e);
+
+        let mut old = v;
+        let o = old.as_object_mut().unwrap();
+        o.remove("level");
+        o.remove("viaGroup");
+        let e: Event = serde_json::from_value(old).unwrap();
+        assert_eq!(e.level, Level::Alert);
+        assert!(!e.via_group);
+    }
+
+    #[test]
+    fn level_and_category_parse_and_reject_unknowns() {
+        for l in Level::ALL {
+            assert_eq!(Level::parse(l.as_str()), Some(l));
+        }
+        for c in Category::ALL {
+            assert_eq!(Category::from_key(c.key()), Some(c));
+        }
+        for bad in ["Alert", "loud", "", "ALERT"] {
+            assert_eq!(Level::parse(bad), None, "{bad}");
+        }
+        for bad in ["Pr", "prs", "", "pr.vote"] {
+            assert_eq!(Category::from_key(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn at_most_returns_the_quieter_level() {
+        use Level::*;
+        let cases = [
+            (Alert, Alert, Alert),
+            (Alert, Pane, Pane),
+            (Alert, Ignore, Ignore),
+            (Pane, Alert, Pane),
+            (Pane, Pane, Pane),
+            (Pane, Ignore, Ignore),
+            (Ignore, Alert, Ignore),
+            (Ignore, Pane, Ignore),
+            (Ignore, Ignore, Ignore),
+        ];
+        for (level, cap, want) in cases {
+            assert_eq!(level.at_most(cap), want, "{level:?} capped at {cap:?}");
+        }
+    }
+
+    #[test]
+    fn category_of_uses_the_type_prefix() {
+        let cases = [
+            ("pr.vote.changed", Some(Category::Pr)),
+            ("branch.created", Some(Category::Branch)),
+            ("run.completed", Some(Category::Run)),
+            ("release.created", Some(Category::Release)),
+            ("deploy.failed", Some(Category::Deploy)),
+            ("approval.pending", Some(Category::Approval)),
+            ("auth.failed", None),
+            ("source.disabled", None),
+            ("catchup.summary", None),
+            ("record.activated", None),
+            ("", None),
+        ];
+        for (ty, want) in cases {
+            assert_eq!(Category::of(ty), want, "{ty}");
+        }
+    }
+
+    #[test]
+    fn in_pane_excludes_ignored_me_and_record_activated() {
+        let mut e = full_event();
+        e.actor.kind = ActorKind::Human;
+        e.level = Level::Pane;
+        assert!(e.in_pane());
+        e.actor.kind = ActorKind::Bot;
+        assert!(e.in_pane());
+        e.level = Level::Alert;
+        assert!(e.in_pane());
+
+        e.level = Level::Ignore;
+        assert!(!e.in_pane());
+        e.level = Level::Pane;
+        e.actor.kind = ActorKind::Me;
+        assert!(!e.in_pane());
+        e.actor.kind = ActorKind::Human;
+        e.event_type = event_types::RECORD_ACTIVATED.to_string();
+        assert!(!e.in_pane());
     }
 
     #[test]

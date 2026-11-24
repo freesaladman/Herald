@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use globset::{Glob, GlobBuilder};
 use serde::{Deserialize, Serialize};
 
+use crate::event::{Category, Level};
 use crate::hooks::placeholder_paths;
 
 const DEFAULT_TOML: &str = include_str!("../assets/config.default.toml");
@@ -97,8 +98,7 @@ impl ConfigError {
 #[serde(default)]
 pub struct Config {
     pub polling: PollingConfig,
-    pub alerts: AlertsConfig,
-    pub roles: RolesConfig,
+    pub notify: NotifyConfig,
     pub sound: SoundConfig,
     pub toast: ToastConfig,
     pub local: LocalConfig,
@@ -131,34 +131,6 @@ impl Default for PollingConfig {
             slow_secs: 600,
             max_lookback_days: 14,
             sources: BTreeMap::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AlertsConfig {
-    pub mute_types: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RolesConfig {
-    pub group_reviewer: GroupReviewerRole,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct GroupReviewerRole {
-    pub alert_types: Vec<String>,
-}
-
-impl Default for GroupReviewerRole {
-    fn default() -> Self {
-        Self {
-            alert_types: ["pr.created", "pr.published", "pr.mentioned"]
-                .map(String::from)
-                .to_vec(),
         }
     }
 }
@@ -225,6 +197,45 @@ pub struct AuthConfig {
     pub method: String,
 }
 
+/// Notification levels by category key; values are validated by `Config::validate`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotifyConfig {
+    /// Levels for events that reached me through a group, by category key.
+    pub group: BTreeMap<String, String>,
+    /// Levels by category key.
+    #[serde(flatten)]
+    pub levels: BTreeMap<String, String>,
+}
+
+impl NotifyConfig {
+    /// Configured level for a category (group map when `group`); None when unset or invalid.
+    pub fn level(&self, category: Category, group: bool) -> Option<Level> {
+        let map = if group { &self.group } else { &self.levels };
+        map.get(category.key()).and_then(|v| Level::parse(v))
+    }
+}
+
+/// Lookup order: connection.group, connection, global.group, global, then Alert.
+/// The group steps apply only when `via_group`.
+pub fn resolve_level(
+    global: &NotifyConfig,
+    connection: Option<&NotifyConfig>,
+    category: Category,
+    via_group: bool,
+) -> Level {
+    [connection, Some(global)]
+        .into_iter()
+        .flatten()
+        .find_map(|n| {
+            via_group
+                .then(|| n.level(category, true))
+                .flatten()
+                .or_else(|| n.level(category, false))
+        })
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConnectionConfig {
     pub id: String,
@@ -235,6 +246,9 @@ pub struct ConnectionConfig {
     pub auth: AuthConfig,
     #[serde(default)]
     pub bots: Vec<String>,
+    /// Levels for this connection; overrides the global `[notify]`.
+    #[serde(default)]
+    pub notify: NotifyConfig,
     /// Provider-specific keys.
     #[serde(flatten)]
     pub settings: toml::Table,
@@ -371,6 +385,14 @@ impl Config {
 
     pub fn from_toml_str(text: &str) -> Result<Config, Vec<ConfigError>> {
         let cfg: Config = toml::from_str(text).map_err(|e| vec![parse_error(text, &e)])?;
+        if let Ok(table) = text.parse::<toml::Table>() {
+            for key in deprecated_keys(&table) {
+                tracing::warn!(
+                    key,
+                    "config key is no longer supported and is ignored; use [notify]"
+                );
+            }
+        }
         let errors = cfg.validate();
         if errors.is_empty() {
             Ok(cfg)
@@ -403,12 +425,7 @@ impl Config {
                 ));
             }
         }
-        check_globs(&mut errs, "alerts.mute_types", &self.alerts.mute_types);
-        check_globs(
-            &mut errs,
-            "roles.group_reviewer.alert_types",
-            &self.roles.group_reviewer.alert_types,
-        );
+        check_notify(&mut errs, "notify", &self.notify);
 
         let mut seen_ids: Vec<&str> = Vec::new();
         for (i, c) in self.connections.iter().enumerate() {
@@ -437,6 +454,7 @@ impl Config {
                 ));
             }
             check_globs(&mut errs, &format!("{at}.bots"), &c.bots);
+            check_notify(&mut errs, &format!("{at}.notify"), &c.notify);
         }
 
         let mut seen_names: Vec<&str> = Vec::new();
@@ -516,12 +534,60 @@ fn shell_executed_env(name: &str) -> bool {
         .contains(&upper.as_str())
 }
 
+fn check_notify(errs: &mut Vec<ConfigError>, path: &str, notify: &NotifyConfig) {
+    let maps = [
+        (path.to_string(), &notify.levels),
+        (format!("{path}.group"), &notify.group),
+    ];
+    for (base, map) in maps {
+        for (key, value) in map {
+            let at = format!("{base}.{key}");
+            if Category::from_key(key).is_none() {
+                errs.push(ConfigError::new(
+                    at,
+                    format!(
+                        "unknown category '{key}' (expected pr, branch, run, release, deploy or approval)"
+                    ),
+                ));
+            } else if Level::parse(value).is_none() {
+                errs.push(ConfigError::new(
+                    at,
+                    format!("'{value}' must be alert, pane or ignore"),
+                ));
+            }
+        }
+    }
+}
+
 fn check_globs(errs: &mut Vec<ConfigError>, path: &str, patterns: &[String]) {
     for p in patterns {
         if let Err(e) = build_glob(p) {
             errs.push(ConfigError::new(path, format!("invalid glob '{p}': {e}")));
         }
     }
+}
+
+/// Removed keys still present in a config file.
+fn deprecated_keys(table: &toml::Table) -> Vec<&'static str> {
+    let has = |path: &[&str]| {
+        let mut cur = table;
+        for (i, k) in path.iter().enumerate() {
+            match cur.get(*k) {
+                Some(toml::Value::Table(t)) if i + 1 < path.len() => cur = t,
+                Some(_) => return i + 1 == path.len(),
+                None => return false,
+            }
+        }
+        false
+    };
+    let mut out = Vec::new();
+    if has(&["alerts", "mute_types"]) {
+        out.push("alerts.mute_types");
+    }
+    if has(&["roles", "group_reviewer", "alert_types"]) {
+        out.push("roles.group_reviewer.alert_types");
+    }
+    out
 }
 
 fn parse_error(text: &str, e: &toml::de::Error) -> ConfigError {
@@ -602,7 +668,8 @@ releases = 15
         assert_eq!(cfg.hooks.len(), 1);
         assert_eq!(cfg.hooks[0].action, Some(HookAction::OpenUrl));
         assert_eq!(cfg.polling, PollingConfig::default());
-        assert_eq!(cfg.roles, RolesConfig::default());
+        assert!(deprecated_keys(&Config::default_toml().parse().unwrap()).is_empty());
+        assert_eq!(cfg.notify, NotifyConfig::default());
         assert_eq!(cfg.toast, ToastConfig::default());
     }
 
@@ -611,7 +678,7 @@ releases = 15
         let mut out = Vec::new();
         let mut in_block = false;
         for line in Config::default_toml().lines() {
-            if line.starts_with("# [[") {
+            if line.starts_with("# [[") || line.starts_with("# [notify") {
                 in_block = true;
             } else if line.is_empty() {
                 in_block = false;
@@ -625,6 +692,122 @@ releases = 15
         let cfg = Config::from_toml_str(&out.join("\n")).expect("examples valid");
         assert_eq!(cfg.connections.len(), 1);
         assert_eq!(cfg.hooks.len(), 2);
+        assert_eq!(cfg.notify.levels["pr"], "pane");
+        assert_eq!(cfg.notify.group["approval"], "ignore");
+        let conn = &cfg.connections[0].notify;
+        assert_eq!(conn.levels["pr"], "pane");
+        assert_eq!(conn.group["approval"], "ignore");
+        assert!(!cfg.connections[0].settings.contains_key("notify"));
+    }
+
+    #[test]
+    fn resolve_level_follows_lookup_order() {
+        let cfg = Config::from_toml_str(
+            r#"
+[notify]
+approval = "pane"
+[notify.group]
+pr = "pane"
+[[connections]]
+id = "a"
+provider = "fake"
+notify = { pr = "ignore" }
+"#,
+        )
+        .unwrap();
+        let conn = Some(&cfg.connections[0].notify);
+        let g = &cfg.notify;
+        assert_eq!(resolve_level(g, conn, Category::Pr, true), Level::Ignore);
+        assert_eq!(resolve_level(g, conn, Category::Pr, false), Level::Ignore);
+        assert_eq!(resolve_level(g, None, Category::Pr, true), Level::Pane);
+        assert_eq!(resolve_level(g, None, Category::Pr, false), Level::Alert);
+        assert_eq!(
+            resolve_level(g, conn, Category::Approval, false),
+            Level::Pane
+        );
+        assert_eq!(resolve_level(g, conn, Category::Run, true), Level::Alert);
+        let grouped = Config::from_toml_str(
+            "[[connections]]
+id = \"a\"
+provider = \"fake\"
+notify = { pr = \"ignore\", group = { pr = \"pane\" } }
+",
+        )
+        .unwrap();
+        let gconn = Some(&grouped.connections[0].notify);
+        let none = NotifyConfig::default();
+        assert_eq!(resolve_level(&none, gconn, Category::Pr, true), Level::Pane);
+        assert_eq!(
+            resolve_level(&none, gconn, Category::Pr, false),
+            Level::Ignore
+        );
+        let empty = NotifyConfig::default();
+        assert_eq!(
+            resolve_level(&empty, None, Category::Approval, true),
+            Level::Alert
+        );
+    }
+
+    #[test]
+    fn notify_is_not_a_provider_setting() {
+        let cfg = Config::from_toml_str(
+            "[[connections]]\nid = \"a\"\nprovider = \"fake\"\nhost = \"x\"\nnotify = { pr = \"pane\" }\n",
+        )
+        .unwrap();
+        let c = &cfg.connections[0];
+        assert!(!c.settings.contains_key("notify"));
+        assert!(c.settings.contains_key("host"));
+        assert_eq!(c.notify.level(Category::Pr, false), Some(Level::Pane));
+    }
+
+    #[test]
+    fn notify_validation_reports_each_path() {
+        let toml = r#"
+[notify]
+bogus = "alert"
+pr = "loud"
+[notify.group]
+bogus = "alert"
+run = "loud"
+[[connections]]
+id = "a"
+provider = "fake"
+notify = { bogus = "alert", pr = "loud", group = { bogus = "pane", deploy = "loud" } }
+"#;
+        let errs = Config::from_toml_str(toml).expect_err("rejected");
+        let got: Vec<(&str, &str)> = errs
+            .iter()
+            .map(|e| (e.path.as_str(), e.message.as_str()))
+            .collect();
+        let unknown = |k: &str| {
+            format!(
+                "unknown category '{k}' (expected pr, branch, run, release, deploy or approval)"
+            )
+        };
+        let bad = |v: &str| format!("'{v}' must be alert, pane or ignore");
+        let expected = [
+            ("notify.bogus", unknown("bogus")),
+            ("notify.pr", bad("loud")),
+            ("notify.group.bogus", unknown("bogus")),
+            ("notify.group.run", bad("loud")),
+            ("connections[0].notify.bogus", unknown("bogus")),
+            ("connections[0].notify.pr", bad("loud")),
+            ("connections[0].notify.group.bogus", unknown("bogus")),
+            ("connections[0].notify.group.deploy", bad("loud")),
+        ];
+        for (path, msg) in &expected {
+            assert!(
+                got.contains(&(*path, msg.as_str())),
+                "missing {path}: {got:?}"
+            );
+        }
+        assert_eq!(got.len(), expected.len());
+    }
+
+    #[test]
+    fn valid_notify_passes() {
+        Config::from_toml_str("[notify]\npr = \"pane\"\n[notify.group]\napproval = \"ignore\"\n")
+            .unwrap();
     }
 
     #[test]
@@ -760,18 +943,20 @@ env = { bash_env = "{pr.title}", PS4 = "{x}", BASH_FUNC_f = "{x}", ENV = "ok", S
     }
 
     #[test]
-    fn rejects_bad_globs_and_volume() {
-        let p = err_paths(
-            "[alerts]\nmute_types = [\"[\"]\n[roles.group_reviewer]\nalert_types = [\"[\"]\n[sound]\nvolume = 1.5\n",
-        );
+    fn rejects_bad_volume() {
+        assert_eq!(err_paths("[sound]\nvolume = 1.5\n"), vec!["sound.volume"]);
+    }
+
+    #[test]
+    fn removed_keys_still_load_and_are_reported() {
+        let text = "[alerts]\nmute_types = [\"pr.*\"]\n[roles.group_reviewer]\nalert_types = [\"pr.created\"]\n";
+        assert!(Config::from_toml_str(text).is_ok());
         assert_eq!(
-            p,
-            vec![
-                "sound.volume",
-                "alerts.mute_types",
-                "roles.group_reviewer.alert_types"
-            ]
+            deprecated_keys(&text.parse().unwrap()),
+            ["alerts.mute_types", "roles.group_reviewer.alert_types"]
         );
+        let commented = "# [alerts]\n# mute_types = [\"pr.*\"]\n[roles]\n";
+        assert!(deprecated_keys(&commented.parse().unwrap()).is_empty());
     }
 
     #[test]

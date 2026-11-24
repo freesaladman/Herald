@@ -12,11 +12,11 @@ use serde::de::DeserializeOwned;
 use super::{HookRun, Result, Store, StoreError, Watermark};
 use crate::event::Event;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The v2 `events` table and its indexes. A macro so the migration and `SCHEMA` share one text.
+/// The current `events` table and its indexes. A macro so the migration and `SCHEMA` share one text.
 macro_rules! events_ddl {
     () => {
         "
@@ -32,9 +32,11 @@ CREATE TABLE IF NOT EXISTS events (
     catch_up INTEGER NOT NULL,
     test INTEGER NOT NULL,
     viewed_utc TEXT NULL,
-    json TEXT NOT NULL
+    json TEXT NOT NULL,
+    pane INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_events_alert_viewed ON events (alert, viewed_utc, occurred_utc);
+CREATE INDEX IF NOT EXISTS idx_events_pane_viewed ON events (pane, viewed_utc, occurred_utc);
 CREATE INDEX IF NOT EXISTS idx_events_occurred ON events (occurred_utc);
 "
     };
@@ -86,6 +88,8 @@ pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
     /// False only for a read-only open of a v1 database, whose `events` table has no `seq` column.
     has_seq: bool,
+    /// False only for a read-only open of a pre-v3 database, whose `events` table has no `pane` column.
+    has_pane: bool,
     /// Test builds (unit tests, or the `testing` feature) run in-memory stores on the calling task: tokio's paused clock treats a
     /// pending `spawn_blocking` as idle and would jump time past it.
     #[cfg(any(test, feature = "testing"))]
@@ -126,6 +130,14 @@ fn check_schema_version(conn: &Connection) -> Result<()> {
     }
 }
 
+fn events_has_pane(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('events') WHERE name = 'pane')",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
 fn events_has_seq(conn: &Connection) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM pragma_table_info('events') WHERE name = 'seq')",
@@ -144,22 +156,26 @@ fn needs_v2_migration(conn: &Connection) -> Result<bool> {
     Ok(has_events && !events_has_seq(conn)?)
 }
 
-fn migration_error(what: &str, e: impl std::fmt::Display) -> StoreError {
-    StoreError::Backend(format!("schema migration to v2 failed ({what}): {e}").into())
+fn migration_error(version: u32, what: &str, e: impl std::fmt::Display) -> StoreError {
+    StoreError::Backend(format!("schema migration to v{version} failed ({what}): {e}").into())
 }
 
-/// `<db>.v1.bak`, or `<db>.v1.<UTC yyyymmddThhmmss>.bak` when that already exists.
-fn backup_path(db: &Path) -> std::path::PathBuf {
+/// `<db>.v<N>.bak`, or `<db>.v<N>.<UTC yyyymmddThhmmss>.bak` when that already exists, where N is the
+/// schema version being backed up.
+fn backup_path(db: &Path, version: u32) -> std::path::PathBuf {
     let with_suffix = |suffix: &str| {
         let mut name = db.as_os_str().to_owned();
         name.push(suffix);
         std::path::PathBuf::from(name)
     };
-    let plain = with_suffix(".v1.bak");
+    let plain = with_suffix(&format!(".v{version}.bak"));
     if !plain.exists() {
         return plain;
     }
-    with_suffix(&format!(".v1.{}.bak", Utc::now().format("%Y%m%dT%H%M%S")))
+    with_suffix(&format!(
+        ".v{version}.{}.bak",
+        Utc::now().format("%Y%m%dT%H%M%S")
+    ))
 }
 
 /// Rebuilds `events` with an AUTOINCREMENT `seq` primary key, keeping rows in their old rowid
@@ -180,15 +196,15 @@ fn migrate_v1_to_v2_with(
         return Ok(());
     }
     if let Some(db) = db_path {
-        let bak = backup_path(db);
+        let bak = backup_path(db, 1);
         conn.execute("VACUUM INTO ?1", params![bak.to_string_lossy()])
-            .map_err(|e| migration_error("backup", e))?;
+            .map_err(|e| migration_error(2, "backup", e))?;
         tracing::info!(backup = %bak.display(), "backed up database before schema migration");
     }
     before_begin();
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| migration_error("begin", e))?;
+        .map_err(|e| migration_error(2, "begin", e))?;
     // Another opener may have migrated while this one waited for the lock; a second rebuild would
     // renumber seqs densely and reuse pruned ones.
     if !needs_v2_migration(&tx)? {
@@ -208,13 +224,94 @@ fn migrate_v1_to_v2_with(
          CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
          INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1');",
     ))
-    .map_err(|e| migration_error("rebuild", e))?;
+    .map_err(|e| migration_error(2, "rebuild", e))?;
     tx.execute(
         "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
-        params![SCHEMA_VERSION.to_string()],
+        params!["2"],
     )
-    .map_err(|e| migration_error("version", e))?;
-    tx.commit().map_err(|e| migration_error("commit", e))?;
+    .map_err(|e| migration_error(2, "version", e))?;
+    tx.commit().map_err(|e| migration_error(2, "commit", e))?;
+    Ok(())
+}
+
+fn stored_schema_version(conn: &Connection) -> Result<Option<i64>> {
+    let has_meta: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_meta {
+        return Ok(None);
+    }
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(value.and_then(|v| v.trim().parse::<i64>().ok()))
+}
+
+/// A pre-v3 database has an `events` table and a stored version below 3 (or none). A brand-new
+/// database has no `events` table and is created current by `SCHEMA`.
+fn needs_v3_migration(conn: &Connection) -> Result<bool> {
+    let has_events: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events')",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(has_events && stored_schema_version(conn)?.is_none_or(|v| v < 3))
+}
+
+/// Adds `events.pane` (when missing), backfills it from `alert`, gives stored json a `level`, indexes
+/// the column and records version 3, all in one transaction. A file database is first copied with
+/// `VACUUM INTO`.
+fn migrate_v2_to_v3(conn: &mut Connection, db_path: Option<&Path>) -> Result<()> {
+    migrate_v2_to_v3_with(conn, db_path, || {})
+}
+
+/// `before_begin` runs after the backup and before the write lock is taken, where a racing opener can slip in.
+fn migrate_v2_to_v3_with(
+    conn: &mut Connection,
+    db_path: Option<&Path>,
+    before_begin: impl FnOnce(),
+) -> Result<()> {
+    if !needs_v3_migration(conn)? {
+        return Ok(());
+    }
+    if let Some(db) = db_path {
+        let bak = backup_path(db, 2);
+        conn.execute("VACUUM INTO ?1", params![bak.to_string_lossy()])
+            .map_err(|e| migration_error(3, "backup", e))?;
+        tracing::info!(backup = %bak.display(), "backed up database before schema migration");
+    }
+    before_begin();
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| migration_error(3, "begin", e))?;
+    if !needs_v3_migration(&tx)? {
+        return Ok(());
+    }
+    if !events_has_pane(&tx)? {
+        tx.execute_batch("ALTER TABLE events ADD COLUMN pane INTEGER NOT NULL DEFAULT 0;")
+            .map_err(|e| migration_error(3, "column", e))?;
+    }
+    // Before v3 only alerting events were listed, so pane = alert preserves what the pane showed.
+    tx.execute_batch(
+        "UPDATE events SET pane = alert;
+         UPDATE events SET json = json_set(json, '$.level', CASE WHEN alert = 1 THEN 'alert' ELSE 'pane' END)
+             WHERE json_extract(json, '$.level') IS NULL;
+         CREATE INDEX IF NOT EXISTS idx_events_pane_viewed ON events (pane, viewed_utc, occurred_utc);",
+    )
+    .map_err(|e| migration_error(3, "backfill", e))?;
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES ('schema_version', '3')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [],
+    )
+    .map_err(|e| migration_error(3, "version", e))?;
+    tx.commit().map_err(|e| migration_error(3, "commit", e))?;
     Ok(())
 }
 
@@ -253,9 +350,11 @@ impl SqliteStore {
         conn.busy_timeout(BUSY_TIMEOUT)?;
         check_schema_version(&conn)?;
         let has_seq = events_has_seq(&conn)?;
+        let has_pane = events_has_pane(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             has_seq,
+            has_pane,
             #[cfg(any(test, feature = "testing"))]
             inline: false,
         })
@@ -267,6 +366,8 @@ impl SqliteStore {
         check_schema_version(&conn)?;
         // Before `SCHEMA`: the rebuild needs the v1 `events` table, which `SCHEMA` would not replace.
         migrate_v1_to_v2(&mut conn, db_path)?;
+        // Also before `SCHEMA`: its index on `pane` fails on a v2 table.
+        migrate_v2_to_v3(&mut conn, db_path)?;
         conn.execute_batch(SCHEMA)?;
         conn.execute(
             "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?1)",
@@ -279,6 +380,7 @@ impl SqliteStore {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             has_seq: true,
+            has_pane: true,
             #[cfg(any(test, feature = "testing"))]
             inline: false,
         })
@@ -309,8 +411,8 @@ impl SqliteStore {
         let conn = self.lock()?;
         let n = conn.execute(
             "INSERT OR IGNORE INTO events
-             (id, type, connection_id, occurred_utc, detected_utc, subject_key, alert, catch_up, test, viewed_utc, json)
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10
+             (id, type, connection_id, occurred_utc, detected_utc, subject_key, alert, catch_up, test, viewed_utc, json, pane)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11
              WHERE NOT EXISTS (SELECT 1 FROM events WHERE id = ?1)",
             params![
                 e.id,
@@ -322,7 +424,8 @@ impl SqliteStore {
                 e.alert,
                 e.catch_up,
                 e.test,
-                json
+                json,
+                e.in_pane()
             ],
         )?;
         Ok((n > 0).then(|| conn.last_insert_rowid().cast_unsigned()))
@@ -395,11 +498,15 @@ impl SqliteStore {
             })?)
     }
 
-    /// Alerting events not yet viewed, newest first.
+    /// Pane-listed events not yet viewed, newest first. A read-only pre-v3 database has no `pane`
+    /// column and listed alerting events only.
     fn unviewed(&self, limit: u32) -> Result<Vec<Event>> {
+        let column = if self.has_pane { "pane" } else { "alert" };
         self.query_events(
-            "SELECT json, {seq} FROM events WHERE alert = 1 AND viewed_utc IS NULL
-             ORDER BY occurred_utc DESC, id LIMIT ?1",
+            &format!(
+                "SELECT json, {{seq}} FROM events WHERE {column} = 1 AND viewed_utc IS NULL
+                 ORDER BY occurred_utc DESC, id LIMIT ?1"
+            ),
             params![limit],
         )
     }
@@ -430,7 +537,7 @@ impl SqliteStore {
 
     fn mark_all_viewed(&self) -> Result<()> {
         self.lock()?.execute(
-            "UPDATE events SET viewed_utc = ?1 WHERE alert = 1 AND viewed_utc IS NULL",
+            "UPDATE events SET viewed_utc = ?1 WHERE pane = 1 AND viewed_utc IS NULL",
             params![ts(Utc::now())],
         )?;
         Ok(())
@@ -682,7 +789,7 @@ impl Store for SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::ConnectionRef;
+    use crate::event::{ConnectionRef, Level};
     use chrono::TimeZone;
     use pretty_assertions::assert_eq;
 
@@ -713,6 +820,7 @@ mod tests {
         };
         let mut e = Event::new(conn, "pr.created", occurred, occurred, "t", "c:pr:1:1").with_id(id);
         e.alert = alert;
+        e.level = if alert { Level::Alert } else { Level::Pane };
         e
     }
 
@@ -751,8 +859,9 @@ mod tests {
         s.insert_event_if_new(&event("old", at(1), true)).unwrap();
         s.insert_event_if_new(&event("new", at(3), true)).unwrap();
         s.insert_event_if_new(&event("mid", at(2), true)).unwrap();
-        s.insert_event_if_new(&event("quiet", at(4), false))
-            .unwrap();
+        let mut quiet = event("quiet", at(4), false);
+        quiet.level = Level::Ignore;
+        s.insert_event_if_new(&quiet).unwrap();
 
         assert_eq!(s.unviewed_count().unwrap(), 3);
         assert_eq!(ids(&s.unviewed(10).unwrap()), ["new", "mid", "old"]);
@@ -877,7 +986,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(v, "2");
+            assert_eq!(v, "3");
         }
         let ro = SqliteStore::open_read_only(&path).unwrap();
         assert_eq!(ro.unviewed_count().unwrap(), 1);
@@ -1070,8 +1179,9 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         assert_eq!(s.latest_seq().unwrap(), 4);
         assert!(!s.store_id().unwrap().is_empty());
 
+        assert_eq!(ids(&s.unviewed(10).unwrap()), ["d", "c", "b"]);
         let conn = s.lock().unwrap();
-        assert_eq!(schema_version(&conn), "2");
+        assert_eq!(schema_version(&conn), "3");
         let mut stmt = conn
             .prepare("SELECT name FROM sqlite_master WHERE tbl_name = 'events' ORDER BY name")
             .unwrap();
@@ -1082,6 +1192,7 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             .unwrap();
         assert!(names.contains(&"idx_events_alert_viewed".to_string()));
         assert!(names.contains(&"idx_events_occurred".to_string()));
+        assert!(names.contains(&"idx_events_pane_viewed".to_string()));
         assert!(!names.iter().any(|n| n.contains("v1")));
     }
 
@@ -1127,7 +1238,10 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         drop(SqliteStore::open(&path).unwrap());
         drop(SqliteStore::open(&path).unwrap());
 
-        assert_eq!(bak_files(dir.path()), ["herald.db.v1.bak"]);
+        assert_eq!(
+            bak_files(dir.path()),
+            ["herald.db.v1.bak", "herald.db.v2.bak"]
+        );
         let bak = Connection::open_with_flags(
             dir.path().join("herald.db.v1.bak"),
             OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -1153,8 +1267,11 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
         assert_eq!(std::fs::read(&existing).unwrap(), b"keep");
         let names = bak_files(dir.path());
-        assert_eq!(names.len(), 2);
-        let stamped = names.iter().find(|n| *n != "herald.db.v1.bak").unwrap();
+        assert_eq!(names.len(), 3);
+        let stamped = names
+            .iter()
+            .find(|n| n.starts_with("herald.db.v1.") && *n != "herald.db.v1.bak")
+            .unwrap();
         let stamp = stamped
             .strip_prefix("herald.db.v1.")
             .and_then(|n| n.strip_suffix(".bak"))
@@ -1184,7 +1301,7 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
         let s = SqliteStore::open(&path).unwrap();
         assert_eq!(ids(&s.events_after_seq(0, 10).unwrap()), ["a", "b"]);
-        assert_eq!(schema_version(&s.lock().unwrap()), "2");
+        assert_eq!(schema_version(&s.lock().unwrap()), "3");
     }
 
     #[test]
@@ -1206,6 +1323,153 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         assert!(matches!(ro.latest_seq(), Err(StoreError::NeedsUpgrade)));
         assert!(matches!(ro.oldest_seq(), Err(StoreError::NeedsUpgrade)));
         assert!(matches!(ro.store_id(), Err(StoreError::NeedsUpgrade)));
+        assert!(bak_files(dir.path()).is_empty());
+    }
+
+    /// The v2 `events` table as the previous release created it: `seq`, no `pane`.
+    const V2_EVENTS: &str = "
+CREATE TABLE IF NOT EXISTS events (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    type TEXT NOT NULL,
+    connection_id TEXT NOT NULL,
+    occurred_utc TEXT NOT NULL,
+    detected_utc TEXT NOT NULL,
+    subject_key TEXT NOT NULL,
+    alert INTEGER NOT NULL,
+    catch_up INTEGER NOT NULL,
+    test INTEGER NOT NULL,
+    viewed_utc TEXT NULL,
+    json TEXT NOT NULL
+);
+";
+
+    /// Builds a v2 database with an alerting row `a` and a non-alerting row `q`, whose stored json
+    /// predates `level`.
+    fn make_v2_db(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))
+            .unwrap();
+        conn.execute_batch(V2_EVENTS).unwrap();
+        conn.execute_batch(V1_SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', '2')",
+            [],
+        )
+        .unwrap();
+        for (i, (id, alert)) in [("a", true), ("q", false)].into_iter().enumerate() {
+            let e = event(id, at(i64::try_from(i).unwrap()), alert);
+            let mut json = serde_json::to_value(&e).unwrap();
+            json.as_object_mut().unwrap().remove("level");
+            conn.execute(
+                "INSERT INTO events
+                 (id, type, connection_id, occurred_utc, detected_utc, subject_key, alert, catch_up, test, viewed_utc, json)
+                 VALUES (?1, 'pr.created', 'c', ?2, ?2, 't', ?3, 0, 0, NULL, ?4)",
+                params![id, ts(e.occurred_utc), alert, json.to_string()],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn v2_database_migrates_to_v3_with_pane_backfilled_and_a_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herald.db");
+        make_v2_db(&path);
+
+        let s = SqliteStore::open(&path).unwrap();
+
+        assert_eq!(bak_files(dir.path()), ["herald.db.v2.bak"]);
+        assert_eq!(ids(&s.unviewed(10).unwrap()), ["a"]);
+        assert_eq!(s.unviewed_count().unwrap(), 1);
+        let levels: Vec<Level> = s
+            .events_after_seq(0, 10)
+            .unwrap()
+            .iter()
+            .map(|e| e.level)
+            .collect();
+        assert_eq!(levels, [Level::Alert, Level::Pane]);
+        let stored: String = s
+            .lock()
+            .unwrap()
+            .query_row("SELECT json FROM events WHERE id = 'q'", [], |r| r.get(0))
+            .unwrap();
+        assert!(stored.contains("\"level\":\"pane\""));
+        assert_eq!(schema_version(&s.lock().unwrap()), "3");
+        drop(s);
+
+        // Reopening is a no-op: no second backup, rows unchanged.
+        let s = SqliteStore::open(&path).unwrap();
+        assert_eq!(bak_files(dir.path()), ["herald.db.v2.bak"]);
+        assert_eq!(ids(&s.unviewed(10).unwrap()), ["a"]);
+        assert_eq!(schema_version(&s.lock().unwrap()), "3");
+    }
+
+    #[test]
+    fn v3_migration_survives_a_column_added_by_an_earlier_partial_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herald.db");
+        make_v2_db(&path);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("ALTER TABLE events ADD COLUMN pane INTEGER NOT NULL DEFAULT 0;")
+            .unwrap();
+
+        let s = SqliteStore::open(&path).unwrap();
+
+        assert_eq!(ids(&s.unviewed(10).unwrap()), ["a"]);
+        assert_eq!(schema_version(&s.lock().unwrap()), "3");
+    }
+
+    #[test]
+    fn v3_migration_is_skipped_when_another_opener_migrated_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herald.db");
+        make_v2_db(&path);
+        let mut first = Connection::open(&path).unwrap();
+        first.busy_timeout(BUSY_TIMEOUT).unwrap();
+
+        migrate_v2_to_v3_with(&mut first, Some(&path), || {
+            let other = SqliteStore::open(&path).unwrap();
+            // A pane-level row written at v3: a second backfill (pane = alert) would unlist it.
+            other
+                .insert_event_if_new(&event("p", at(5), false))
+                .unwrap();
+        })
+        .unwrap();
+
+        let s = SqliteStore::open(&path).unwrap();
+        assert_eq!(ids(&s.unviewed(10).unwrap()), ["p", "a"]);
+        assert_eq!(schema_version(&s.lock().unwrap()), "3");
+        let baks = bak_files(dir.path());
+        assert_eq!(baks.len(), 2);
+        assert!(baks.contains(&"herald.db.v2.bak".to_string()));
+        let stamped = baks
+            .iter()
+            .find(|n| *n != "herald.db.v2.bak")
+            .unwrap()
+            .strip_prefix("herald.db.v2.")
+            .and_then(|n| n.strip_suffix(".bak"))
+            .unwrap();
+        assert!(
+            chrono::NaiveDateTime::parse_from_str(stamped, "%Y%m%dT%H%M%S").is_ok(),
+            "{stamped}"
+        );
+    }
+
+    #[test]
+    fn read_only_v2_database_still_reads_by_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herald.db");
+        make_v2_db(&path);
+
+        let ro = SqliteStore::open_read_only(&path).unwrap();
+
+        assert_eq!(ids(&ro.events_after_seq(0, 10).unwrap()), ["a", "q"]);
+        assert_eq!(ro.latest_seq().unwrap(), 2);
+        assert_eq!(ids(&ro.unviewed(10).unwrap()), ["a"]);
+        assert_eq!(ro.unviewed_count().unwrap(), 1);
+        assert_eq!(ids(&ro.events_since(at(0), 10).unwrap()), ["a", "q"]);
         assert!(bak_files(dir.path()).is_empty());
     }
 

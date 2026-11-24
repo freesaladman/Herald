@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use toml_edit::{ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value, value};
 
-use crate::config::{AuthConfig, Config, ConfigError, ConnectionConfig};
+use crate::config::{AuthConfig, Config, ConfigError, ConnectionConfig, NotifyConfig};
 use crate::provider::ProviderRegistry;
 
 const RESERVED_KEYS: [&str; 5] = ["id", "provider", "enabled", "auth", "bots"];
@@ -62,6 +62,7 @@ impl ConnectionDraft {
                 method: self.auth_method.clone(),
             },
             bots: self.bots.clone(),
+            notify: NotifyConfig::default(),
             settings,
         })
     }
@@ -611,6 +612,21 @@ mod tests {
         assert_eq!(s["extra"].as_str(), Some("keep"));
         assert_eq!(s["mine"].as_array().unwrap().len(), 1);
         assert_eq!(s["mine"][0].as_str(), Some("y"));
+    }
+
+    #[test]
+    fn edit_keeps_hand_written_notify() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let reg = registry(&FakeProvider::new());
+        let text = "[[connections]]\nid = \"a\"\nprovider = \"fake\"\nauth = { method = \"token\" }\nhost = \"old\"\nnotify = { pr = \"ignore\" }\n";
+        std::fs::write(&path, text).unwrap();
+
+        save_connection(&path, &draft("a"), Some("a"), &reg).unwrap();
+
+        let cfg = load(&path);
+        assert_eq!(cfg.connections[0].notify.levels["pr"], "ignore");
+        assert!(!cfg.connections[0].settings.contains_key("notify"));
     }
 
     #[test]

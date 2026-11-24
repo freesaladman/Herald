@@ -521,7 +521,7 @@ fn system_actor() -> Actor {
 }
 
 fn summary_event(done: CycleDone, now: DateTime<Utc>) -> Option<Event> {
-    // Only what the pane shows counts.
+    // Only alert events count; pane-level ones are listed but not summarized.
     let shown: Vec<&Arc<Event>> = done.events.iter().filter(|e| e.alert).collect();
     let total = shown.len();
     if total == 0 {
@@ -2687,6 +2687,33 @@ mod tests {
 
         assert_eq!(fake.poll_count("s"), 1);
         assert!(of_type(&h.drain(), "catchup.summary").is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn summary_skips_pane_level_events() {
+        let fake = fake_with(&[("s", Tier::Fast)]);
+        fake.push_poll(
+            "s",
+            ok(vec![
+                ev("c1:pr:1", "pr.created", true),
+                ev("c1:deploy:1", "deploy.failed", true),
+            ]),
+        );
+        let mut cfg = config();
+        cfg.notify.levels.insert("pr".into(), "pane".into());
+        let mut h = Harness::build(
+            vec![Arc::new(FakeProviderFactory::new(fake.clone()))],
+            Some(store_with_watermark("c1:s", t0() - secs(3600)).await),
+            cfg,
+        )
+        .await;
+        pass(1).await;
+
+        let events = h.drain();
+        let summaries = of_type(&events, "catchup.summary");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].data["total"], 1);
+        assert!(summaries[0].data["counts"].get("pr.created").is_none());
     }
 
     #[tokio::test(start_paused = true)]

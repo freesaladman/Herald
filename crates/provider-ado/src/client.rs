@@ -614,6 +614,7 @@ mod tests {
         let secrets = MemorySecretStore::new();
         secrets.set("conn", PAT).unwrap();
         let cfg = ConnectionConfig {
+            notify: Default::default(),
             id: "conn".into(),
             provider: "ado".into(),
             enabled: true,
@@ -1165,6 +1166,7 @@ mod tests {
         let secrets = MemorySecretStore::new();
         secrets.set("conn", PAT).unwrap();
         let cfg = ConnectionConfig {
+            notify: Default::default(),
             id: "conn".into(),
             provider: "ado".into(),
             enabled: true,

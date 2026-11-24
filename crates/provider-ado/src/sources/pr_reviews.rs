@@ -570,6 +570,7 @@ mod tests {
             id: "c1".into(),
             provider: "ado".into(),
             enabled: true,
+            notify: Default::default(),
             auth: AuthConfig {
                 method: "pat".into(),
             },

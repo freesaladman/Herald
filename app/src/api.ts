@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
+export type Level = "alert" | "pane" | "ignore";
 export type Severity = "critical" | "warn" | "success" | "info";
 export type ActorKind = "me" | "human" | "bot" | "system";
 export type PrRole =
@@ -89,6 +90,8 @@ export interface Event {
   severity: Severity;
   actor: Actor;
   alert: boolean;
+  level: Level;
+  viaGroup: boolean;
   title: string;
   subtitle?: string | null;
   url?: string | null;

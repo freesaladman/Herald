@@ -1,12 +1,23 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { emit } from "@tauri-apps/api/event";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
-import type { ConnectionStatus, Event, UiState } from "../api";
+import {
+  EVENT_UNVIEWED_CHANGED,
+  type ConnectionStatus,
+  type Event,
+  type UiState,
+} from "../api";
 import { Pane } from "./Pane";
 import { relativeTime } from "./RecordRow";
 
-function makeEvent(id: string, title: string, occurredUtc: string): Event {
+function makeEvent(
+  id: string,
+  title: string,
+  occurredUtc: string,
+  level: Event["level"] = "alert",
+): Event {
   return {
     id,
     type: "pr.created",
@@ -18,7 +29,9 @@ function makeEvent(id: string, title: string, occurredUtc: string): Event {
     test: false,
     severity: "info",
     actor: { kind: "human", id: "a", displayName: "Ann" },
-    alert: true,
+    alert: level === "alert",
+    level,
+    viaGroup: false,
     title,
     subjectKey: "k",
   };
@@ -49,13 +62,18 @@ function makeUi(over: Partial<UiState> = {}): UiState {
   };
 }
 
-function setup(events: Event[], ui: UiState = makeUi()) {
+function setup(
+  events: Event[],
+  ui: UiState = makeUi(),
+  count = events.length,
+) {
   const calls: { cmd: string; args: unknown }[] = [];
   mockIPC(
     (cmd, args) => {
       calls.push({ cmd, args });
       if (cmd === "list_unviewed") return events;
       if (cmd === "get_ui_state") return ui;
+      if (cmd === "unviewed_count") return count;
       return null;
     },
     { shouldMockEvents: true },
@@ -78,6 +96,36 @@ describe("Pane", () => {
     const rows = await screen.findAllByTestId("record-row");
     expect(rows[0]).toHaveTextContent("Newer");
     expect(rows[1]).toHaveTextContent("Older");
+  });
+
+  it("badge shows the unviewed count, not the list length", async () => {
+    setup(
+      [
+        makeEvent("a", "Alert row", "2026-01-02T00:00:00Z"),
+        makeEvent("p", "Pane row", "2026-01-01T00:00:00Z", "pane"),
+      ],
+      makeUi(),
+      1,
+    );
+    render(<Pane />);
+    expect(await screen.findAllByTestId("record-row")).toHaveLength(2);
+    await waitFor(() =>
+      expect(screen.getByLabelText("Unviewed count")).toHaveTextContent("1"),
+    );
+  });
+
+  it("badge follows the unviewed-changed payload", async () => {
+    setup([
+      makeEvent("a", "Alert row", "2026-01-02T00:00:00Z"),
+      makeEvent("p", "Pane row", "2026-01-01T00:00:00Z", "pane"),
+    ]);
+    render(<Pane />);
+    expect(await screen.findAllByTestId("record-row")).toHaveLength(2);
+    await waitFor(async () => {
+      await emit(EVENT_UNVIEWED_CHANGED, 7);
+      expect(screen.getByLabelText("Unviewed count")).toHaveTextContent("7");
+    });
+    expect(await screen.findAllByTestId("record-row")).toHaveLength(2);
   });
 
   it("shows the empty state", async () => {

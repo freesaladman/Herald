@@ -1,19 +1,19 @@
-//! Sets actor kind, severity and alert on events before they are stored or broadcast.
+//! Sets actor kind, severity, level and alert on events before they are stored or broadcast.
 
 use std::collections::BTreeMap;
 
 use globset::GlobMatcher;
 use serde_json::Value;
 
-use crate::config::{Config, build_glob};
-use crate::event::{ActorKind, Event, PrRole, Severity, event_types as t};
+use crate::config::{Config, NotifyConfig, build_glob, resolve_level};
+use crate::event::{ActorKind, Category, Event, Level, Severity, event_types as t};
 use crate::provider::Identity;
 
 pub struct Classifier {
     me: BTreeMap<String, String>,
     bots: BTreeMap<String, Vec<GlobMatcher>>,
-    mute_types: Vec<GlobMatcher>,
-    group_reviewer_types: Vec<GlobMatcher>,
+    notify: NotifyConfig,
+    connection_notify: BTreeMap<String, NotifyConfig>,
 }
 
 fn compile(patterns: &[String]) -> Vec<GlobMatcher> {
@@ -49,8 +49,12 @@ impl Classifier {
                 .iter()
                 .map(|c| (c.id.clone(), compile(&c.bots)))
                 .collect(),
-            mute_types: compile(&config.alerts.mute_types),
-            group_reviewer_types: compile(&config.roles.group_reviewer.alert_types),
+            notify: config.notify.clone(),
+            connection_notify: config
+                .connections
+                .iter()
+                .map(|c| (c.id.clone(), c.notify.clone()))
+                .collect(),
         }
     }
 
@@ -59,7 +63,8 @@ impl Classifier {
         if e.event_type != t::CATCHUP_SUMMARY {
             e.severity = severity(e);
         }
-        e.alert = self.alert(e);
+        e.level = self.level(e);
+        e.alert = e.level == Level::Alert;
     }
 
     fn actor_kind(&self, e: &Event) -> ActorKind {
@@ -84,12 +89,23 @@ impl Classifier {
         e.actor.kind
     }
 
-    fn alert(&self, e: &Event) -> bool {
-        matches!(e.actor.kind, ActorKind::Human | ActorKind::System)
-            && e.event_type != t::RECORD_ACTIVATED
-            && !any_match(&self.mute_types, &e.event_type)
-            && (e.pr.as_ref().map(|p| p.role) != Some(PrRole::GroupReviewer)
-                || any_match(&self.group_reviewer_types, &e.event_type))
+    fn level(&self, e: &Event) -> Level {
+        let level = match e.event_type.as_str() {
+            t::AUTH_FAILED | t::SOURCE_DISABLED | t::CATCHUP_SUMMARY => Level::Alert,
+            t::RECORD_ACTIVATED => Level::Pane,
+            ty => Category::of(ty).map_or(Level::Alert, |category| {
+                resolve_level(
+                    &self.notify,
+                    self.connection_notify.get(&e.connection.id),
+                    category,
+                    e.via_group,
+                )
+            }),
+        };
+        match e.actor.kind {
+            ActorKind::Me | ActorKind::Bot => level.at_most(Level::Pane),
+            _ => level,
+        }
     }
 }
 
@@ -134,7 +150,7 @@ fn severity(e: &Event) -> Severity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{ApprovalRef, ConnectionRef, DeploymentRef, PrRef, RunRef};
+    use crate::event::{ApprovalRef, ConnectionRef, DeploymentRef, RunRef};
     use chrono::{DateTime, Utc};
     use serde_json::json;
 
@@ -150,6 +166,23 @@ mod tests {
     fn classifier(extra: &str) -> Classifier {
         let toml = format!(
             "{extra}\n[[connections]]\nid = \"conn-a\"\nprovider = \"fake\"\nbots = [\"Build\\\\*\", \"svc-*@example.com\"]\n"
+        );
+        let cfg = Config::from_toml_str(&toml).expect("config");
+        let ids = BTreeMap::from([("conn-a".to_string(), identity())]);
+        Classifier::new(&cfg, &ids)
+    }
+
+    fn classifier_with_conn(extra: &str, conn_extra: &str) -> Classifier {
+        let toml = format!(
+            "{extra}
+[[connections]]
+id = \"conn-a\"
+provider = \"fake\"
+{conn_extra}
+[[connections]]
+id = \"conn-b\"
+provider = \"fake\"
+"
         );
         let cfg = Config::from_toml_str(&toml).expect("config");
         let ids = BTreeMap::from([("conn-a".to_string(), identity())]);
@@ -172,17 +205,6 @@ mod tests {
         e.actor.id = actor_id.into();
         e.actor.display_name = name.into();
         e
-    }
-
-    fn pr(role: PrRole) -> PrRef {
-        PrRef {
-            id: 1,
-            title: "p".into(),
-            source_branch: "a".into(),
-            target_branch: "b".into(),
-            is_draft: false,
-            role,
-        }
     }
 
     fn run_ref(result: &str) -> RunRef {
@@ -474,30 +496,120 @@ mod tests {
         }
     }
 
-    #[test]
-    fn alert_rules() {
-        let c = classifier("[alerts]\nmute_types = [\"pr.iteration.*\"]\n");
-        let alert = |mut e: Event| {
-            c.classify(&mut e);
-            e.alert
-        };
-        assert!(alert(event(t::PR_COMMENT_ADDED, "x", "Pat")));
-        assert!(!alert(event(t::PR_COMMENT_ADDED, "me-id", "Me")));
-        assert!(!alert(event(t::PR_COMMENT_ADDED, "x", "Build\\Svc")));
-        assert!(!alert(event(t::PR_ITERATION_PUSHED, "x", "Pat")));
-        assert!(!alert(event(t::RECORD_ACTIVATED, "x", "Pat")));
-        assert!(alert(event(t::RUN_COMPLETED, "x", "Pat")));
+    fn level_of(c: &Classifier, mut e: Event) -> (Level, bool) {
+        c.classify(&mut e);
+        (e.level, e.alert)
+    }
 
-        let mut e = event(t::PR_COMMENT_ADDED, "x", "Pat");
-        e.pr = Some(pr(PrRole::GroupReviewer));
-        assert!(!alert(e));
-        let mut e = event(t::PR_CREATED, "x", "Pat");
-        e.pr = Some(pr(PrRole::GroupReviewer));
-        assert!(alert(e));
+    fn group_event(ty: &str) -> Event {
+        let mut e = event(ty, "x", "Pat");
+        e.via_group = true;
+        e
+    }
+
+    #[test]
+    fn default_levels() {
+        let c = classifier("");
+        assert_eq!(
+            level_of(&c, event(t::PR_COMMENT_ADDED, "x", "Pat")),
+            (Level::Alert, true)
+        );
+        assert_eq!(
+            level_of(&c, event(t::PR_COMMENT_ADDED, "me-id", "Me")),
+            (Level::Pane, false)
+        );
+        assert_eq!(
+            level_of(&c, event(t::PR_COMMENT_ADDED, "x", "Build\\Svc")),
+            (Level::Pane, false)
+        );
+        assert_eq!(
+            level_of(&c, event(t::RUN_COMPLETED, "x", "Pat")),
+            (Level::Alert, true)
+        );
+        assert_eq!(
+            level_of(&c, group_event(t::PR_CREATED)),
+            (Level::Alert, true)
+        );
 
         let mut e = event(t::PR_COMMENT_ADDED, "x", "Pat");
         e.catch_up = true;
         e.test = true;
-        assert!(alert(e));
+        assert_eq!(level_of(&c, e), (Level::Alert, true));
+    }
+
+    #[test]
+    fn category_levels_and_actor_cap() {
+        let c = classifier("[notify]\npr = \"pane\"\nrun = \"ignore\"\n");
+        assert_eq!(
+            level_of(&c, event(t::PR_COMMENT_ADDED, "x", "Pat")),
+            (Level::Pane, false)
+        );
+        assert_eq!(
+            level_of(&c, event(t::RUN_COMPLETED, "x", "Pat")),
+            (Level::Ignore, false)
+        );
+        assert_eq!(
+            level_of(&c, event(t::DEPLOY_FAILED, "x", "Pat")),
+            (Level::Alert, true)
+        );
+        assert_eq!(
+            level_of(&c, event(t::RUN_COMPLETED, "x", "Build\\Svc")),
+            (Level::Ignore, false)
+        );
+        assert_eq!(
+            level_of(&c, event(t::PR_COMMENT_ADDED, "me-id", "Me")),
+            (Level::Pane, false)
+        );
+    }
+
+    #[test]
+    fn group_levels_apply_only_via_group() {
+        let c = classifier("[notify]\npr = \"alert\"\n[notify.group]\npr = \"pane\"\n");
+        assert_eq!(
+            level_of(&c, group_event(t::PR_CREATED)),
+            (Level::Pane, false)
+        );
+        assert_eq!(
+            level_of(&c, event(t::PR_CREATED, "x", "Pat")),
+            (Level::Alert, true)
+        );
+    }
+
+    #[test]
+    fn connection_overrides_global() {
+        let c = classifier_with_conn(
+            "[notify.group]\npr = \"pane\"\n",
+            "notify = { pr = \"ignore\" }\n",
+        );
+        assert_eq!(
+            level_of(&c, group_event(t::PR_CREATED)),
+            (Level::Ignore, false)
+        );
+        assert_eq!(
+            level_of(&c, event(t::PR_CREATED, "x", "Pat")),
+            (Level::Ignore, false)
+        );
+        let mut other = event(t::PR_CREATED, "x", "Pat");
+        other.connection.id = "conn-b".into();
+        assert_eq!(level_of(&c, other), (Level::Alert, true));
+    }
+
+    #[test]
+    fn system_types_ignore_notify() {
+        let all = ["pr", "branch", "run", "release", "deploy", "approval"]
+            .map(|k| format!("{k} = \"ignore\""))
+            .join("\n");
+        let c = classifier(&format!("[notify]\n{all}\n"));
+        for ty in [t::AUTH_FAILED, t::SOURCE_DISABLED, t::CATCHUP_SUMMARY] {
+            assert_eq!(
+                level_of(&c, event(ty, "x", "Pat")),
+                (Level::Alert, true),
+                "{ty}"
+            );
+        }
+        assert_eq!(
+            level_of(&c, event(t::RECORD_ACTIVATED, "x", "Pat")),
+            (Level::Pane, false)
+        );
     }
 }

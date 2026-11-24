@@ -61,8 +61,9 @@ pub trait Store: Send + Sync + 'static {
     /// Resolves to the new event's seq, or None when an event with the same id already exists.
     fn insert_event_if_new<'a>(&'a self, e: &'a Event) -> BoxFuture<'a, Result<Option<u64>>>;
     fn get_event<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Option<Event>>>;
-    /// Alerting events not yet viewed, newest first.
+    /// Pane-listed events not yet viewed, newest first.
     fn unviewed<'a>(&'a self, limit: u32) -> BoxFuture<'a, Result<Vec<Event>>>;
+    /// Alerting events not yet viewed.
     fn unviewed_count<'a>(&'a self) -> BoxFuture<'a, Result<u32>>;
     fn mark_viewed<'a>(&'a self, ids: &'a [String]) -> BoxFuture<'a, Result<()>>;
     fn mark_all_viewed<'a>(&'a self) -> BoxFuture<'a, Result<()>>;

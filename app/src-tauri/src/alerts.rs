@@ -295,7 +295,7 @@ async fn run(
         tokio::select! {
             received = rx.recv() => match received {
                 Ok(event) => {
-                    unviewed_dirty |= event.alert;
+                    unviewed_dirty |= event.in_pane();
                     if accepts(&event) {
                         batch.push(event);
                         batch_deadline.get_or_insert_with(|| Instant::now() + BATCH_WINDOW);
@@ -417,7 +417,9 @@ mod tests {
         let mut e = (*event("s", "t", Severity::Info)).clone();
         assert!(accepts(&e));
         e.alert = false;
+        e.level = herald_core::event::Level::Pane;
         assert!(!accepts(&e));
+        assert!(e.in_pane());
         e.alert = true;
         e.catch_up = true;
         assert!(!accepts(&e));

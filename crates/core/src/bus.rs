@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::{Mutex, broadcast};
 
 use crate::classify::Classifier;
-use crate::event::Event;
+use crate::event::{Event, Level};
 use crate::local_repos::LocalIndex;
 use crate::store::{Store, StoreError};
 
@@ -37,7 +37,7 @@ impl Bus {
         }
     }
 
-    /// Persists and broadcasts a new event; `Some` means the event was new. `None` for a duplicate id, an empty id or a store error.
+    /// Persists a new event and broadcasts it unless its level is ignore; `Some` means the event was new. `None` for a duplicate id, an empty id or a store error.
     pub async fn publish(&self, e: Event) -> Option<Arc<Event>> {
         self.try_publish(e).await.ok().flatten()
     }
@@ -61,8 +61,10 @@ impl Bus {
                 Ok(Some(seq)) => {
                     e.seq = Some(seq);
                     let e = Arc::new(e);
-                    // Err only means no subscribers.
-                    let _ = tx.send(e.clone());
+                    // Ignored events are stored but never broadcast. A send error only means no subscribers.
+                    if e.level != Level::Ignore {
+                        let _ = tx.send(e.clone());
+                    }
                     Ok(Some(e))
                 }
                 Ok(None) => Ok(None),
@@ -81,7 +83,9 @@ impl Bus {
         self.prepare(&mut e);
         e.seq = None;
         let e = Arc::new(e);
-        let _ = self.tx.send(e.clone());
+        if e.level != Level::Ignore {
+            let _ = self.tx.send(e.clone());
+        }
         e
     }
 
@@ -131,9 +135,14 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
-    fn classifier(mute: &[&str]) -> Classifier {
+    /// Classifier whose `[notify]` sets each (category, level) pair.
+    fn classifier(levels: &[(&str, &str)]) -> Classifier {
         let mut cfg = Config::from_toml_str(Config::default_toml()).unwrap();
-        cfg.alerts.mute_types = mute.iter().map(|s| s.to_string()).collect();
+        for (category, level) in levels {
+            cfg.notify
+                .levels
+                .insert(category.to_string(), level.to_string());
+        }
         Classifier::new(&cfg, &BTreeMap::new())
     }
 
@@ -406,11 +415,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ignored_event_is_stored_but_not_broadcast() {
+        let bus = bus(classifier(&[("pr", "ignore")]), LocalIndex::empty());
+        let mut rx = bus.subscribe();
+
+        let published = bus.publish(event("c:1")).await.unwrap();
+        assert_eq!(published.level, Level::Ignore);
+        let stored = bus.store().get_event("c:1").await.unwrap().unwrap();
+        assert_eq!(stored.level, Level::Ignore);
+        assert!(rx.try_recv().is_err());
+
+        let transient = bus.publish_transient(event("ui:1"));
+        assert_eq!(transient.level, Level::Ignore);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn pane_event_is_broadcast() {
+        let bus = bus(classifier(&[("pr", "pane")]), LocalIndex::empty());
+        let mut rx = bus.subscribe();
+
+        bus.publish(event("c:1")).await.unwrap();
+        let got = rx.recv().await.unwrap();
+        assert_eq!(got.level, Level::Pane);
+        assert!(!got.alert);
+    }
+
+    #[tokio::test]
     async fn set_classifier_applies_to_later_publishes() {
         let bus = bus(classifier(&[]), LocalIndex::empty());
         assert!(bus.publish(event("c:1")).await.unwrap().alert);
 
-        bus.set_classifier(classifier(&["pr.completed"]));
+        bus.set_classifier(classifier(&[("pr", "pane")]));
         assert!(!bus.publish(event("c:2")).await.unwrap().alert);
     }
 }

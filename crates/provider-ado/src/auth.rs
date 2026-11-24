@@ -350,6 +350,7 @@ mod tests {
 
     fn cfg(method: &str) -> ConnectionConfig {
         ConnectionConfig {
+            notify: Default::default(),
             id: "conn-a".into(),
             provider: "ado".into(),
             enabled: true,

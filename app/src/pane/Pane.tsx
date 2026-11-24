@@ -8,6 +8,7 @@ import {
   onUiState,
   onUnviewedChanged,
   setPinned,
+  unviewedCount,
   type Event,
   type UiState,
 } from "../api";
@@ -122,6 +123,7 @@ function Banners({
 
 export function Pane() {
   const [events, setEvents] = useState<Event[]>([]);
+  const [count, setCount] = useState(0);
   const [ui, setUi] = useState<UiState | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [view, setView] = useState<View>("records");
@@ -147,6 +149,12 @@ export function Pane() {
 
   useEffect(() => {
     void refresh();
+    let gotEvent = false;
+    unviewedCount()
+      .then((n) => {
+        if (!gotEvent) setCount(n);
+      })
+      .catch(fail);
     getUiState().then(applyUi).catch(fail);
 
     let cancelled = false;
@@ -158,7 +166,13 @@ export function Pane() {
           else unlisteners.push(un);
         })
         .catch(fail);
-    track(onUnviewedChanged(() => void refresh()));
+    track(
+      onUnviewedChanged((n) => {
+        gotEvent = true;
+        setCount(n);
+        void refresh();
+      }),
+    );
     track(onUiState(applyUi));
     return () => {
       cancelled = true;
@@ -179,7 +193,7 @@ export function Pane() {
       <header className="row" style={{ flexShrink: 0 }}>
         <strong>Herald</strong>
         <span className="badge" aria-label="Unviewed count">
-          {events.length}
+          {count}
         </span>
         <span style={{ flex: 1 }} />
         <button

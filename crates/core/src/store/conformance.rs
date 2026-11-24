@@ -3,7 +3,7 @@
 use chrono::{DateTime, Duration, TimeZone, Utc};
 
 use super::{HookRun, Store, Watermark};
-use crate::event::{ConnectionRef, Event};
+use crate::event::{ActorKind, ConnectionRef, Event, Level};
 
 fn at(mins: i64) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap() + Duration::minutes(mins)
@@ -16,6 +16,7 @@ fn event(id: &str, occurred: DateTime<Utc>, alert: bool) -> Event {
     };
     let mut e = Event::new(conn, "pr.created", occurred, occurred, "t", "c:pr:1:1").with_id(id);
     e.alert = alert;
+    e.level = if alert { Level::Alert } else { Level::Pane };
     e
 }
 
@@ -32,10 +33,12 @@ pub async fn run(store: &dyn Store) {
     ui_state(store).await;
     prune_removes_only_old_events_and_hook_runs(store).await;
     seq_contract(store).await;
+    pane_levels(store).await;
 }
 
 async fn events_dedupe_and_read_back(store: &dyn Store) {
-    let e = event("dedupe", at(0), false);
+    let mut e = event("dedupe", at(0), false);
+    e.level = Level::Ignore;
     let seq = store.insert_event_if_new(&e).await.unwrap();
     assert!(seq.is_some());
     assert_eq!(store.insert_event_if_new(&e).await.unwrap(), None);
@@ -52,13 +55,11 @@ async fn unviewed_and_mark_viewed(store: &dyn Store) {
         ("uv-mid", 102, true),
         ("uv-quiet", 104, false),
     ] {
-        assert!(
-            store
-                .insert_event_if_new(&event(id, at(mins), alert))
-                .await
-                .unwrap()
-                .is_some()
-        );
+        let mut e = event(id, at(mins), alert);
+        if id == "uv-quiet" {
+            e.level = Level::Ignore;
+        }
+        assert!(store.insert_event_if_new(&e).await.unwrap().is_some());
     }
     assert_eq!(store.unviewed_count().await.unwrap(), 3);
 
@@ -258,4 +259,39 @@ async fn seq_contract(store: &dyn Store) {
         .unwrap()
         .unwrap();
     assert!(next > old);
+}
+
+async fn pane_levels(store: &dyn Store) {
+    store.mark_all_viewed().await.unwrap();
+    let alert = event("pl-alert", at(301), true);
+    let pane = event("pl-pane", at(302), false);
+    let mut ignore = event("pl-ignore", at(303), false);
+    ignore.level = Level::Ignore;
+    let mut mine = event("pl-me", at(304), false);
+    mine.actor.kind = ActorKind::Me;
+    for e in [&alert, &pane, &ignore, &mine] {
+        assert!(store.insert_event_if_new(e).await.unwrap().is_some());
+    }
+
+    // Ignore and Me events are stored and replayable but never listed.
+    assert_eq!(
+        ids(&store.unviewed(1000).await.unwrap()),
+        ["pl-pane", "pl-alert"]
+    );
+    assert_eq!(store.unviewed_count().await.unwrap(), 1);
+    let mine_only = |v: &'_ [Event]| -> Vec<String> {
+        v.iter()
+            .filter(|e| e.id.starts_with("pl-"))
+            .map(|e| e.id.clone())
+            .collect()
+    };
+    let all = ["pl-alert", "pl-pane", "pl-ignore", "pl-me"];
+    let since = store.events_since(at(301), 1000).await.unwrap();
+    assert_eq!(mine_only(&since), all);
+    let after = store.events_after_seq(0, 1000).await.unwrap();
+    assert_eq!(mine_only(&after), all);
+
+    store.mark_all_viewed().await.unwrap();
+    assert!(store.unviewed(1000).await.unwrap().is_empty());
+    assert_eq!(store.unviewed_count().await.unwrap(), 0);
 }

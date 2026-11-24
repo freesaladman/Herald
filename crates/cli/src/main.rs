@@ -421,7 +421,8 @@ async fn tail(paths: &Paths, opts: TailOptions) -> Result<()> {
     }
 }
 
-/// `[seq  ]HH:MM:SS  type  title  url` in the given zone; seq and url omitted when absent.
+/// `[seq  ]HH:MM:SS  type  [level  ]title  url` in the given zone; seq and url omitted when absent.
+/// The level shows as `[pane]` or `[ignore]`; alert rows carry no marker.
 fn format_line<Tz>(event: &Value, tz: &Tz) -> String
 where
     Tz: TimeZone,
@@ -435,7 +436,11 @@ where
     if let Some(seq) = event.get("seq").and_then(Value::as_u64) {
         line.push_str(&format!("{seq}  "));
     }
-    line.push_str(&format!("{time}  {}  {}", field("type"), field("title")));
+    line.push_str(&format!("{time}  {}  ", field("type")));
+    if let level @ ("pane" | "ignore") = field("level") {
+        line.push_str(&format!("[{level}]  "));
+    }
+    line.push_str(field("title"));
     let url = field("url");
     if !url.is_empty() {
         line.push_str("  ");
@@ -929,6 +934,31 @@ mod tests {
         assert_eq!(
             format_line(&event, &Utc),
             "09:05:03  run.completed  Build failed  https://example.com/r/1"
+        );
+    }
+
+    #[test]
+    fn format_line_marks_pane_and_ignore_levels_but_not_alert() {
+        let mut event = json!({
+            "seq": 7,
+            "occurredUtc": "2026-01-10T09:05:03Z",
+            "type": "run.completed",
+            "title": "Build failed",
+            "level": "alert",
+        });
+        assert_eq!(
+            format_line(&event, &Utc),
+            "7  09:05:03  run.completed  Build failed"
+        );
+        event["level"] = json!("pane");
+        assert_eq!(
+            format_line(&event, &Utc),
+            "7  09:05:03  run.completed  [pane]  Build failed"
+        );
+        event["level"] = json!("ignore");
+        assert_eq!(
+            format_line(&event, &Utc),
+            "7  09:05:03  run.completed  [ignore]  Build failed"
         );
     }
 

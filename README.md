@@ -130,7 +130,7 @@ Tracked, with the role you have on a PR:
 | --- | --- |
 | author | PRs you created, including drafts |
 | reviewer | you are an individual reviewer |
-| groupReviewer | a group you belong to is a reviewer (light alerting) |
+| groupReviewer | a group you belong to is a reviewer |
 | commenter | active PRs where you have commented in a thread |
 | mentioned | active PRs where you are @mentioned directly (comment or description) |
 
@@ -138,15 +138,45 @@ Precedence is author, reviewer, groupReviewer, commenter, mentioned. A groupRevi
 
 Also tracked: branches you created (any name), pipeline runs for your PRs, your branches or requested by you, classic releases created from those runs or by you, and approvals waiting on you (classic, including group approvals, and YAML pipeline approvals).
 
-Alert rules:
+Notification levels decide what an event does. Each event gets one level when Herald detects it:
 
-- Your own actions are silent (they are still stored and sent to hooks and the stream).
-- Bots (per-connection `bots` globs on unique or display name) are silent.
-- Humans and system outcomes alert, minus `alerts.mute_types`.
-- On groupReviewer PRs only `roles.group_reviewer.alert_types` alert.
+| Level | Effect |
+| --- | --- |
+| `alert` | toast, sound, pane, tray count, hooks and stream (the default) |
+| `pane` | pane, hooks and stream; no toast or sound, and it does not bump the tray or unviewed count |
+| `ignore` | stored in `herald.db` only (see `herald events`); no pane row, hook or stream delivery |
+
+Levels are set per category, the event type prefix: `pr`, `branch`, `run`, `release`, `deploy` and `approval`. The system types `auth.failed`, `source.disabled`, `catchup.summary` and `record.activated` are not configurable.
+
+```toml
+[notify]
+pr = "pane"           # PR events show in the pane without a toast
+run = "ignore"        # pipeline runs are only stored
+
+[notify.group]
+approval = "pane"     # approvals that reached me through a group
+pr = "ignore"
+
+[[connections]]
+id = "oss"
+# ...
+notify = { pr = "alert", group = { approval = "ignore" } }
+```
+
+- `[notify.group]` applies to events with `viaGroup = true`, set by the provider when an event reached you only through a group. For Azure DevOps that is group-reviewer PR events not directly about you (`pr.created`, `pr.published`, `pr.rereview.needed`, and `pr.reviewer.added`/`removed` for your group) and approvals assigned to a group you are in. Mentions of you and replies on your threads are direct.
+- Approvals already pending when you upgrade are treated as direct (no `viaGroup`) when they complete.
+- A connection can override with `notify = { ... }` (same keys, including a `group` table).
+- Lookup order, first match wins: connection group, connection, global group, global, then `alert`. The group steps apply only to `viaGroup` events. With the example above, on `oss` a group approval is `ignore` (connection group), a group `pr` event is `alert` (the connection's `pr` beats the global group's `pr`) and a direct `run` event is `ignore` (global). On other connections a group `pr` event is `ignore` (global group). A category unset at every step is `alert`.
+
+Other rules:
+
+- Your own actions never toast or show in the pane (they are still stored and sent to hooks and the stream).
+- Bots (per-connection `bots` globs on unique or display name) never toast, but their events show in the pane. The category level can lower them further.
+- Levels are stamped when an event is detected and stored with it. Changing the config is not retroactive: the pane, tray count and stream replay follow the stored level.
+- Catch-up summary: the `catchup.summary` toast counts only alert events. Pane-level catch-up events land in the pane; ignore-level ones stay in the database.
 - On PRs you did not author, only review asks (`pr.created`, `pr.published`, `pr.rereview.needed`, `pr.reviewer.added`/`removed` for you or your group), `pr.mentioned`, and comment and status events on threads you commented in are emitted. Builds, policies, votes, pushes, conflicts and closes are emitted only for your own PRs.
 - Direct @mentions emit `pr.mentioned` (not also a comment event).
-- Catch-up: after downtime or sleep Herald queries since the last watermark (UTC server time, at most `max_lookback_days`). Catch-up events go to the pane only, with one `catchup.summary` toast and one sound. The first run seeds silently.
+- Catch-up: after downtime or sleep Herald queries since the last watermark (UTC server time, at most `max_lookback_days`). Catch-up events do not toast; one `catchup.summary` toast and one sound cover the alert ones. The first run seeds silently.
 - Snooze suppresses toast and sound only; the pane, tray and hooks still update (hooks stop only with `respect_snooze`). Mute skips the sound only. On Windows, toast and sound are also suppressed while the system reports a non-notifiable state (full-screen app, presentation mode, busy, quiet time).
 
 Event types and default severity (severity drives the card colour and toast duration):
@@ -159,7 +189,7 @@ Event types and default severity (severity drives the card colour and toast dura
 | everything else | info |
 | `catchup.summary` | highest severity among the summarised events |
 
-Other types: `pr.created`, `pr.published`, `pr.abandoned`, `pr.reactivated`, `pr.iteration.pushed`, `pr.reviewer.added`, `pr.reviewer.removed`, `pr.votes.reset`, `pr.comment.added`, `pr.comment.replied`, `pr.thread.status.changed`, `pr.autocomplete.set`, `pr.autocomplete.cancelled`, `branch.created`, `branch.pushed`, `branch.forcepushed`, `branch.deleted`, `release.created`, `deploy.started`, `approval.completed`, `record.activated` (fired when you click a pane record; never alerts).
+Other types: `pr.created`, `pr.published`, `pr.abandoned`, `pr.reactivated`, `pr.iteration.pushed`, `pr.reviewer.added`, `pr.reviewer.removed`, `pr.votes.reset`, `pr.comment.added`, `pr.comment.replied`, `pr.thread.status.changed`, `pr.autocomplete.set`, `pr.autocomplete.cancelled`, `branch.created`, `branch.pushed`, `branch.forcepushed`, `branch.deleted`, `release.created`, `deploy.started`, `approval.completed`, `record.activated` (fired when you click a pane record; never alerts or shows in the pane).
 
 Types starting `run.`, `release.`, `deploy.`, `approval.`, plus `pr.policy.changed`, `pr.conflicts.*`, `pr.rereview.needed`, `catchup.summary`, `auth.failed` and `source.disabled`, have actor kind `system`.
 
@@ -173,8 +203,8 @@ All keys are snake_case TOML. Every section is optional; the defaults are below 
 | `polling.pr_secs` | 120 | pull requests and their threads |
 | `polling.slow_secs` | 600 | branches, discovery scan, identity and group refresh, local clone index |
 | `polling.max_lookback_days` | 14 | how far back the first sync and catch-up look |
-| `alerts.mute_types` | `[]` | event type globs that never toast or sound, e.g. `["pr.iteration.*"]` |
-| `roles.group_reviewer.alert_types` | `["pr.created", "pr.published", "pr.mentioned"]` | the only types that alert on groupReviewer PRs |
+| `notify.<category>` | `"alert"` | level (`alert`, `pane` or `ignore`) for `pr`, `branch`, `run`, `release`, `deploy` or `approval` events |
+| `notify.group.<category>` | the category's normal level | level for those events when they reached you only through a group |
 | `sound.file` | `""` | sound file; empty uses the built-in chime; a relative path resolves against the config folder (`HERALD_HOME`) |
 | `sound.volume` | 0.8 | 0.0 to 1.0 |
 | `toast.duration_secs` | 6 | toast lifetime |
@@ -183,6 +213,8 @@ All keys are snake_case TOML. Every section is optional; the defaults are below 
 | `local.scan_roots` | `[]` | folders searched for local clones and worktrees |
 | `local.scan_depth` | 2 | how deep below each root to look |
 | `stream.port` | 0 | stream port; 0 picks a free one (see Stream) |
+
+The old `alerts.mute_types` and `roles.group_reviewer.alert_types` keys are ignored with a warning in the log; use `[notify]` instead. An unknown category or a level other than `alert`, `pane` or `ignore` is a config error.
 
 Changing `stream.port` applies on reload: the stream restarts on the new port with a new token, so clients must re-read `stream.json`. All keys apply on reload, including `[polling]` intervals, which take effect on running connections without a restart (and, for `slow_secs`, the local clone index rebuild).
 
@@ -216,9 +248,9 @@ A `poll now` still polls every source once. The PR sources share a short-lived t
 
 `local.scan_roots` lets Herald map an event to your checkout: it reads each repo's git remotes (and worktrees) and fills `local.repoPath` (main clone) and `local.worktreePath` (a worktree on the PR source branch or the branch). The index rebuilds every `slow_secs`.
 
-`[[connections]]` keys: `id`, `provider`, `enabled` (default true), `auth.method` (`pat` or `azcli` for ado), `bots` (globs), and provider keys: for ado `organization` (required) and `projects` (names; empty = all).
+`[[connections]]` keys: `id`, `provider`, `enabled` (default true), `auth.method` (`pat` or `azcli` for ado), `bots` (globs), `notify` (per-connection levels, see above), and provider keys: for ado `organization` (required) and `projects` (names; empty = all).
 
-Globs (`mute_types`, `bots`, hook `on` and `match`) are case-insensitive, with `\` literal (so `Build\*` works the same on every OS).
+Globs (`bots`, hook `on` and `match`) are case-insensitive, with `\` literal (so `Build\*` works the same on every OS).
 
 ## Hooks
 
@@ -275,7 +307,7 @@ Each run records start, exit code, error and the last 4 KB of stderr in `herald.
 - Environment: `HERALD_EVENT_TYPE`, `HERALD_EVENT_ID`, `HERALD_EVENT_FILE`, `HERALD_SUBJECT`, `HERALD_CONNECTION`, `HERALD_PROVIDER`, and when present `HERALD_URL`, `HERALD_PR_ID`, `HERALD_REPO`, `HERALD_BRANCH` (short name), `HERALD_LOCAL_PATH` (worktree path, else repo path), plus the hook's own `env`.
 - Placeholders: `{dotted.camelCase.path}` in `run` argv, `cwd` and `env` values expand from the event JSON. Numbers and bools become text. Use `{{` and `}}` for literal braces. A missing placeholder stops the run and records an error. Examples: `{title}`, `{url}`, `{pr.id}`, `{pr.sourceBranch}` (full ref, e.g. `refs/heads/feature/x`), `{branch.shortName}`, `{repo.name}`, `{run.result}`, `{actor.displayName}`, `{local.worktreePath}`, `{data.vote}`.
 
-Event shape (abridged): `id`, `type`, `connection {id, provider}`, `occurredUtc`, `detectedUtc`, `inferred`, `catchUp`, `test`, `severity`, `actor {kind, id, displayName, uniqueName}`, `alert`, `title`, `subtitle`, `url`, `subjectKey`, and when relevant `repo`, `pr {id, title, sourceBranch, targetBranch, isDraft, role}`, `branch {name, shortName}`, `run`, `deployment`, `comment`, `approval`, `local {repoPath, worktreePath}`, `data`. Run `herald emit-test` and `herald tail --json` to see real payloads.
+Event shape (abridged): `id`, `type`, `connection {id, provider}`, `occurredUtc`, `detectedUtc`, `inferred`, `catchUp`, `test`, `severity`, `actor {kind, id, displayName, uniqueName}`, `alert`, `level` (`alert`, `pane` or `ignore`), `viaGroup`, `title`, `subtitle`, `url`, `subjectKey`, and when relevant `repo`, `pr {id, title, sourceBranch, targetBranch, isDraft, role}`, `branch {name, shortName}`, `run`, `deployment`, `comment`, `approval`, `local {repoPath, worktreePath}`, `data`. `match = { viaGroup = "true" }` selects group events. Test events (`herald emit-test`, stream `emit`) go through the same levels, so an ignored category neither shows nor runs hooks. Run `herald emit-test` and `herald tail --json` to see real payloads.
 
 ### Hook safety
 
@@ -322,7 +354,7 @@ Server to client: `{"type":"event","event":{...}}`, `{"type":"ok"}`, `{"type":"e
 
 ### Replay
 
-Every stored event has a `seq`: strictly increasing, never reused (also after pruning), but with possible gaps, so do not assume it is dense. Events are sent live in seq order. Transient events (for example `record.activated`) are not stored, have no `seq` and are always forwarded live.
+Every stored event has a `seq`: strictly increasing, never reused (also after pruning), but with possible gaps, so do not assume it is dense. Events are sent live in seq order. Replay and live delivery skip `ignore`-level events; a client that fetches by seq (for example `herald events --after X`) may see stored ignore rows and can filter on `level`. Transient events (for example `record.activated`) are not stored, have no `seq` and are always forwarded live.
 
 The `ok` reply to every `subscribe` carries `latestSeq` (0 when the store is empty), `oldestSeq` (`null` when empty) and `storeId` (identifies the database; it changes if the database is recreated). Remember the highest `seq` you processed and the `storeId`; after a reconnect, send `afterSeq` with that value:
 
@@ -338,8 +370,10 @@ The `ok` reply to every `subscribe` carries `latestSeq` (0 when the store is emp
 
 Sequence numbers need a newer database schema. The first start of a build with this feature upgrades the database in place. Before it does, Herald copies the old file to `<db>.v1.bak`, or to `<db>.v1.<UTC yyyymmddThhmmss>.bak` if that name is taken; a failed attempt may leave another timestamped backup.
 
-- Older builds refuse an upgraded database (its schema version is newer than they know). To roll back, stop Herald, restore the backup over the database file and start the older build.
-- A read-only CLI on a database that has not been upgraded cannot serve `--after` or a subscribe with `afterSeq`; it reports "open the Herald app once to upgrade".
+Schema version 3 adds notification levels. Its upgrade first copies the database to `herald.db.v2.bak` (or `herald.db.v2.<UTC yyyymmddThhmmss>.bak`). Old events get level `alert` when their stored alert flag was set and `pane` otherwise, so the pane and unviewed count look as before. A database upgraded from version 1 is backed up at each step.
+
+- Older builds refuse an upgraded database (version 3 included) because its schema version is newer than they know. To roll back, stop Herald, restore the backup over the database file and start the older build.
+- A read-only CLI on a database that has not been upgraded cannot serve `--after` or a subscribe with `afterSeq`; it reports "open the Herald app once to upgrade". The CLI never upgrades a database; on one that predates version 3 it still reads events, but rows show level `alert` until the app upgrades it.
 
 Limits: 16 authenticated clients, 64 KiB per message, 3 s to complete the handshake, keep-alive pings every 30 s.
 
@@ -349,9 +383,9 @@ Limits: 16 authenticated clients, 64 KiB per message, 3 s to complete the handsh
 
 | Command | What it does |
 | --- | --- |
-| `herald tail [--type GLOB]... [--match path=glob]... [--no-catch-up] [--after SEQ] [--json]` | stream live events, one line each (`[seq  ]HH:MM:SS  type  title  url`, local time); `--json` prints raw event JSON, one per line, and nothing else on stdout. `--after SEQ` first replays stored events with a higher seq (see Replay), then continues live; the replay `ok`, `overflow` and `reset` notices are printed to stderr as short lines. Repeating `--match` for one key means any-of. Exits 1 when the app is not running or stops; rerun to reconnect. Ctrl+C exits 0 |
+| `herald tail [--type GLOB]... [--match path=glob]... [--no-catch-up] [--after SEQ] [--json]` | stream live events, one line each (`[seq  ]HH:MM:SS  type  [level  ]title  url`, local time; the level appears only as `[pane]`, since tail never receives `ignore` events); `--json` prints raw event JSON, one per line, and nothing else on stdout. `--after SEQ` first replays stored events with a higher seq (see Replay), then continues live; the replay `ok`, `overflow` and `reset` notices are printed to stderr as short lines. Repeating `--match` for one key means any-of. Exits 1 when the app is not running or stops; rerun to reconnect. Ctrl+C exits 0 |
 | `herald emit-test <type> [--title T] [--pr-id N] [--repo R] [--branch B] [--url U] [--connection ID] [--set key=value]...` | publish a test event through the running app; prints its id. `--set` overrides any dotted path (JSON value or plain string) |
-| `herald events (--since <when> \| --after <seq>) [--limit N] [--json]` | list stored events, oldest first; exactly one of `--since` and `--after` is required. `<when>` is RFC3339, a date `YYYY-MM-DD` (UTC midnight) or a duration `30m`, `2h`, `7d`, `1w`; `--after` lists events with a higher `seq`. Each event shows its `seq` (leading column in text, `seq` field in JSON). Default limit 200; no app needed. A database that predates sequence numbers makes `--after` fail with a message; open the app once to upgrade it |
+| `herald events (--since <when> \| --after <seq>) [--limit N] [--json]` | list stored events, oldest first; exactly one of `--since` and `--after` is required. `<when>` is RFC3339, a date `YYYY-MM-DD` (UTC midnight) or a duration `30m`, `2h`, `7d`, `1w`; `--after` lists events with a higher `seq`. Lists every stored event, including `ignore` level. Each event shows its `seq` (leading column in text, `seq` field in JSON) and its `level` (`[pane]` or `[ignore]` marker in text, `level` field in JSON). Default limit 200; no app needed. A database that predates sequence numbers makes `--after` fail with a message; open the app once to upgrade it |
 | `herald auth set\|test\|clear [--connection ID]` | manage a connection's secret (see First run) |
 | `herald config path` | print the config file path |
 

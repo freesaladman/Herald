@@ -20,7 +20,7 @@ use crate::bus::Bus;
 use crate::config::{Config, HookAction, HookConfig, Paths};
 use crate::event::Event;
 use crate::hooks::{CompiledHookFilter, expand, lookup};
-use crate::process::kill_tree;
+use crate::process::ProcessTree;
 use crate::store::{HookRun, Store};
 
 const MAX_CONCURRENT: usize = 4;
@@ -193,20 +193,20 @@ impl Drop for RunGuard {
 /// While armed, dropping it (run finished early, or aborted at shutdown) kills the child's
 /// process tree. It also deletes the run's event file.
 struct KillGuard {
-    pid: Option<u32>,
+    tree: Option<ProcessTree>,
     event_file: PathBuf,
 }
 
 impl KillGuard {
     fn disarm(&mut self) {
-        self.pid = None;
+        self.tree = None;
     }
 }
 
 impl Drop for KillGuard {
     fn drop(&mut self) {
-        if let Some(pid) = self.pid {
-            kill_tree(pid);
+        if let Some(tree) = &self.tree {
+            tree.kill();
         }
         let _ = std::fs::remove_file(&self.event_file);
     }
@@ -445,9 +445,7 @@ impl Shared {
         };
         let body = job.json.to_string().into_bytes();
         let stdin = child.stdin.take();
-        if !detached {
-            crate::process::assign_to_kill_on_exit_job(&child);
-        }
+        let tree = (!detached).then(|| ProcessTree::attach(&child));
         if detached {
             tracing::info!(hook = %job.hook.name, pid = ?child.id(), "detached hook started");
             self.finish(job, started, Outcome::started()).await;
@@ -455,10 +453,7 @@ impl Shared {
             write_stdin(stdin, &body).await;
             return;
         }
-        let mut guard = KillGuard {
-            pid: child.id(),
-            event_file,
-        };
+        let mut guard = KillGuard { tree, event_file };
         let timeout = Duration::from_secs(match job.hook.timeout_secs {
             0 => DEFAULT_TIMEOUT_SECS,
             n => n,
@@ -471,8 +466,8 @@ impl Shared {
                 Ok(Ok(status)) => (status.code(), None),
                 Ok(Err(e)) => (None, Some(format!("wait failed: {e}"))),
                 Err(_) => {
-                    if let Some(pid) = child.id() {
-                        let _ = tokio::task::spawn_blocking(move || kill_tree(pid)).await;
+                    if let Some(tree) = guard.tree.take() {
+                        let _ = tokio::task::spawn_blocking(move || tree.kill()).await;
                     }
                     let _ = child.kill().await;
                     (

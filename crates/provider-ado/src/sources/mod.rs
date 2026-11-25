@@ -249,7 +249,8 @@ pub fn is_fatal(e: &ProviderError) -> bool {
     )
 }
 
-/// On a PR I did not author, only review asks, mentions and thread activity are wanted.
+/// On a PR I did not author, only review asks, mentions, thread activity and pushes to PRs
+/// I commented on (`iCommented`) are wanted.
 /// Thread events need no check here: `pr_threads` only watches my threads on such PRs.
 pub fn wanted_on_pr(e: &Event) -> bool {
     let Some(pr) = &e.pr else {
@@ -268,6 +269,7 @@ pub fn wanted_on_pr(e: &Event) -> bool {
         | t::PR_COMMENT_REPLIED
         | t::PR_THREAD_STATUS_CHANGED => true,
         t::PR_REVIEWER_ADDED | t::PR_REVIEWER_REMOVED => flag("isMe") || flag("isMyGroup"),
+        t::PR_ITERATION_PUSHED => flag("iCommented"),
         _ => false,
     }
 }
@@ -381,6 +383,22 @@ mod tests {
             serde_json::json!({ "isMyGroup": true })
         )));
         assert!(!wanted_on_pr(&added(serde_json::json!({ "isMe": false }))));
+        let push = |role, data| event(t::PR_ITERATION_PUSHED, role, data);
+        for role in [PrRole::Reviewer, PrRole::GroupReviewer] {
+            assert!(wanted_on_pr(&push(
+                role,
+                serde_json::json!({ "iCommented": true })
+            )));
+            assert!(!wanted_on_pr(&push(
+                role,
+                serde_json::json!({ "iCommented": false })
+            )));
+            assert!(!wanted_on_pr(&push(role, none.clone())));
+        }
+        assert!(wanted_on_pr(&push(
+            PrRole::Author,
+            serde_json::json!({ "iCommented": false })
+        )));
     }
 
     #[test]
@@ -426,6 +444,7 @@ mod tests {
             t::PR_COMMENT_ADDED,
             t::PR_COMMENT_REPLIED,
             t::PR_THREAD_STATUS_CHANGED,
+            t::PR_ITERATION_PUSHED,
         ] {
             assert!(
                 !via_group(&event(ty, PrRole::GroupReviewer, none.clone())),

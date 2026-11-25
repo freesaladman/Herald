@@ -1,6 +1,6 @@
 //! Pr-tier source: review activity on tracked PRs, from system threads and iterations.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
@@ -14,8 +14,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    SNAPSHOT_TRACKED_PRS, TrackedPr, TrackedPrs, actor_from, is_fatal, pr_key, pr_web_url,
-    project_ref, repo_ref, via_group, wanted_on_pr, window_start,
+    SNAPSHOT_TRACKED_PRS, SNAPSHOT_TRACKED_THREADS, ThreadReason, TrackedPr, TrackedPrs,
+    TrackedThreads, actor_from, is_fatal, pr_key, pr_web_url, project_ref, repo_ref, via_group,
+    wanted_on_pr, window_start,
 };
 use crate::connection::AdoShared;
 use crate::dto_git::{GitPullRequestCommentThread, GitPullRequestIteration, IdentityRef};
@@ -96,6 +97,16 @@ impl PrReviewsSource {
             .await?
             .unwrap_or_default();
         let old: SeenState = ctx.snapshots.get(SNAPSHOT_SEEN).await?.unwrap_or_default();
+        let commented: HashSet<String> = ctx
+            .snapshots
+            .get::<TrackedThreads>(SNAPSHOT_TRACKED_THREADS)
+            .await?
+            .unwrap_or_default()
+            .threads
+            .iter()
+            .filter(|t| t.reason == ThreadReason::Commenter)
+            .map(|t| pr_key(&t.repo_id, t.pr_id))
+            .collect();
 
         let fetches: Vec<BoxFuture<'_, Result<Fetched, ProviderError>>> = tracked
             .prs
@@ -134,7 +145,11 @@ impl PrReviewsSource {
                 window
             };
             let mut seen = previous.cloned().unwrap_or_default();
-            let found = review_events(ctx, org, pr, data, &mut seen, cut, previous.is_none());
+            let flags = PrFlags {
+                first_sight: previous.is_none(),
+                i_commented: commented.contains(&key),
+            };
+            let found = review_events(ctx, org, pr, data, &mut seen, cut, flags);
             if !seeding {
                 events.extend(found.into_iter().filter(wanted_on_pr).map(|mut e| {
                     e.via_group = via_group(&e);
@@ -165,6 +180,13 @@ impl Source for PrReviewsSource {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PrFlags {
+    first_sight: bool,
+    /// A thread of mine on this PR is tracked as a commenter.
+    i_commented: bool,
+}
+
 /// Diffs one PR's system threads and iterations against `seen`, updating it in place.
 fn review_events(
     ctx: &SyncContext,
@@ -173,8 +195,12 @@ fn review_events(
     data: PrData,
     seen: &mut PrSeen,
     cut: DateTime<Utc>,
-    first_sight: bool,
+    flags: PrFlags,
 ) -> Vec<Event> {
+    let PrFlags {
+        first_sight,
+        i_commented,
+    } = flags;
     let mut system: Vec<&GitPullRequestCommentThread> = data
         .threads
         .iter()
@@ -234,7 +260,7 @@ fn review_events(
         if it.id <= 1 || created < cut {
             continue;
         }
-        events.push(iteration_event(ctx, org, pr, &it, created));
+        events.push(iteration_event(ctx, org, pr, &it, created, i_commented));
         // The PR list's vote is authoritative; the thread-derived one only fills in when absent.
         let current = pr.my_vote.or(seen.my_vote.map(|v| v.value)).unwrap_or(0);
         let voted_before = current != 0 && seen.my_vote.is_none_or(|v| created > v.time);
@@ -502,6 +528,7 @@ fn iteration_event(
     pr: &TrackedPr,
     it: &GitPullRequestIteration,
     created: DateTime<Utc>,
+    i_commented: bool,
 ) -> Event {
     let mut e = base_event(
         ctx,
@@ -523,7 +550,7 @@ fn iteration_event(
         .as_deref()
         .filter(|r| !r.is_empty())
         .unwrap_or("push");
-    e.data = json!({ "reason": reason });
+    e.data = json!({ "reason": reason, "iCommented": i_commented });
     e
 }
 
@@ -552,6 +579,7 @@ mod tests {
     use super::*;
     use crate::auth::AdoAuth;
     use crate::client::AdoClient;
+    use crate::sources::TrackedThread;
     use chrono::TimeZone;
     use herald_core::config::{AuthConfig, ConnectionConfig};
     use herald_core::provider::Identity;
@@ -714,6 +742,16 @@ mod tests {
 
     /// Seeds on an empty PR, then polls with the given threads/iterations at day 10 12:00.
     async fn seeded_poll(role: PrRole, threads: Vec<Value>, iterations: Vec<Value>) -> Vec<Event> {
+        seeded_poll_with(role, threads, iterations, None).await
+    }
+
+    /// As `seeded_poll`, writing the tracked-threads snapshot before the second poll.
+    async fn seeded_poll_with(
+        role: PrRole,
+        threads: Vec<Value>,
+        iterations: Vec<Value>,
+        tracked: Option<TrackedThreads>,
+    ) -> Vec<Event> {
         let server = MockServer::start().await;
         let (ctx, _store) = sync_context(cfg(), me(), at(10, 0), None, false);
         track(&ctx, role).await;
@@ -725,6 +763,12 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        if let Some(t) = tracked {
+            ctx.snapshots
+                .put(SNAPSHOT_TRACKED_THREADS, &t)
+                .await
+                .unwrap();
+        }
         serve(&server, ok(threads), ok(iterations)).await;
         run(&mut src, &ctx, Some(at(10, 0)), at(10, 12))
             .await
@@ -976,8 +1020,76 @@ mod tests {
         .await;
         assert_eq!(types(&events), ["pr.iteration.pushed"]);
         assert_eq!(events[0].id, "c1:pr:Repo-1:1:iteration:2");
-        assert_eq!(events[0].data, json!({ "reason": "push" }));
+        assert_eq!(
+            events[0].data,
+            json!({ "reason": "push", "iCommented": false })
+        );
         assert_eq!(events[0].actor.id, "pusher");
+    }
+
+    fn thread_on(repo_id: &str, pr_id: i64, reason: ThreadReason) -> TrackedThreads {
+        TrackedThreads {
+            threads: vec![TrackedThread {
+                repo_id: repo_id.into(),
+                repo_name: "widgets".into(),
+                project: "Alpha".into(),
+                project_id: "p1".into(),
+                pr_id,
+                thread_id: 7,
+                since_utc: at(5, 0),
+                reason,
+                title: "change".into(),
+                source_ref: String::new(),
+                target_ref: String::new(),
+                is_draft: false,
+                url: String::new(),
+            }],
+        }
+    }
+
+    async fn push_poll(role: PrRole, tracked: Option<TrackedThreads>) -> Vec<Event> {
+        let its = vec![iteration(1, at(1, 0)), iteration(2, at(10, 4))];
+        seeded_poll_with(role, vec![], its, tracked).await
+    }
+
+    #[tokio::test]
+    async fn push_on_group_pr_i_commented_on_is_direct_and_flagged() {
+        // Lowercase repo id checks the case-insensitive pr_key match.
+        let tracked = thread_on("repo-1", 1, ThreadReason::Commenter);
+        let events = push_poll(PrRole::GroupReviewer, Some(tracked)).await;
+        assert_eq!(types(&events), ["pr.iteration.pushed"]);
+        assert_eq!(events[0].data["iCommented"], true);
+        assert!(!events[0].via_group);
+        assert_eq!(events[0].pr.as_ref().unwrap().role, PrRole::GroupReviewer);
+    }
+
+    #[tokio::test]
+    async fn push_on_reviewer_pr_i_commented_on_is_emitted() {
+        let tracked = thread_on("Repo-1", 1, ThreadReason::Commenter);
+        let events = push_poll(PrRole::Reviewer, Some(tracked)).await;
+        assert_eq!(types(&events), ["pr.iteration.pushed"]);
+        assert_eq!(events[0].data["iCommented"], true);
+    }
+
+    #[tokio::test]
+    async fn push_on_author_pr_is_flagged_when_i_commented() {
+        let tracked = thread_on("Repo-1", 1, ThreadReason::Commenter);
+        let events = push_poll(PrRole::Author, Some(tracked)).await;
+        assert_eq!(types(&events), ["pr.iteration.pushed"]);
+        assert_eq!(events[0].data["iCommented"], true);
+    }
+
+    #[tokio::test]
+    async fn push_on_pr_i_did_not_comment_on_is_dropped() {
+        let cases = [
+            None,
+            Some(thread_on("Repo-1", 1, ThreadReason::Mentioned)),
+            Some(thread_on("Repo-1", 2, ThreadReason::Commenter)),
+        ];
+        for tracked in cases {
+            let events = push_poll(PrRole::GroupReviewer, tracked.clone()).await;
+            assert!(events.is_empty(), "{tracked:?}");
+        }
     }
 
     #[tokio::test]

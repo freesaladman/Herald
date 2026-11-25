@@ -10,6 +10,7 @@ use base64::engine::general_purpose::STANDARD;
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use futures_util::future::BoxFuture;
 use herald_core::config::ConnectionConfig;
+use herald_core::process::ProcessTree;
 use herald_core::provider::ProviderError;
 use herald_core::secrets::{SecretError, SecretStore};
 use tokio::sync::Mutex;
@@ -18,8 +19,9 @@ const ADO_RESOURCE: &str = "499b84ac-1321-427f-aa17-267ca6975798";
 const EXPIRY_MARGIN_MINUTES: i64 = 5;
 const STDERR_EXCERPT_CHARS: usize = 200;
 const AZ_TIMEOUT: Duration = Duration::from_secs(30);
-// Backstop for runners that do not enforce AZ_TIMEOUT themselves; leaves room for the tree kill.
-const AZ_BACKSTOP: Duration = Duration::from_secs(40);
+// Backstop for runners that do not enforce AZ_TIMEOUT themselves. Covers AZ_TIMEOUT (30s)
+// plus the core taskkill cap (10s) and slack; keep it above that sum.
+const AZ_BACKSTOP: Duration = Duration::from_secs(45);
 
 /// Failure of the `az` invocation: it could not start or exited non-zero.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,20 +46,24 @@ const AZ_TIMED_OUT: &str = "az timed out";
 /// could otherwise be killed instead.
 struct TreeKill {
     child: Option<tokio::process::Child>,
+    tree: Option<ProcessTree>,
     armed: bool,
-    kill: fn(u32),
+    kill: fn(&ProcessTree),
 }
 
 impl Drop for TreeKill {
     fn drop(&mut self) {
         let child = self.child.take();
+        let tree = self.tree.take();
         if !self.armed {
             return;
         }
-        if let Some(pid) = child.as_ref().and_then(|c| c.id()) {
+        if child.as_ref().is_some_and(|c| c.id().is_some())
+            && let Some(tree) = tree
+        {
             let kill = self.kill;
             std::thread::spawn(move || {
-                kill(pid);
+                kill(&tree);
                 drop(child);
             });
         }
@@ -73,13 +79,14 @@ async fn read_all<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>) -> Vec<u8> {
     buf
 }
 
-/// Runs `cmd` to completion or `timeout`. On timeout the tree is killed while the root
-/// process still exists (taskkill /T needs it to find the descendants), then the child.
-/// The child has no kill_on_drop: dropping it first would kill only the root.
+/// Runs `cmd` to completion or `timeout`. On timeout the tree is killed first (its job, or
+/// taskkill /T while the root still exists), then the child. The kill is skipped once the
+/// root has been reaped, since its pid could be recycled. The child has no kill_on_drop:
+/// dropping it first would kill only the root.
 async fn run_command(
     mut cmd: tokio::process::Command,
     timeout: Duration,
-    kill: fn(u32),
+    kill: fn(&ProcessTree),
 ) -> Result<String, AzFailure> {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -93,9 +100,10 @@ async fn run_command(
         stderr: format!("could not run az: {e}"),
     })?;
     // Covers az's python child if Herald itself dies.
-    herald_core::process::assign_to_kill_on_exit_job(&child);
+    let tree = ProcessTree::attach(&child);
     let mut guard = TreeKill {
         child: Some(child),
+        tree: Some(tree),
         armed: true,
         kill,
     };
@@ -122,8 +130,10 @@ async fn run_command(
         },
         Err(_) => {
             if let Some(child) = guard.child.as_mut() {
-                if let Some(pid) = child.id() {
-                    let _ = tokio::task::spawn_blocking(move || kill(pid)).await;
+                if child.id().is_some()
+                    && let Some(tree) = guard.tree.take()
+                {
+                    let _ = tokio::task::spawn_blocking(move || kill(&tree)).await;
                 }
                 let _ = child.kill().await;
             }
@@ -161,7 +171,7 @@ impl AzRunner for CliAzRunner {
                 "-o",
                 "json",
             ]);
-            run_command(cmd, AZ_TIMEOUT, herald_core::process::kill_tree).await
+            run_command(cmd, AZ_TIMEOUT, ProcessTree::kill).await
         })
     }
 }
@@ -569,11 +579,11 @@ mod tests {
         assert_eq!(auth.authorization().await.unwrap(), "Bearer tok-after");
     }
 
-    static KILLED_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static KILLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-    fn record_and_kill(pid: u32) {
-        KILLED_PID.store(pid, Ordering::SeqCst);
-        herald_core::process::kill_tree(pid);
+    fn record_and_kill(tree: &ProcessTree) {
+        KILLED.store(true, Ordering::SeqCst);
+        tree.kill();
     }
 
     fn sleeper() -> tokio::process::Command {
@@ -598,11 +608,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.stderr, AZ_TIMED_OUT);
-        assert_ne!(
-            KILLED_PID.load(Ordering::SeqCst),
-            0,
-            "tree kill not invoked"
-        );
+        assert!(KILLED.load(Ordering::SeqCst), "tree kill not invoked");
         assert!(started.elapsed() < Duration::from_secs(15));
         assert_eq!(
             classify_failure(err),
@@ -610,11 +616,11 @@ mod tests {
         );
     }
 
-    static CANCELLED_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-    fn record_cancel_and_kill(pid: u32) {
-        CANCELLED_PID.store(pid, Ordering::SeqCst);
-        herald_core::process::kill_tree(pid);
+    fn record_cancel_and_kill(tree: &ProcessTree) {
+        CANCELLED.store(true, Ordering::SeqCst);
+        tree.kill();
     }
 
     #[tokio::test]
@@ -626,12 +632,11 @@ mod tests {
         .await;
         assert!(outer.is_err(), "run_command finished before the cancel");
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while CANCELLED_PID.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+        while !CANCELLED.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert_ne!(
-            CANCELLED_PID.load(Ordering::SeqCst),
-            0,
+        assert!(
+            CANCELLED.load(Ordering::SeqCst),
             "tree kill not invoked after the future was dropped"
         );
     }

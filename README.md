@@ -168,6 +168,42 @@ notify = { pr = "alert", group = { approval = "ignore" } }
 - A connection can override with `notify = { ... }` (same keys, including a `group` table).
 - Lookup order, first match wins: connection group, connection, global group, global, then `alert`. The group steps apply only to `viaGroup` events. With the example above, on `oss` a group approval is `ignore` (connection group), a group `pr` event is `alert` (the connection's `pr` beats the global group's `pr`) and a direct `run` event is `ignore` (global). On other connections a group `pr` event is `ignore` (global group). A category unset at every step is `alert`.
 
+Level rules (`[[notify.rules]]`) set the level of events by type and content, before the lookup above:
+
+```toml
+[notify]
+pr = "ignore"
+run = "ignore"
+
+[[notify.rules]]
+on = ["pr.reviewer.added"]
+match = { "data.isMe" = "true", viaGroup = "false" }   # added to a PR as me, not via a group
+level = "alert"
+
+[[notify.rules]]
+on = ["pr.comment.replied"]
+match = { "actor.kind" = ["human", "bot"] }
+level = "alert"
+
+[[notify.rules]]
+on = ["run.completed"]
+match = { "run.result" = "failed", "pr.id" = "*" }     # failed runs that belong to a PR
+level = "alert"
+
+[[notify.rules]]
+on = ["pr.policy.changed"]
+match = { "data.state" = ["rejected", "failed", "broken", "error"], "data.previousState" = ["approved", "succeeded", "queued", "running", "notSet"] }
+level = "alert"
+```
+
+- Rules are checked in file order. The first match sets the level and overrides the connection, group and global lookup. An event no rule matches uses that lookup unchanged.
+- `on` is a list of event type globs (required). `level` is `alert`, `pane` or `ignore` (required). `match` is optional and works as in [Hooks](#hooks): dotted camelCase event JSON paths, glob values, case-insensitive, a list means any of, bools and numbers are compared as text, and a missing or null path never matches.
+- `actor.kind` is the classified actor: `me`, `human`, `bot` or `system`.
+- The system types `auth.failed`, `source.disabled`, `catchup.summary` and `record.activated` ignore rules. With every category set to `ignore`, the first three still alert.
+- The own and bot cap applies after a rule: a bot reply matched as `alert` lands in the pane, and your own actions never toast or show in the pane. Hooks run for `alert` and `pane`, not `ignore`.
+- Rules are global. For one connection use `match = { "connection.id" = "..." }`; `notify.rules` under a connection is a config error. An unknown key in a rule is a parse error.
+- A policy whose first observed state is already a failure has no `previousState`, so a rule on `data.previousState` does not match it.
+
 Other rules:
 
 - Your own actions never toast or show in the pane (they are still stored and sent to hooks and the stream).
@@ -205,6 +241,9 @@ All keys are snake_case TOML. Every section is optional; the defaults are below 
 | `polling.max_lookback_days` | 14 | how far back the first sync and catch-up look |
 | `notify.<category>` | `"alert"` | level (`alert`, `pane` or `ignore`) for `pr`, `branch`, `run`, `release`, `deploy` or `approval` events |
 | `notify.group.<category>` | the category's normal level | level for those events when they reached you only through a group |
+| `notify.rules[].on` | required | event type globs the rule applies to |
+| `notify.rules[].match` | `{}` | dotted event JSON paths to glob values, as in hooks; all must match |
+| `notify.rules[].level` | required | `alert`, `pane` or `ignore`, set when the rule matches |
 | `sound.file` | `""` | sound file; empty uses the built-in chime; a relative path resolves against the config folder (`HERALD_HOME`) |
 | `sound.volume` | 0.8 | 0.0 to 1.0 |
 | `toast.duration_secs` | 6 | toast lifetime |
@@ -214,7 +253,7 @@ All keys are snake_case TOML. Every section is optional; the defaults are below 
 | `local.scan_depth` | 2 | how deep below each root to look |
 | `stream.port` | 0 | stream port; 0 picks a free one (see Stream) |
 
-The old `alerts.mute_types` and `roles.group_reviewer.alert_types` keys are ignored with a warning in the log; use `[notify]` instead. An unknown category or a level other than `alert`, `pane` or `ignore` is a config error.
+The old `alerts.mute_types` and `roles.group_reviewer.alert_types` keys are ignored with a warning in the log; use `[notify]` instead. An unknown category or a level other than `alert`, `pane` or `ignore` is a config error, as is a rule with a missing or empty `on`, a bad glob, a missing or unknown `level`, or rules under a connection.
 
 Changing `stream.port` applies on reload: the stream restarts on the new port with a new token, so clients must re-read `stream.json`. All keys apply on reload, including `[polling]` intervals, which take effect on running connections without a restart (and, for `slow_secs`, the local clone index rebuild).
 

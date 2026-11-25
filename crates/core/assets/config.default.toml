@@ -18,10 +18,16 @@ max_lookback_days = 14  # how far back the first sync and catch-up look
 # Your own actions never toast or show in the pane; bot actions never toast.
 # A [notify.group] entry applies to events that reach you only through a group.
 # Lookup: connection group, connection, global group, global, then alert.
+# Rules ([[notify.rules]]) are checked first, in order; the first match sets the level.
+# Rules skip system events; the own/bot cap still applies after a rule.
 # [notify]
 # pr = "pane"
 # [notify.group]
 # approval = "ignore"
+# [[notify.rules]]
+# on = ["pr.reviewer.added"]
+# match = { "data.isMe" = "true", viaGroup = "false" }
+# level = "alert"
 
 [sound]
 # A relative file resolves against the config folder (HERALD_HOME).

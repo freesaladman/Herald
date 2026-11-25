@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use crate::config::{Config, NotifyConfig, build_glob, resolve_level};
 use crate::event::{ActorKind, Category, Event, Level, Severity, event_types as t};
+use crate::hooks::CompiledHookFilter;
 use crate::provider::Identity;
 
 pub struct Classifier {
@@ -14,6 +15,7 @@ pub struct Classifier {
     bots: BTreeMap<String, Vec<GlobMatcher>>,
     notify: NotifyConfig,
     connection_notify: BTreeMap<String, NotifyConfig>,
+    rules: Vec<(CompiledHookFilter, Level)>,
 }
 
 fn compile(patterns: &[String]) -> Vec<GlobMatcher> {
@@ -55,6 +57,15 @@ impl Classifier {
                 .iter()
                 .map(|c| (c.id.clone(), c.notify.clone()))
                 .collect(),
+            rules: config
+                .notify
+                .rules
+                .iter()
+                .filter_map(|r| {
+                    let level = Level::parse(&r.level)?;
+                    Some((CompiledHookFilter::new(&r.on, &r.r#match), level))
+                })
+                .collect(),
         }
     }
 
@@ -93,19 +104,39 @@ impl Classifier {
         let level = match e.event_type.as_str() {
             t::AUTH_FAILED | t::SOURCE_DISABLED | t::CATCHUP_SUMMARY => Level::Alert,
             t::RECORD_ACTIVATED => Level::Pane,
-            ty => Category::of(ty).map_or(Level::Alert, |category| {
-                resolve_level(
-                    &self.notify,
-                    self.connection_notify.get(&e.connection.id),
-                    category,
-                    e.via_group,
-                )
+            ty => self.rule_level(e).unwrap_or_else(|| {
+                Category::of(ty).map_or(Level::Alert, |category| {
+                    resolve_level(
+                        &self.notify,
+                        self.connection_notify.get(&e.connection.id),
+                        category,
+                        e.via_group,
+                    )
+                })
             }),
         };
         match e.actor.kind {
             ActorKind::Me | ActorKind::Bot => level.at_most(Level::Pane),
             _ => level,
         }
+    }
+
+    /// Level of the first rule matching the event, if any.
+    fn rule_level(&self, e: &Event) -> Option<Level> {
+        if self.rules.is_empty() {
+            return None;
+        }
+        let json = match serde_json::to_value(e) {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::warn!(event_type = %e.event_type, "cannot match notify rules");
+                return None;
+            }
+        };
+        self.rules
+            .iter()
+            .find(|(filter, _)| filter.matches(&e.event_type, &json))
+            .map(|(_, level)| *level)
     }
 }
 
@@ -150,7 +181,7 @@ fn severity(e: &Event) -> Severity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{ApprovalRef, ConnectionRef, DeploymentRef, RunRef};
+    use crate::event::{ApprovalRef, ConnectionRef, DeploymentRef, PrRef, PrRole, RunRef};
     use chrono::{DateTime, Utc};
     use serde_json::json;
 
@@ -610,6 +641,232 @@ provider = \"fake\"
         assert_eq!(
             level_of(&c, event(t::RECORD_ACTIVATED, "x", "Pat")),
             (Level::Pane, false)
+        );
+    }
+
+    const ALL_IGNORE: &str = "[notify]
+pr = \"ignore\"
+branch = \"ignore\"
+run = \"ignore\"
+release = \"ignore\"
+deploy = \"ignore\"
+approval = \"ignore\"
+";
+
+    const ACCEPTANCE_RULES: &str = r#"
+[[notify.rules]]
+on = ["pr.reviewer.added"]
+match = { "data.isMe" = "true", viaGroup = "false" }
+level = "alert"
+
+[[notify.rules]]
+on = ["pr.comment.replied"]
+match = { "actor.kind" = ["human", "bot"] }
+level = "alert"
+
+[[notify.rules]]
+on = ["run.completed"]
+match = { "run.result" = "failed", "pr.id" = "*" }
+level = "alert"
+
+[[notify.rules]]
+on = ["pr.policy.changed"]
+match = { "data.state" = ["rejected", "failed", "broken", "error"], "data.previousState" = ["approved", "succeeded", "queued", "running", "notSet"] }
+level = "alert"
+"#;
+
+    fn acceptance_classifier() -> Classifier {
+        classifier(&format!("{ALL_IGNORE}{ACCEPTANCE_RULES}"))
+    }
+
+    fn with_pr(mut e: Event) -> Event {
+        e.pr = Some(PrRef {
+            id: 7,
+            title: "x".into(),
+            source_branch: "refs/heads/f".into(),
+            target_branch: "refs/heads/main".into(),
+            is_draft: false,
+            role: PrRole::Author,
+        });
+        e
+    }
+
+    fn reviewer_added(actor_id: &str, is_me: bool, via_group: bool) -> Event {
+        let mut e = event(t::PR_REVIEWER_ADDED, actor_id, "Pat");
+        e.data = json!({"isMe": is_me});
+        e.via_group = via_group;
+        e
+    }
+
+    fn run_completed(result: &str, with_pr_ref: bool) -> Event {
+        let mut e = event(t::RUN_COMPLETED, "x", "Pat");
+        e.run = Some(run_ref(result));
+        if with_pr_ref { with_pr(e) } else { e }
+    }
+
+    fn policy_changed(state: &str, previous: &str) -> Event {
+        let mut e = event(t::PR_POLICY_CHANGED, "x", "Pat");
+        e.data = json!({"state": state, "previousState": previous});
+        e
+    }
+
+    #[test]
+    fn acceptance_rules_alert_only_their_targets() {
+        let c = acceptance_classifier();
+        let alert = (Level::Alert, true);
+        let ignore = (Level::Ignore, false);
+
+        assert_eq!(level_of(&c, reviewer_added("x", true, false)), alert);
+        assert_eq!(
+            level_of(&c, event(t::PR_COMMENT_REPLIED, "x", "Pat")),
+            alert
+        );
+        assert_eq!(level_of(&c, run_completed("failed", true)), alert);
+        assert_eq!(level_of(&c, policy_changed("rejected", "approved")), alert);
+
+        assert_eq!(level_of(&c, reviewer_added("x", true, true)), ignore);
+        assert_eq!(level_of(&c, reviewer_added("x", false, false)), ignore);
+        assert_eq!(
+            level_of(&c, event(t::PR_COMMENT_REPLIED, "me-id", "Me")),
+            ignore
+        );
+        assert_eq!(level_of(&c, run_completed("failed", false)), ignore);
+        assert_eq!(level_of(&c, run_completed("succeeded", true)), ignore);
+        assert_eq!(level_of(&c, policy_changed("rejected", "rejected")), ignore);
+        assert_eq!(level_of(&c, policy_changed("approved", "approved")), ignore);
+        for ty in [
+            t::PR_CREATED,
+            t::BRANCH_PUSHED,
+            t::RELEASE_CREATED,
+            t::DEPLOY_FAILED,
+            t::APPROVAL_PENDING,
+        ] {
+            assert_eq!(level_of(&c, event(ty, "x", "Pat")), ignore, "{ty}");
+        }
+    }
+
+    #[test]
+    fn rules_still_get_capped_for_bots_and_me() {
+        let c = acceptance_classifier();
+        assert_eq!(
+            level_of(&c, event(t::PR_COMMENT_REPLIED, "x", r"Build\Svc")),
+            (Level::Pane, false)
+        );
+        assert_eq!(
+            level_of(&c, reviewer_added("me-id", true, false)),
+            (Level::Pane, false)
+        );
+    }
+
+    #[test]
+    fn first_matching_rule_wins() {
+        let c = classifier(
+            r#"
+[[notify.rules]]
+on = ["pr.*"]
+match = { "data.isMe" = "true" }
+level = "pane"
+
+[[notify.rules]]
+on = ["pr.reviewer.added"]
+level = "alert"
+
+[[notify.rules]]
+on = ["*"]
+level = "ignore"
+"#,
+        );
+        assert_eq!(
+            level_of(&c, reviewer_added("x", true, false)),
+            (Level::Pane, false)
+        );
+        assert_eq!(
+            level_of(&c, reviewer_added("x", false, false)),
+            (Level::Alert, true)
+        );
+        assert_eq!(
+            level_of(&c, event(t::PR_CREATED, "x", "Pat")),
+            (Level::Ignore, false)
+        );
+    }
+
+    #[test]
+    fn unmatched_events_fall_back_to_the_lookup() {
+        let c = classifier_with_conn(
+            "[notify]
+run = \"ignore\"
+[notify.group]
+pr = \"pane\"
+[[notify.rules]]
+on = [\"deploy.failed\"]
+level = \"pane\"
+",
+            "notify = { branch = \"ignore\" }
+",
+        );
+        assert_eq!(
+            level_of(&c, event(t::DEPLOY_FAILED, "x", "Pat")),
+            (Level::Pane, false)
+        );
+        assert_eq!(
+            level_of(&c, event(t::RUN_COMPLETED, "x", "Pat")),
+            (Level::Ignore, false)
+        );
+        assert_eq!(
+            level_of(&c, group_event(t::PR_CREATED)),
+            (Level::Pane, false)
+        );
+        assert_eq!(
+            level_of(&c, event(t::BRANCH_PUSHED, "x", "Pat")),
+            (Level::Ignore, false)
+        );
+        assert_eq!(
+            level_of(&c, event(t::PR_CREATED, "x", "Pat")),
+            (Level::Alert, true)
+        );
+    }
+
+    #[test]
+    fn rules_never_apply_to_system_arms() {
+        let c = classifier(
+            "[[notify.rules]]
+on = [\"*\"]
+level = \"ignore\"
+",
+        );
+        for ty in [t::AUTH_FAILED, t::SOURCE_DISABLED, t::CATCHUP_SUMMARY] {
+            assert_eq!(
+                level_of(&c, event(ty, "x", "Pat")),
+                (Level::Alert, true),
+                "{ty}"
+            );
+        }
+        assert_eq!(
+            level_of(&c, event(t::RECORD_ACTIVATED, "x", "Pat")),
+            (Level::Pane, false)
+        );
+        assert_eq!(
+            level_of(&c, event(t::PR_CREATED, "x", "Pat")),
+            (Level::Ignore, false)
+        );
+    }
+
+    #[test]
+    fn rule_can_match_connection_id() {
+        let c = classifier_with_conn(
+            "[[notify.rules]]
+on = [\"pr.*\"]
+match = { \"connection.id\" = \"conn-b\" }
+level = \"ignore\"
+",
+            "",
+        );
+        let mut other = event(t::PR_CREATED, "x", "Pat");
+        other.connection.id = "conn-b".into();
+        assert_eq!(level_of(&c, other), (Level::Ignore, false));
+        assert_eq!(
+            level_of(&c, event(t::PR_CREATED, "x", "Pat")),
+            (Level::Alert, true)
         );
     }
 }

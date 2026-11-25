@@ -1,5 +1,5 @@
 //! Event type and field matching, and `{path}` placeholder expansion, shared by the hook
-//! runner and the stream server. Paths are dotted camelCase into the event's JSON.
+//! runner, the stream server and notify rules. Paths are dotted camelCase into the event's JSON.
 
 use globset::GlobMatcher;
 use serde_json::Value;
@@ -103,7 +103,7 @@ impl CompiledTable {
     }
 }
 
-/// A hook's `on` globs plus `match` table, compiled once.
+/// An `on` globs plus `match` table, compiled once; shared by hooks, the stream and notify rules.
 pub struct CompiledHookFilter {
     on: Vec<GlobMatcher>,
     table: CompiledTable,

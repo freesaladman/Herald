@@ -197,15 +197,29 @@ pub struct AuthConfig {
     pub method: String,
 }
 
-/// Notification levels by category key; values are validated by `Config::validate`.
+/// Notification levels by category key, plus ordered level rules; validated by `Config::validate`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NotifyConfig {
+    /// Ordered level rules; global `[notify]` only.
+    pub rules: Vec<NotifyRule>,
     /// Levels for events that reached me through a group, by category key.
     pub group: BTreeMap<String, String>,
     /// Levels by category key.
     #[serde(flatten)]
     pub levels: BTreeMap<String, String>,
+}
+
+/// Sets the level of events matching `on` and `match`; checked in order before the category levels.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotifyRule {
+    /// Event type globs.
+    pub on: Vec<String>,
+    /// Dotted event JSON paths to glob values, as in hooks.
+    pub r#match: MatchTable,
+    /// alert, pane or ignore; validated by `Config::validate`.
+    pub level: String,
 }
 
 impl NotifyConfig {
@@ -426,6 +440,7 @@ impl Config {
             }
         }
         check_notify(&mut errs, "notify", &self.notify);
+        check_rules(&mut errs, &self.notify.rules);
 
         let mut seen_ids: Vec<&str> = Vec::new();
         for (i, c) in self.connections.iter().enumerate() {
@@ -455,6 +470,15 @@ impl Config {
             }
             check_globs(&mut errs, &format!("{at}.bots"), &c.bots);
             check_notify(&mut errs, &format!("{at}.notify"), &c.notify);
+            if !c.notify.rules.is_empty() {
+                errs.push(ConfigError::new(
+                    format!("{at}.notify.rules"),
+                    format!(
+                        "rules are global; use [[notify.rules]] with match = {{ \"connection.id\" = \"{}\" }}",
+                        c.id
+                    ),
+                ));
+            }
         }
 
         let mut seen_names: Vec<&str> = Vec::new();
@@ -555,6 +579,33 @@ fn check_notify(errs: &mut Vec<ConfigError>, path: &str, notify: &NotifyConfig) 
                     format!("'{value}' must be alert, pane or ignore"),
                 ));
             }
+        }
+    }
+}
+
+fn check_rules(errs: &mut Vec<ConfigError>, rules: &[NotifyRule]) {
+    for (i, r) in rules.iter().enumerate() {
+        let at = format!("notify.rules[{i}]");
+        if r.on.is_empty() {
+            errs.push(ConfigError::new(
+                format!("{at}.on"),
+                "at least one event type glob is required",
+            ));
+        }
+        check_globs(errs, &format!("{at}.on"), &r.on);
+        for (key, value) in &r.r#match {
+            check_globs(errs, &format!("{at}.match.{key}"), value.patterns());
+        }
+        if r.level.is_empty() {
+            errs.push(ConfigError::new(
+                format!("{at}.level"),
+                "level is required (alert, pane or ignore)",
+            ));
+        } else if Level::parse(&r.level).is_none() {
+            errs.push(ConfigError::new(
+                format!("{at}.level"),
+                format!("'{}' must be alert, pane or ignore", r.level),
+            ));
         }
     }
 }
@@ -694,6 +745,12 @@ releases = 15
         assert_eq!(cfg.hooks.len(), 2);
         assert_eq!(cfg.notify.levels["pr"], "pane");
         assert_eq!(cfg.notify.group["approval"], "ignore");
+        assert_eq!(cfg.notify.rules.len(), 1);
+        let rule = &cfg.notify.rules[0];
+        assert_eq!(rule.on, ["pr.reviewer.added"]);
+        assert_eq!(rule.level, "alert");
+        assert_eq!(rule.r#match["data.isMe"], MatchValue::One("true".into()));
+        assert_eq!(rule.r#match["viaGroup"], MatchValue::One("false".into()));
         let conn = &cfg.connections[0].notify;
         assert_eq!(conn.levels["pr"], "pane");
         assert_eq!(conn.group["approval"], "ignore");
@@ -808,6 +865,87 @@ notify = { bogus = "alert", pr = "loud", group = { bogus = "pane", deploy = "lou
     fn valid_notify_passes() {
         Config::from_toml_str("[notify]\npr = \"pane\"\n[notify.group]\napproval = \"ignore\"\n")
             .unwrap();
+    }
+
+    #[test]
+    fn notify_rules_validate_each_path() {
+        let toml = r#"
+[[notify.rules]]
+level = "alert"
+[[notify.rules]]
+on = ["pr.[bad"]
+match = { "actor.kind" = ["human", "[x"], "pr.id" = "*" }
+level = "loud"
+[[notify.rules]]
+on = ["pr.*"]
+[[connections]]
+id = "work"
+provider = "fake"
+notify = { rules = [{ on = ["pr.*"], level = "pane" }] }
+"#;
+        let errs = Config::from_toml_str(toml).expect_err("rejected");
+        let got: Vec<(&str, &str)> = errs
+            .iter()
+            .map(|e| (e.path.as_str(), e.message.as_str()))
+            .collect();
+        let has = |path: &str, msg: &str| got.iter().any(|(p, m)| *p == path && m.contains(msg));
+        assert!(has(
+            "notify.rules[0].on",
+            "at least one event type glob is required"
+        ));
+        assert!(has("notify.rules[1].on", "invalid glob 'pr.[bad'"));
+        assert!(has("notify.rules[1].match.actor.kind", "invalid glob '[x'"));
+        assert!(has(
+            "notify.rules[1].level",
+            "'loud' must be alert, pane or ignore"
+        ));
+        assert!(has(
+            "notify.rules[2].level",
+            "level is required (alert, pane or ignore)"
+        ));
+        assert!(has(
+            "connections[0].notify.rules",
+            "rules are global; use [[notify.rules]] with match = { \"connection.id\" = \"work\" }"
+        ));
+        assert_eq!(got.len(), 6, "{got:?}");
+    }
+
+    #[test]
+    fn notify_rules_keep_order_and_stay_out_of_levels() {
+        let cfg = Config::from_toml_str(
+            r#"
+[notify]
+pr = "pane"
+[[notify.rules]]
+on = ["run.*"]
+match = { "run.result" = ["failed", "canceled"] }
+level = "alert"
+[[notify.rules]]
+on = ["*"]
+level = "ignore"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.notify.rules.len(), 2);
+        assert_eq!(cfg.notify.rules[0].on, ["run.*"]);
+        assert_eq!(
+            cfg.notify.rules[0].r#match["run.result"],
+            MatchValue::Any(vec!["failed".into(), "canceled".into()])
+        );
+        assert_eq!(cfg.notify.rules[1].level, "ignore");
+        assert_eq!(cfg.notify.levels.keys().collect::<Vec<_>>(), ["pr"]);
+    }
+
+    #[test]
+    fn notify_rule_unknown_key_is_a_parse_error() {
+        let toml = "[[notify.rules]]
+on = [\"pr.*\"]
+mach = { a = \"b\" }
+level = \"alert\"
+";
+        let paths = err_paths(toml);
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].starts_with("line "), "{paths:?}");
     }
 
     #[test]
